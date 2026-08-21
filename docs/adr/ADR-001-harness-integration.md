@@ -38,7 +38,7 @@ HawkAIAgent needs to integrate DeepSeek Harness as its AI backend. Three routes 
 
 ## Decision
 
-**Route A for Phase 0 validation.** Route B is the target product architecture but remains blocked. Route C is deferred.
+**Route A for Phase 0 validation.** Route B is a product-architecture candidate. It is not an accepted target until browser runtime compatibility is independently verified. Route C is deferred.
 
 ## Consequences
 
