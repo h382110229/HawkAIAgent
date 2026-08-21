@@ -22,7 +22,17 @@ WS: new WebSocket(url, ['hawk-auth', token])
 
 **Status:** ⚠️ Blocked by client package API limitations
 
-### Candidate B: HttpOnly SameSite=Strict session cookie (PREFERRED)
+### Candidate B: HttpOnly SameSite=Strict session cookie (PREFERRED CANDIDATE)
+
+> **Status: Candidate / pending PoC — not final security design**
+>
+> **Critical limitation:** Cookie 按 Host/Domain/Path 匹配，**不按 TCP 端口隔离**。为 127.0.0.1 设置的 Cookie 可能被发送到该 Host 的其他端口。如果同一机器上其他服务监听不同端口，Cookie 可能泄露。
+>
+> **Additional constraints:**
+> - HttpOnly 只能阻止 JS 直接读取 Token，**不能阻止 XSS 发起已认证请求**
+> - SameSite 不能替代 Origin、Host、CSP 和 Renderer 隔离
+> - 需要验证 Electron、官方 UI、HTTP RPC、WebSocket Upgrade 的实际兼容性
+> - Harness 是否暴露可用的 HTTP middleware 和 WS upgrade hook **尚未验证**
 
 ```
 1. Main process generates 32-byte random token (hex or base64url)
@@ -147,3 +157,6 @@ export function apply(ctx: Context) {
 1. Does `@deepseek-ai/dsh-host-webserver` expose a middleware hook? (Must verify)
 2. Does the WS upgrade handler receive Cookie headers? (Standard browsers send them)
 3. What if Harness changes its webserver plugin interface?
+4. Cookie 不按端口隔离 — 如何防止跨端口泄露？
+5. XSS 能否利用已认证 Cookie 发起请求（即使无法读取 Token）？
+6. 组合防御候选是否足够？

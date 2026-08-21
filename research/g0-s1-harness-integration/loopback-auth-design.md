@@ -1,5 +1,9 @@
 # R1-06: Loopback API Authentication Design
 
+> **Status: Superseded by loopback-auth-design-r2.md**
+> The Bearer + WS subprotocol approach described below is blocked by client package API limitations.
+> See R2 design for current candidates.
+
 ## Previous (incorrect) statement
 > "无认证层，桌面场景可接受"
 

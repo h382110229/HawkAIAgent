@@ -20,7 +20,7 @@
 | Lifecycle | Harness spawn, health check, crash prompt, restart button |
 | Packaging | Development build (electron-forge) |
 | Key storage | Electron safeStorage (DPAPI) |
-| Auth | Loopback token validation (hawk-auth plugin) |
+| Auth | Loopback token validation (candidate — pending PoC verification) |
 | DSH_HOME | `<userData>/dsh-home/` (isolated from ~/.dsh) |
 
 ## Deferred
@@ -41,17 +41,33 @@
 | Multiple providers | Single provider for MVP | Phase 2 |
 | Multi-model routing | Single model for MVP | Phase 3 |
 
-## Acceptance Criteria
+## Phase 0 Harness Integration Gate
 
-1. ✅ App launches on Windows 11 x64
-2. ✅ Harness subprocess starts and responds to health check
-3. ✅ User can enter DeepSeek API key in Settings
-4. ✅ User can create a new chat session
-5. ✅ User can send a message and see streaming response
-6. ✅ Agent tool calls display correctly
-7. ✅ User can approve/reject tool execution
-8. ✅ Session persists across app restarts
-9. ✅ Harness crash shows restart prompt (no silent failure)
-10. ✅ API key encrypted with safeStorage
-11. ✅ Loopback API requires auth token
-12. ✅ No orphan processes after app exit
+> 以下为 Harness 集成验证条件。全部通过后才能进入产品 MVP 开发。
+
+- [ ] Harness subprocess starts and responds to `host.describe`
+- [ ] WebSocket `/api/events.mux` upgrade succeeds
+- [ ] WebSocket `/api/events.host` upgrade succeeds
+- [ ] No-Key error path returns expected error (no silent failure)
+- [ ] No orphan processes after Harness exit
+- [ ] Port released after Harness exit
+- [ ] Temp directory cleaned up
+
+## Product MVP Acceptance Criteria
+
+> 以下为桌面应用 MVP 的验收条件。Phase 0 Gate 通过后，逐项实现。
+
+- [ ] App launches on Windows 11 x64
+- [ ] Harness subprocess starts and responds to health check
+- [ ] User can enter DeepSeek API key in Settings
+- [ ] User can create a new chat session
+- [ ] User can send a message and see streaming response
+- [ ] Agent tool calls display correctly
+- [ ] User can approve/reject tool execution
+- [ ] Session persists across app restarts
+- [ ] Harness crash shows restart prompt (no silent failure)
+- [ ] API key encrypted with safeStorage
+- [ ] Loopback API requires auth token
+- [ ] No orphan processes after app exit
+
+> **注意：** Harness PoC 成功 ≠ 桌面应用 MVP 已完成。Phase 0 Gate 是前置条件，不是验收完成。

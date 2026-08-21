@@ -1,12 +1,16 @@
 # G0-S1-R1 Verification Report
 
+> **Status: Historical snapshot — superseded by G0-S1-R2-preflight.md and G0-S1-R3 remediation.**
+> This report reflects the state at the time of original R1 generation (2026-08-20).
+> For current status, see `G0-S1-R2-preflight.md`.
+
 **Gate:** HawkAIAgent-G0-S1-R1 (Blocker Closure)
 **Date:** 2026-08-20
 **Previous Gate Result:** FAIL — CHANGES REQUIRED
 
 ---
 
-## R1 Gate Result: BLOCKED — pending Windows 11 x64 verification
+## R1 Gate Result (Historical): BLOCKED — pending Windows 11 x64 verification
 
 ---
 
@@ -19,7 +23,7 @@
 | R1-03 Windows PoC | ⚠️ BLOCKED | Script generated, requires Windows execution |
 | R1-04 Native ABI | ✅ COMPLETE | No native deps in client packages |
 | R1-05 Key security | ✅ FIXED | Revised threat model documented |
-| R1-06 Loopback auth | ✅ COMPLETE | Auth design documented |
+| R1-06 Loopback auth | ✅ COMPLETE | Auth design documented (superseded by R2/R3) |
 | R1-07 DSH_HOME | ✅ COMPLETE | Decision documented |
 | R1-08 Reports | ✅ COMPLETE | All documents created |
 
@@ -55,13 +59,7 @@ Exit code: 0
 | dsh-api-remotes/client | ✅ (host) | ⚠️ window.__ModuleLoader__ |
 | dsh-api-gateway/client | ✅ (host) | ⚠️ window.__ModuleLoader__ |
 
-**Note:** `window is not defined` in Node is expected. Client packages are browser-only. `window.__ModuleLoader__` is tsdown's browser bundle format — requires Vite/bundler to handle.
-
-### Conclusion
-- ✅ Exact version installable
-- ✅ Lockfile reproducible
-- ✅ No peer dep conflicts
-- ✅ Vendor NOT needed
+**Note:** `window is not defined` in Node is expected. Client packages are browser-only. `window.__ModuleLoader__` is tsdown's browser bundle format — **Vite can produce a bundle, but the browser runtime still requires `window.__ModuleLoader__`; Route B remains blocked.**
 
 ---
 
@@ -69,16 +67,7 @@ Exit code: 0
 
 **Reason:** OpenClaw agent runs on Ubuntu, cannot execute Windows tests.
 
-**Deliverable:** `windows-poc-test.ps1` — complete PowerShell test script covering:
-1. dsh web startup (no browser, loopback)
-2. Readiness probe (host.describe)
-3. WebSocket endpoints (events.mux, events.host)
-4. No-key error path
-5. Clean shutdown
-6. Orphan process check
-7. Port release check
-
-**Action required:** User must run on Windows 11 x64 and return output.
+**Deliverable:** `windows-poc-test.ps1` — now superseded by `windows-poc-test-r2.ps1`.
 
 ---
 
@@ -95,14 +84,6 @@ Exit code: 0
 
 **Conclusion:** Client packages are pure JS. No electron-rebuild needed.
 
-### Route comparison
-
-| Route | Native deps risk | electron-rebuild | Recommendation |
-|-------|-----------------|-----------------|----------------|
-| A: Independent Node 22 + spawn | Low (host-side only) | No | ✅ Recommended |
-| B: ELECTRON_RUN_AS_NODE | Same as A | No | ✅ Viable |
-| C: Electron embedded | High (node-pty, koffi) | Yes | ⚠️ Complex |
-
 ---
 
 ## R1-05: Key Security (FIXED)
@@ -117,29 +98,18 @@ Exit code: 0
 - Cannot prevent same-UID process or Harness plugin from reading ⚠️
 - This is **accidental exposure reduction**, NOT strong isolation
 
-### Recommendation
-- **Developer Preview:** safeStorage → env (acceptable risk)
-- **Stable release:** OS-keychain provider or Named Pipe
-
-Full analysis: `key-security-analysis.md`
-
 ---
 
-## R1-06: Loopback Auth (COMPLETE)
+## R1-06: Loopback Auth (SUPERSEDED)
 
-### Design
-- 32-byte random token generated per app launch
-- HTTP: `Authorization: Bearer <token>` header
-- WebSocket: subprotocol-based auth (`new WebSocket(url, ['hawk-auth', token])`)
-- Token held only in main process memory + renderer via IPC
-- NOT in URL, logs, localStorage, or disk
+> **Superseded by loopback-auth-design-r2.md**
 
-### Implementation scope
-- Harness side: ~50 line Cordis plugin
-- Electron side: ~20 lines (token gen + IPC)
-- No BFF required
+Original design used Bearer + WS subprotocol. R2 analysis shows:
+- Browser WebSocket API does NOT support custom headers
+- `@deepseek-ai/dsh-client-connection` has NO public API for custom auth headers or subprotocols
+- Candidate B (HttpOnly Cookie) is preferred but **requires PoC verification**
 
-Full design: `loopback-auth-design.md`
+Current status: **Candidate / pending PoC** — not final security design.
 
 ---
 
@@ -149,58 +119,21 @@ Full design: `loopback-auth-design.md`
 DSH_HOME = path.join(app.getPath('userData'), 'dsh-home')
 ```
 
-- Isolated from `~/.dsh/`
-- Supports spaces and Chinese in username
-- Profiles, settings, sessions, logs preserved across upgrades
-
-Full decision: `dsh-home-decision.md`
-
 ---
 
-## Remaining BLOCKERs
+## Remaining BLOCKERs (Historical)
 
 | # | Blocker | Resolution |
 |---|---------|-----------|
-| B1 | Windows PoC not executed | User must run `windows-poc-test.ps1` |
+| B1 | Windows PoC not executed | User must run `windows-poc-test-r2.ps1` |
 | B2 | WebSocket message format undocumented | Must capture from live Harness |
 
 ---
 
-## Remaining UNKNOWNs
+## Confirmation (Historical)
 
-| # | Item | Impact |
-|---|------|--------|
-| U1 | Agent approval flow UI protocol | Affects renderer approval dialog |
-| U2 | File/image upload via API | May need additional interface |
-| U3 | `window.__ModuleLoader__` integration with Vite | Must verify bundling works |
-
----
-
-## Files Generated
-
-```
-research/g0-s1-harness-integration/
-├── report.md                          # G0-S1 original report
-├── key-security-analysis.md           # R1-05
-├── loopback-auth-design.md            # R1-06
-├── dsh-home-decision.md               # R1-07
-├── windows-poc-test.ps1               # R1-03
-
-docs/
-├── research/harness-integration-feasibility.md
-├── architecture.md
-├── mvp.md
-├── adr/ADR-001-harness-integration.md
-├── adr/ADR-002-secret-storage.md
-├── adr/ADR-003-windows-sandbox.md
-```
-
----
-
-## Confirmation
-
-- [x] NOT pushed to remote
-- [x] NOT created PR
+- [x] NOT pushed to remote (at time of generation)
+- [x] NOT created PR (at time of generation)
 - [x] NOT merged
 - [x] NOT exposed credentials
 - [x] NOT modified upstream repository

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted — 2026-08-20
+**Accepted for Phase 0 / Provisional for product architecture** — 2026-08-20
+**Updated: 2026-08-21 (G0-S1-R3)**
 
 ## Context
 
@@ -31,22 +32,19 @@ HawkAIAgent needs to integrate DeepSeek Harness as its AI backend. Three routes 
 1. Harness has complete Typert API Gateway (HTTP RPC + WebSocket)
 2. Official client packages (`dsh-client-connection`, `dsh-api-remotes`) published to npm at 0.1.0-rc.8
 3. npm install succeeds with 59 transitive deps, 0 peer warnings
-4. Client packages use `window.__ModuleLoader__` — requires Vite bundler
+4. Client packages use `window.__ModuleLoader__` — Vite can produce a bundle, **but the browser runtime still requires `window.__ModuleLoader__`; Route B remains blocked.**
 5. No API gaps identified for MVP scope
 6. All peer deps resolve via npm (not workspace-only)
 
 ## Decision
 
-**Route A for Phase 0 validation → Route B for product.**
-
-Route C rejected — no evidence of API gaps.
+**Route A for Phase 0 validation.** Route B is the target product architecture but remains blocked. Route C is deferred.
 
 ## Consequences
 
-- Must use Vite to bundle client packages (handles ModuleLoader)
+- Route B: Vite can produce a bundle, but the browser runtime still requires `window.__ModuleLoader__`; Route B remains blocked until polyfill, Vite plugin, or upstream browser build is verified.
 - Must pin exact upstream versions with lockfile
 - Must track upstream API changes between releases
-- Medium coupling to `@deepseek-ai/dsh-client-connection`
 
 ## Rejected Alternatives
 
@@ -58,3 +56,5 @@ Route C rejected — no evidence of API gaps.
 - [ ] Exact WebSocket message format for events.mux
 - [ ] Agent approval flow UI protocol
 - [ ] File/image upload via API
+- [ ] `window.__ModuleLoader__` polyfill or Vite plugin feasibility
+- [ ] Harness HTTP middleware and WS upgrade hook availability (affects loopback auth)

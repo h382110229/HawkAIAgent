@@ -2,6 +2,7 @@
 
 **Gate:** HawkAIAgent-G0-S1-R2 (Windows PoC Preflight)
 **Date:** 2026-08-20
+**Updated: 2026-08-21 (G0-S1-R3)**
 **Gate Result:** BLOCKED — pending Windows 11 x64 verification
 
 ---
@@ -23,7 +24,7 @@ Two independent dimensions:
 | Option | Native deps | Notes |
 |--------|------------|-------|
 | Official Web UI | None | BrowserWindow loads localhost |
-| Hawk React UI + client packages | None (client) | ⚠️ ModuleLoader issue (see R2-4) |
+| Hawk React UI + client packages | None (client) | ⚠️ **Vite can produce a bundle, but the browser runtime still requires `window.__ModuleLoader__`; Route B remains blocked.** |
 
 ### Harness Host Runtime
 | Option | Native deps | electron-rebuild | Status |
@@ -38,21 +39,45 @@ Key fact: Client packages have NO native addons. Native deps are host-side only.
 
 ## R2-3: Loopback Authentication (Revised)
 
+> **Status: Candidate / pending PoC — not final security design**
+
 Three candidates evaluated:
 
 | Candidate | Security | Client pkg changes | Status |
 |-----------|----------|-------------------|--------|
-| A: Bearer + WS subprotocol | Good | Requires patching | ⚠️ Blocked |
-| B: HttpOnly SameSite cookie | Best | No changes needed | ✅ Preferred |
-| C: Electron IPC carrier | Weakest | Manual per-call | ❌ Not recommended |
+| A: Bearer + WS subprotocol | — | Requires patching | ⚠️ Blocked — client API limitations |
+| B: HttpOnly SameSite cookie | — | No changes needed | ✅ Preferred candidate |
+| C: Electron IPC carrier | — | Manual per-call | ❌ Not recommended |
 
-**Preferred: Candidate B (HttpOnly Cookie)**
-- Main process generates 32-byte token
-- Sets via `session.defaultSession.cookies.set()`
-- httpOnly, sameSite=strict, secure=false (localhost)
-- Official fetch/WebSocket auto-attach cookie
-- Token never in Renderer JS, URL, localStorage, or logs
-- Harness auth plugin validates Cookie header
+**Preferred candidate: B (HttpOnly Cookie)** — but NOT accepted as final design.
+
+### Critical limitation: Cookie 不按端口隔离
+
+- Cookie 按 Host/Domain/Path 匹配，**不按 TCP 端口隔离**
+- 为 `127.0.0.1` 设置的 Cookie 可能被发送到该 Host 的其他端口
+- 如果同一机器上其他服务监听不同端口，Cookie 可能泄露
+
+### Additional security constraints
+
+- HttpOnly 只能阻止 JS 直接读取 Token，**不能阻止 XSS 发起已认证请求**
+- SameSite 不能替代 Origin、Host、CSP 和 Renderer 隔离
+- Cookie 方案需要验证 Electron、官方 UI、HTTP RPC、WebSocket Upgrade 的实际兼容性
+- Harness 是否暴露可用的 HTTP middleware 和 WS upgrade hook **尚未验证**
+
+### 组合防御候选（需全部验证）
+
+- 随机高位端口
+- 仅绑定 127.0.0.1
+- Host allowlist
+- Origin allowlist
+- HttpOnly session Cookie 候选
+- 严格 CSP
+- `nodeIntegration: false` + `contextIsolation: true` + `sandbox: true`
+- 独立 Electron session partition
+- Token 每次启动重新生成
+- 退出时清除 Cookie
+
+> **注意：** 这些措施不构成强隔离。
 
 ---
 
@@ -76,9 +101,11 @@ import { API_PATH } from '@deepseek-ai/dsh-client-connection';
 
 ### Implication for Route B
 Hawk React UI cannot directly import official client packages without either:
-1. Providing a `__ModuleLoader__` polyfill
-2. Writing a Vite plugin to transform the pattern
+1. Providing a `__ModuleLoader__` polyfill (untested, fragile)
+2. Writing a Vite plugin to transform the pattern (medium effort)
 3. Using Route A (load official Web UI which already handles this)
+
+**Vite 构建成功 ≠ 浏览器运行成功。Route B remains blocked.**
 
 ---
 
@@ -105,16 +132,6 @@ Hawk React UI cannot directly import official client packages without either:
 | Default mode | ✅ No-credential test only |
 | PID tracking | ✅ Exact PID recorded |
 
-### Script metadata
-- SHA-256: [computed at runtime]
-- Size: ~6.5 KB
-- Lines: ~175
-- Required execution: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
-- Estimated time: 60-90 seconds
-- Files created: `$env:TEMP\hawkai-poc-*\` (temp dir, logs, npm install)
-- Processes spawned: node (dsh), npm (install)
-- Cleanup: `Remove-Item -Recurse -Force '$env:TEMP\hawkai-poc-*'`
-
 ### User execution command
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; .\windows-poc-test-r2.ps1
@@ -124,25 +141,19 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; .\windows-poc-test-r
 
 ## R2-6: File Inventory
 
-### git status --short (untracked files)
-```
-docs/adr/
-docs/architecture.md
-docs/mvp.md
-docs/research/
-docs/verification/
-research/
-```
-
-### All project files (15)
+### Pre-PR baseline files (3)
 ```
 .gitignore
 README.md
+docs/decisions.md
+```
+
+### PR initial new deliverables (17)
+```
 docs/adr/ADR-001-harness-integration.md
 docs/adr/ADR-002-secret-storage.md
 docs/adr/ADR-003-windows-sandbox.md
 docs/architecture.md
-docs/decisions.md
 docs/mvp.md
 docs/research/harness-integration-feasibility.md
 docs/verification/G0-S1-verification.md
@@ -150,13 +161,22 @@ research/g0-s1-harness-integration/abi-matrix-r2.md
 research/g0-s1-harness-integration/dsh-home-decision.md
 research/g0-s1-harness-integration/key-security-analysis.md
 research/g0-s1-harness-integration/loopback-auth-design-r2.md
+research/g0-s1-harness-integration/loopback-auth-design.md
 research/g0-s1-harness-integration/report.md
 research/g0-s1-harness-integration/vite-fixture-results.md
 research/g0-s1-harness-integration/windows-poc-test-r2.ps1
+research/g0-s1-harness-integration/windows-poc-test.ps1
+docs/verification/G0-S1-R2-preflight.md
 ```
 
-Total: 17 files (15 from R1 + 2 new in R2: `abi-matrix-r2.md`, `loopback-auth-design-r2.md`, `vite-fixture-results.md`, `windows-poc-test-r2.ps1`)
-Previous count of 15 was accurate for R1; R2 adds 4 new files.
+### PR Head total repository files: 20
+
+| Category | Count | Files |
+|----------|-------|-------|
+| Pre-PR baseline | 3 | .gitignore, README.md, docs/decisions.md |
+| R1 deliverables | 13 | ADRs, architecture, mvp, feasibility, verification, report, key-security, loopback-auth, dsh-home, poc-test |
+| R2 deliverables | 4 | abi-matrix-r2, loopback-auth-design-r2, vite-fixture-results, poc-test-r2, R2-preflight |
+| **Total** | **20** | |
 
 ---
 
@@ -165,7 +185,7 @@ Previous count of 15 was accurate for R1; R2 adds 4 new files.
 | # | Blocker | Resolution |
 |---|---------|-----------|
 | B1 | Windows PoC not executed | User must run script on Windows 11 x64 |
-| B2 | Client package ModuleLoader issue | Must decide: polyfill, Vite plugin, or Route A only |
+| B2 | Client package ModuleLoader issue | Route B blocked; Route A for Phase 0 |
 
 ---
 
@@ -182,8 +202,6 @@ Given the ModuleLoader blocker (R2-4), **Route A (load official Web UI) is the o
 
 ## Confirmation
 
-- [x] NOT pushed to remote
-- [x] NOT created PR
 - [x] NOT merged
 - [x] NOT exposed credentials
 - [x] NOT modified upstream repository

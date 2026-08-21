@@ -2,13 +2,14 @@
 
 **Gate:** HawkAIAgent-G0-S1 / G0-S1-R1
 **Date:** 2026-08-20
+**Updated: 2026-08-21 (G0-S1-R3)**
 **Upstream:** DeepSeek Harness 0.1.0-rc.8 (SHA 141eb6fef83422698aef7a981029e843e8161534)
 
 ## Executive Summary
 
 DeepSeek Harness provides a complete API surface (Typert Gateway + WebSocket events) that can be consumed directly from an Electron renderer process. **No custom BFF is needed.** The official client packages (`dsh-client-connection`, `dsh-api-remotes`, `dsh-api-gateway`) are published to npm at the exact version and install cleanly with 59 transitive dependencies.
 
-**R1 Gate Result: BLOCKED — pending Windows 11 x64 verification**
+**Gate Result: BLOCKED — pending Windows 11 x64 verification**
 
 ---
 
@@ -35,7 +36,7 @@ Install: 59 packages, 0 peer dependency warnings, exit code 0.
 ### 3. Client Package Loading
 
 - `lib/index.js` (Node/CJS host): ✅ Works
-- `lib/client.js` (Browser): Uses `window.__ModuleLoader__` — requires Vite/bundler to handle
+- `lib/client.js` (Browser): Uses `window.__ModuleLoader__` — **Vite can produce a bundle, but the browser runtime still requires `window.__ModuleLoader__`; Route B remains blocked.**
 
 ### 4. Native Dependencies
 
@@ -46,21 +47,27 @@ Install: 59 packages, 0 peer dependency warnings, exit code 0.
 ### 5. Security
 
 - Credential storage: safeStorage/DPAPI recommended over plain YAML
-- Loopback API: Needs thin auth plugin (token-based)
+- Loopback API: **Candidate / pending PoC** — not final security design
+  - Cookie 按 Host/Domain/Path 匹配，**不按 TCP 端口隔离**
+  - 为 127.0.0.1 设置的 Cookie 可能被发送到该 Host 的其他端口
+  - HttpOnly 只能阻止 JS 直接读取 Token，不能阻止 XSS 发起已认证请求
+  - SameSite 不能替代 Origin、Host、CSP 和 Renderer 隔离
+  - Harness 是否暴露可用的 HTTP middleware 和 WS upgrade hook 尚未验证
 - Windows ACL sandbox: partial enforcement only
 
 ## Recommendations
 
-1. **Route A for validation** → **Route B for product**
+1. **Route A for Phase 0 validation** — Route B remains blocked by `window.__ModuleLoader__`
 2. Use exact npm versions with lockfile
-3. safeStorage for key management
-4. Thin auth plugin for loopback API
+3. safeStorage for key management (exposure reduction, not strong isolation)
+4. Loopback auth: candidate pending PoC verification
 5. DSH_HOME at `<userData>/dsh-home/`
 
 ## Detailed Reports
 
 - [G0-S1 Gate Report](../g0-s1-harness-integration/report.md)
 - [R1 Key Security Analysis](../g0-s1-harness-integration/key-security-analysis.md)
-- [R1 Loopback Auth Design](../g0-s1-harness-integration/loopback-auth-design.md)
+- [Loopback Auth Design](../g0-s1-harness-integration/loopback-auth-design.md) — **Superseded by loopback-auth-design-r2.md**
+- [Loopback Auth Design R2](../g0-s1-harness-integration/loopback-auth-design-r2.md)
 - [R1 DSH_HOME Decision](../g0-s1-harness-integration/dsh-home-decision.md)
-- [Windows PoC Script](../g0-s1-harness-integration/windows-poc-test.ps1)
+- [Windows PoC Script (R2)](../g0-s1-harness-integration/windows-poc-test-r2.ps1)

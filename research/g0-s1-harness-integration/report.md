@@ -1,5 +1,9 @@
 # G0-S1 Gate Report: Harness Integration Feasibility & Architecture Revalidation
 
+> **Status: Historical / superseded by R2/R3.** This report was generated during G0-S1 original investigation.
+> The repository state section reflects the state at report generation time, not the current state.
+> For current architecture decisions, see `docs/decisions.md` and `docs/architecture.md`.
+
 **Gate:** HawkAIAgent-G0-S1
 **Date:** 2026-08-20
 **Investigator:** 小小霍 (OpenClaw agent)
@@ -267,7 +271,7 @@ If building a custom renderer, the Electron IPC bridge would replace:
 
 ### Verdict
 
-**Route A for validation → Route B for product.** Route C rejected.
+**Route A for Phase 0 validation.** Route B is the target product architecture but remains blocked by `window.__ModuleLoader__`. Route C rejected — no evidence of API gaps.
 
 ---
 
@@ -461,39 +465,18 @@ curl http://127.0.0.1:3080/api -X POST -H "Content-Type: application/json" -d '{
 
 ---
 
-## 10. Recommended Architecture
+## 10. Recommended Architecture (Historical — see docs/architecture.md for current)
 
-```mermaid
-graph TB
-    subgraph Electron["Electron App"]
-        Main["Main Process<br/>- Harness lifecycle<br/>- Native window<br/>- safeStorage bridge<br/>- Logging & crash detection"]
-        Renderer["Renderer Process<br/>- React + TypeScript<br/>- Custom UI (Stitch/Shadcn)<br/>- dsh-client-connection<br/>- dsh-api-remotes/client"]
-        Main <-->|IPC| Renderer
-    end
+> **Note:** This section reflects the original R1 recommendation. Route B (custom React UI + official client packages) is now known to be blocked by `window.__ModuleLoader__`. Current Phase 0 architecture uses Route A (BrowserWindow loading official dsh Web UI).
 
-    subgraph Harness["Harness Host (subprocess)"]
-        DSH["dsh web --no-open<br/>- Agent loop<br/>- Session management<br/>- Tools & approval<br/>- API Gateway<br/>- Event streams"]
-    end
+Route A for Phase 0 validation. Route B remains the target product architecture but is blocked by `window.__ModuleLoader__` runtime dependency.
 
-    subgraph Security["Security Layer"]
-        SafeStorage["Electron safeStorage<br/>(DPAPI on Windows)"]
-        Sandbox["Windows ACL Sandbox<br/>(partial enforcement)"]
-    end
-
-    Main -->|spawn + env| DSH
-    Renderer -->|HTTP POST /api| DSH
-    Renderer -->|WebSocket events.mux| DSH
-    Renderer -->|WebSocket events.host| DSH
-    Main --> SafeStorage
-    DSH --> Sandbox
-```
-
-### Key design decisions:
-1. **No BFF** — Renderer connects directly to Harness `/api` endpoint
-2. **Main process manages lifecycle** — spawn, health check, restart
-3. **safeStorage for keys** — decrypt in main, pass via env to Harness
-4. **Renderer uses official client packages** — `dsh-client-connection`, `dsh-api-remotes/client`
-5. **Single process model** — one Harness subprocess per app instance
+### Key design decisions (Historical):
+1. **No BFF** — Renderer connects directly to Harness `/api` endpoint ✅ Still valid
+2. **Main process manages lifecycle** — spawn, health check, restart ✅ Still valid
+3. **safeStorage for keys** — decrypt in main, pass via env to Harness ✅ Still valid
+4. **Renderer uses official client packages** — ⚠️ Route B blocked by ModuleLoader
+5. **Single process model** — one Harness subprocess per app instance ✅ Still valid
 
 ---
 
@@ -510,16 +493,18 @@ graph TB
 
 ---
 
-## 12. Gate Result
+## 12. Gate Result (Historical)
 
-**PASS WITH BLOCKERS**
+**BLOCKED — pending Windows 11 x64 verification**
+
+> Original report stated "PASS WITH BLOCKERS". Corrected to BLOCKED — Windows PoC not executed. See G0-S1-R2-preflight.md for current status.
 
 ### BLOCKERs
 
 | # | Blocker | Impact | Resolution |
 |---|---------|--------|-----------|
-| B1 | npm publish status of client packages unknown | Route B may be blocked if packages not on npm | Verify with `npm view @deepseek-ai/dsh-client-connection` |
-| B2 | Windows PoC not executed | Cannot confirm Harness runs on Windows target | Must test on Windows 11 x64 |
+| B1 | Windows PoC not executed | Cannot confirm Harness runs on Windows target | Must test on Windows 11 x64 |
+| B2 | Client package ModuleLoader issue | Route B blocked | Route A for Phase 0 |
 | B3 | Native addon ABI compatibility with Electron unverified | Packaging may fail | Must test electron-rebuild with koffi/landlock |
 
 ### UNKNOWNs
@@ -534,8 +519,8 @@ graph TB
 
 ## 13. Confirmation
 
-- [x] NOT pushed to remote
-- [x] NOT created PR
+- [x] NOT pushed to remote (at time of generation)
+- [x] NOT created PR (at time of generation)
 - [x] NOT merged
 - [x] NOT exposed credentials
 - [x] NOT modified upstream repository
