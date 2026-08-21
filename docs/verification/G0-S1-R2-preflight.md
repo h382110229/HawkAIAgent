@@ -2,7 +2,9 @@
 
 **Gate:** HawkAIAgent-G0-S1-R2 (Windows PoC Preflight)
 **Date:** 2026-08-20
-**Updated: 2026-08-21 (G0-S1-R3, R3-R1 remediation)**
+**Updated: 2026-08-21 (G0-S1-R3, R3-R1, R3-R2 remediation)**
+
+> R3-R2 addresses PowerShell runtime correctness: function name consistency, `$PID` conflict, gate aggregation truth table, null-safety, PID identity revalidation, depth-based termination, and cleanup resilience.
 **Gate Result:** BLOCKED — pending Windows 11 x64 verification
 
 ---
