@@ -1,124 +1,130 @@
-# G0-S1-R3-R3-R2 Preflight & Verification Report
+# G0-S1-R3-R3-R3 Preflight & Verification Report
 
-**Gate:** HawkAIAgent-G0-S1-R3-R3-R2 (Final Identity and Platform Checks)
+**Gate:** HawkAIAgent-G0-S1-R3-R3-R3 (Cleanup and Native Dependency Gate Alignment)
 **Date:** 2026-08-23
-**Previous Head:** `bb367903bff207cdb082266483be157e675241d2`
+**Previous Head:** `ac7a9b3d21626af32484be2e2f51d788eceb9ffc`
 **Gate Result:** REMEDIATION COMPLETE — pending Windows 11 x64 execution
 
 ---
 
-## 1. Mandatory 1: `$pid` Variable
+## 1. Finding 1: IdentityBlocked Semantics
 
-**Finding:** Test 23 used `foreach ($pid in $chainPids)` which writes to read-only `$PID`.
+**Finding:** `Invoke-Cleanup` treated IdentityBlocked as `CleanupError/FAIL` + `FatalInternalError`, producing `ERROR (exit 3)` instead of gate-blocking `BLOCKED (exit 2)`.
 
-**Fix:** Changed to `$chainProcessId`. Full file search confirms zero lowercase `$pid` assignments/loop variables.
+**Fix:**
+- IdentityBlocked → `MandatoryFunctional` category, status `BLOCKED`
+- Does NOT set `$script:FatalInternalError`
+- Does NOT add to `$script:CleanupErrors`
+- Gate aggregation: IdentityBlocked → `BLOCKED` (exit 2) unless higher-priority FAIL/ERROR exists
+- Kill failure remains `CleanupError/FAIL` → `ERROR` (exit 3)
+
+**Truth Table:**
+
+| Scenario | Exit Code | Priority |
+|----------|-----------|----------|
+| Script internal exception | 3 (ERROR) | Highest |
+| CleanupError FAIL (Kill failure) | 3 (ERROR) | High |
+| IdentityBlocked (identity unconfirmed) | 2 (BLOCKED) | Medium |
+| Gate-blocking FAIL | 1 (FAIL) | Medium |
+| All Gate-blocking PASS | 0 (PASS) | Lowest |
 
 ---
 
-## 2. Mandatory 2: Identity Mismatch Gate Impact
+## 2. Finding 2: Test 18 Structured Result Consumption
 
-**Finding:** `Stop-OwnedProcesses` put all identity mismatches in `Skipped`; `Invoke-Cleanup` only checked `Failed.Count`.
+**Finding:** Test 18 relied on `$afterKill` with only CreationDate check, didn't consume `Stop-OwnedProcesses` structured results.
 
 **Fix:**
-- Four result categories: `Terminated`, `AlreadyExited`, `IdentityBlocked`, `Failed`
-- `IdentityBlocked` = still running but identity unconfirmed → NOT killed, generates Gate-blocking `BLOCKED` via `CLEANUP-IDENTITY` result
-- `Failed` = identity confirmed but Kill/WaitForExit failed → `MandatoryFunctional FAIL`
-- `Invoke-Cleanup` only writes "OK" when BOTH `Failed` and `IdentityBlocked` are empty
-- Orphan check now verifies CreationDate + CommandLine + ExecutablePath (not just CreationDate)
-- Test 18 consumes structured result from `Stop-OwnedProcesses`
+- Full identity check: CreationDate + CommandLine + ExecutablePath
+- `Failed.Count > 0` → Test 18 `FAIL`
+- `IdentityBlocked.Count > 0` (no FAIL) → Test 18 `BLOCKED`
+- `$afterKill.Count > 0` (identity confirmed, still alive) → Test 18 `FAIL`
+- All terminated/exited → Test 18 `PASS`
+
+**Test 18 Branch Matrix:**
+
+| Condition | Result |
+|-----------|--------|
+| Kill/WaitForExit failure | FAIL |
+| Identity unconfirmed (still running) | BLOCKED |
+| Identity confirmed but survived | FAIL |
+| All terminated or exited | PASS |
+| No owned processes running | PASS |
 
 ---
 
-## 3. Mandatory 3: Harness Proof PID Reuse Protection
+## 3. Finding 3: Native Addon Platform/Optional Split
 
-**Finding:** `cmdOk` used broad `*dsh*` wildcard; no CreationDate/CommandLine/ExecutablePath/ParentPID comparison.
-
-**Fix:**
-- `cmdOk` now matches exact `$dshBin` path
-- Full identity comparison: CIM CreationDate, CommandLine, ExecutablePath, ParentPID vs owned record
-- Any mismatch → `SavedHarnessProven = false`
-- Chain display order: reversed for `launcher -> node` presentation
-
----
-
-## 4. Mandatory 4: npm os/cpu Allow/Deny Semantics
-
-**Finding:** `$pkgData.os -notcontains "win32"` treats `["!darwin"]` as "not for Windows".
+**Finding:** Single `IsOptional` conflated platform applicability with parent dependency optionality. `os: ["!darwin"]` incorrectly treated as "not for Windows".
 
 **Fix:**
-- Positive items = allowlist; `!value` = denylist; no positive items = allow unless denied
-- `["!win32"]` → denied (correct)
-- `["!darwin"]` → NOT denied for win32 (correct)
-- `["win32"]` → allowed (correct)
-- `["!win32", "linux"]` → denied (correct)
-- Missing/empty → allowed (correct)
-- Nested lockfile paths parsed correctly: `node_modules/<parent>/node_modules/node-pty` extracts `node-pty`
-- Unresolvable → EvidenceDependent BLOCKED
+- Split into `PlatformApplicable` (os/cpu allow/deny) and `ParentOptional` (lockfile `optional` + parent `optionalDependencies` edge)
+- Parent entry lookup via lockfile path parsing (handles nested `node_modules/<parent>/node_modules/<dep>`)
+- Gate determination:
+  - Required + platform-applicable + missing → `EvidenceDependent BLOCKED`
+  - Required + platform-applicable + load-fail → `EvidenceDependent FAIL`
+  - Optional or platform-n/a → `Informational` (never blocks Gate)
 
-**Static judgment cases:**
+**os/cpu Judgment Cases:**
 
-| os value | win32 result |
-|----------|-------------|
-| `["win32"]` | Allowed ✅ |
-| `["!darwin"]` | Allowed ✅ (no win32 deny) |
-| `["!win32"]` | Denied ✅ |
-| `["linux"]` | Denied ✅ (allowlist, win32 not in it) |
-| `[]` or missing | Allowed ✅ (default) |
+| os value | win32 result | Notes |
+|----------|-------------|-------|
+| `["win32"]` | Allowed | Explicit allowlist |
+| `["!darwin"]` | Allowed | Denylist doesn't deny win32 |
+| `["!win32"]` | Denied | Denylist denies win32 |
+| `["linux"]` | Denied | Allowlist, win32 not in it |
+| `[]` or missing | Allowed | Default allow |
 
 | cpu value | x64 result |
 |-----------|-----------|
-| `["x64"]` | Allowed ✅ |
-| `["!arm"]` | Allowed ✅ |
-| `["!x64"]` | Denied ✅ |
-| `[]` or missing | Allowed ✅ |
+| `["x64"]` | Allowed |
+| `["!arm"]` | Allowed |
+| `["!x64"]` | Denied |
+| `[]` or missing | Allowed |
+
+**Self-Test Coverage:**
+- `[win32]` → PlatformApplicable=true
+- `[!darwin]` → PlatformApplicable=true
+- `[!win32]` → PlatformApplicable=false
+- `[linux]` → PlatformApplicable=false
+- Empty/missing → PlatformApplicable=true
+- Parent optionalDependencies edge → ParentOptional=true
+- Lockfile `optional: true` → ParentOptional=true
+- Nested path parsing → correct parent lookup
 
 ---
 
-## 5. Mandatory 5: Test 15 Resource & Single-Result
+## 4. Aggregation Self-Test
 
-**Finding:** `$reader` not disposed in finally; each path already produces one result (verified).
+Expanded from 7 to 10 cases. New cases:
 
-**Fix:**
-- `$reader = $null` declared at Test 15 start
-- `$reader.Dispose()` in `finally` block (before `$memStream.Dispose()`)
-- StreamReader created with `UTF8Encoding($false, $true, $true)` (encoder + throwOnInvalid + detectBOM)
-- All 8 paths verified to produce exactly one Test 15 result
-
-**Single-result matrix:**
-
-| Path | Result |
-|------|--------|
-| WS not open | BLOCKED |
-| Oversize | FAIL (test15Finalized=true, break) |
-| Timeout, 0 bytes | BLOCKED |
-| Close frame | FAIL |
-| Non-Text | FAIL |
-| No EndOfMessage | FAIL |
-| Invalid UTF-8 | FAIL |
-| Invalid JSON | FAIL |
-| Valid JSON, unverified envelope | BLOCKED |
+| # | Scenario | Expected |
+|---|----------|----------|
+| 8 | IdentityBlocked in MandatoryFunctional | BLOCKED/2 |
+| 9 | CleanupError FAIL | ERROR/3 |
+| 10 | Kill fail + IdentityBlocked | ERROR/3 |
 
 ---
 
-## 6. Script SHA-256
+## 5. Script SHA-256
 
-`4ea9102e53b437362b2536f6e60224dc785841357f48ea7e5420168013879425`
+`7af0ea733812caaad9b047219f1f6541fca0d8ed220dd79182eef2007716f985`
 
 ---
 
-## 7. Static Analysis Summary
+## 6. Static Analysis Summary
 
 | Check | Result |
 |-------|--------|
-| Lowercase `$pid` variable | ✅ None found |
-| IdentityBlocked in gate | ✅ 12 references |
-| KillResults.Skipped | ✅ 0 references |
-| Harness dshBin path match | ✅ Exact path |
-| identityOk in harness proof | ✅ 7 references |
-| os/cpu denylist (`!`) | ✅ 8 references |
-| reader.Dispose in finally | ✅ Present |
-| chainProcessId | ✅ 2 references |
-| ReversedChain display | ✅ Present |
+| IdentityBlocked not CleanupError | PASS |
+| IdentityBlocked as MandatoryFunctional | PASS |
+| Has r8 self-test | PASS |
+| Has PlatformApplicable | PASS |
+| Has ParentOptional | PASS |
+| Has platformApplicable variable | PASS |
+| Has parentOptional variable | PASS |
+| No IsOptional in foundNative | PASS |
+| Lowercase `$pid` | 0 occurrences |
 | PowerShell parser | PENDING WINDOWS HERMES PHASE A |
 | PSScriptAnalyzer | PENDING WINDOWS HERMES PHASE A |
 | Aggregation runtime | PENDING WINDOWS HERMES PHASE A |

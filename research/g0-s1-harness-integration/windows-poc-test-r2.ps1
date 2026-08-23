@@ -164,6 +164,34 @@ function Test-GetOverallResult {
     $tests += [PSCustomObject]@{ Name = "No Gate-blocking -> ERROR"; Expected = "ERROR"; Actual = $g7; Pass = ($g7 -eq "ERROR") }
     if ($g7 -ne "ERROR") { $allPassed = $false }
 
+    # R3-01: IdentityBlocked in MandatoryFunctional -> BLOCKED/2
+    $r8 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" },
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "BLOCKED" }
+    )
+    $g8 = Get-OverallResult -Results $r8 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "IdentityBlocked -> BLOCKED"; Expected = "BLOCKED"; Actual = $g8; Pass = ($g8 -eq "BLOCKED") }
+    if ($g8 -ne "BLOCKED") { $allPassed = $false }
+
+    # R3-01: Kill failure in CleanupError -> ERROR/3
+    $r9 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" },
+        [PSCustomObject]@{ Category = "CleanupError"; Status = "FAIL" }
+    )
+    $g9 = Get-OverallResult -Results $r9 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "CleanupError FAIL -> ERROR"; Expected = "ERROR"; Actual = $g9; Pass = ($g9 -eq "ERROR") }
+    if ($g9 -ne "ERROR") { $allPassed = $false }
+
+    # R3-01: Kill failure + IdentityBlocked -> ERROR (Kill takes priority)
+    $r10 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" },
+        [PSCustomObject]@{ Category = "CleanupError"; Status = "FAIL" },
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "BLOCKED" }
+    )
+    $g10 = Get-OverallResult -Results $r10 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "Kill fail + IdentityBlocked -> ERROR"; Expected = "ERROR"; Actual = $g10; Pass = ($g10 -eq "ERROR") }
+    if ($g10 -ne "ERROR") { $allPassed = $false }
+
     Write-Host "`n=== Aggregation Self-Test ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
@@ -382,16 +410,14 @@ function Invoke-Cleanup {
 
         if ($hasIdentityBlock) {
             $blockSummary = ($killResult.IdentityBlocked | ForEach-Object { "PID=$($_.PID): $($_.Reason)" }) -join "; "
-            $errMsg = "ERR-CLEANUP-IDENTITY: Unverified processes still running: $blockSummary"
+            # R3-01: IdentityBlocked -> gate-blocking BLOCKED (exit 2), NOT ERROR/exit 3
             $cleanupResults += "Process cleanup: IDENTITY BLOCKED ($($killResult.IdentityBlocked.Count) unverified)"
-            $script:CleanupErrors += $errMsg
-            Add-TestResult -TestId "CLEANUP-IDENTITY" -Category "CleanupError" `
+            Add-TestResult -TestId "CLEANUP-IDENTITY" -Category "MandatoryFunctional" `
               -Description "Process cleanup: identity unconfirmed" `
               -Expected "All still-running processes have confirmed identity" `
               -Actual "IdentityBlocked=$($killResult.IdentityBlocked.Count): $blockSummary" `
-              -Status "FAIL" -ErrorSummary $errMsg
-            $script:FatalInternalError = $true
-            if (-not $script:FatalInternalErrorMessage) { $script:FatalInternalErrorMessage = $errMsg }
+              -Status "BLOCKED" -ErrorSummary "Processes still running but identity not confirmed; not killed"
+            # R3-01: Do NOT set FatalInternalError or CleanupErrors
         }
 
         if (-not $hasFailure -and -not $hasIdentityBlock) {
@@ -767,29 +793,37 @@ try {
                     }
                     $pkgData = $pkgEntry.Value
                     if ($pkgName -in $nativeDepsToCheck) {
-                        # Found a native dep in lockfile — determine optionality
-                        $isOptional = $false
-                        # Check if parent package lists it in optionalDependencies
-                        # In lockfile v2/v3, the package entry itself may have "optional": true
-                        if ($pkgData.optional -eq $true) { $isOptional = $true }
-                        # R2-04: npm allow/deny semantics for os/cpu
-                        # Positive items = allowlist; !value = denylist; no positive = allow unless denied
+                        # R3-03: Split platform-applicable vs parent-optional
+                        $platformApplicable = $true
                         if ($pkgData.os) {
                             $hasPositive = $pkgData.os | Where-Object { $_ -notlike '!*' }
                             $denied = $pkgData.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
-                            if ($denied) { $isOptional = $true }
-                            elseif ($hasPositive -and ($pkgData.os -notcontains "win32")) { $isOptional = $true }
+                            if ($denied) { $platformApplicable = $false }
+                            elseif ($hasPositive -and ($pkgData.os -notcontains "win32")) { $platformApplicable = $false }
                         }
                         if ($pkgData.cpu) {
                             $hasPositive = $pkgData.cpu | Where-Object { $_ -notlike '!*' }
                             $denied = $pkgData.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
-                            if ($denied) { $isOptional = $true }
-                            elseif ($hasPositive -and ($pkgData.cpu -notcontains "x64")) { $isOptional = $true }
+                            if ($denied) { $platformApplicable = $false }
+                            elseif ($hasPositive -and ($pkgData.cpu -notcontains "x64")) { $platformApplicable = $false }
+                        }
+                        $parentOptional = ($pkgData.optional -eq $true)
+                        # R3-03: Check parent optionalDependencies edge
+                        $rawPath = $pkgEntry.Name
+                        if ($rawPath -match '^(.+[/\\])node_modules[/\\]') {
+                            $parentPath = $Matches[1].TrimEnd('/').TrimEnd('\\')
+                            if ($lockfileJson.packages.PSObject.Properties[$parentPath]) {
+                                $parentPkg = $lockfileJson.packages.PSObject.Properties[$parentPath].Value
+                                if ($parentPkg.optionalDependencies -and $parentPkg.optionalDependencies.PSObject.Properties[$pkgName]) {
+                                    $parentOptional = $true
+                                }
+                            }
                         }
                         $transitiveNativeExpected[$pkgName] = [PSCustomObject]@{
                             Name = $pkgName
                             Version = $pkgData.version
-                            IsOptional = $isOptional
+                            PlatformApplicable = $platformApplicable
+                            ParentOptional = $parentOptional
                             InLockfile = $true
                         }
                     }
@@ -808,32 +842,34 @@ try {
                 try {
                     $pkgContent = Get-Content $pkgJsonPath -Raw | ConvertFrom-Json
                     $ver = $pkgContent.version
-                    if ($pkgContent.optional -eq $true) { $isOptional = $true }
-                    # R2-04: npm allow/deny semantics
+                    # R3-03: Split platform vs optional
+                    $platformApplicable = $true
                     if ($pkgContent.os) {
                         $hasPositive = $pkgContent.os | Where-Object { $_ -notlike '!*' }
                         $denied = $pkgContent.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
-                        if ($denied) { $isOptional = $true }
-                        elseif ($hasPositive -and ($pkgContent.os -notcontains "win32")) { $isOptional = $true }
+                        if ($denied) { $platformApplicable = $false }
+                        elseif ($hasPositive -and ($pkgContent.os -notcontains "win32")) { $platformApplicable = $false }
                     }
                     if ($pkgContent.cpu) {
                         $hasPositive = $pkgContent.cpu | Where-Object { $_ -notlike '!*' }
                         $denied = $pkgContent.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
-                        if ($denied) { $isOptional = $true }
-                        elseif ($hasPositive -and ($pkgContent.cpu -notcontains "x64")) { $isOptional = $true }
+                        if ($denied) { $platformApplicable = $false }
+                        elseif ($hasPositive -and ($pkgContent.cpu -notcontains "x64")) { $platformApplicable = $false }
                     }
+                    $parentOptional = ($pkgContent.optional -eq $true)
                 } catch {}
             }
 
-            # R1-07: Override with lockfile-derived optionality if available
+            # R1-07: Override with lockfile-derived split model
             if ($transitiveNativeExpected.ContainsKey($depName)) {
-                $isOptional = $transitiveNativeExpected[$depName].IsOptional
+                $platformApplicable = $transitiveNativeExpected[$depName].PlatformApplicable
+                $parentOptional = $transitiveNativeExpected[$depName].ParentOptional
             }
 
             $loadExit = -1; $loadOutput = ""
             Push-Location $TEST_DIR
             try {
-                $nodeRequire = "try { require('$($foundDir.FullName -replace '\\','/')'); process.exit(0) } catch(e) { console.error(e.message); process.exit(1) }"
+                $nodeRequire = "try { require('$($foundDir.FullName -replace '\','/')'); process.exit(0) } catch(e) { console.error(e.message); process.exit(1) }"
                 $loadOutput = (node -e $nodeRequire 2>&1) | Out-String
                 $loadExit = $LASTEXITCODE
             } catch { $loadOutput = $_.Exception.Message }
@@ -843,46 +879,40 @@ try {
                 Name = $depName; Path = $foundDir.FullName; Version = $ver
                 LoadExit = $loadExit
                 LoadOutput = if ($loadOutput) { $loadOutput.Trim() } else { "" }
-                IsOptional = $isOptional
+                PlatformApplicable = $platformApplicable
+                ParentOptional = $parentOptional
             }
         }
     }
 
+    # R3-03: Gate determination with split platform/optional model
     if ($foundNative.Count -gt 0) {
-        $summary = ($foundNative | ForEach-Object { "$($_.Name)@$($_.Version) exit=$($_.LoadExit) optional=$($_.IsOptional)" }) -join "; "
+        $summary = ($foundNative | ForEach-Object { "$($_.Name)@$($_.Version) exit=$($_.LoadExit) platform=$($_.PlatformApplicable) optional=$($_.ParentOptional)" }) -join "; "
         $loadFailures = $foundNative | Where-Object { $_.LoadExit -ne 0 }
+        $requiredFailures = $loadFailures | Where-Object { $_.PlatformApplicable -and (-not $_.ParentOptional) }
+        $optionalFailures = $loadFailures | Where-Object { (-not $_.PlatformApplicable) -or $_.ParentOptional }
 
-        if ($loadFailures.Count -gt 0) {
-            $failureDetails = ($loadFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) $($_.LoadOutput)" }) -join "; "
-            Add-TestResult -TestId "6" -Category "EvidenceDependent" `
-              -Description "Native addon detection" -Expected "All expected native addons load" `
-              -Actual "LOAD FAILURES: $failureDetails" -Status "FAIL" `
-              -ErrorSummary "Native addon(s) found but failed to load"
+        if ($requiredFailures.Count -gt 0) {
+            $failureDetails = ($requiredFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) $($_.LoadOutput)" }) -join "; "
+            Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Required Windows native addons load" -Actual "REQUIRED LOAD FAILURES: $failureDetails" -Status "FAIL" -ErrorSummary "Required native addon(s) failed to load on Windows x64"
+        } elseif ($optionalFailures.Count -gt 0) {
+            $failureDetails = ($optionalFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) optional=$($_.ParentOptional) platform=$($_.PlatformApplicable)" }) -join "; "
+            Add-TestResult -TestId "6" -Category "Informational" -Description "Native addon detection (optional/platform-n/a failures)" -Expected "Documented" -Actual "Optional failures: $failureDetails" -Status "PASS"
         } else {
-            $windowsExpected = $foundNative | Where-Object { -not $_.IsOptional }
-            if ($windowsExpected.Count -gt 0) {
-                Add-TestResult -TestId "6" -Category "EvidenceDependent" `
-                  -Description "Native addon detection" -Expected "Expected Windows native addons load" `
-                  -Actual "All loaded: $summary" -Status "PASS"
+            $requiredLoaded = $foundNative | Where-Object { $_.PlatformApplicable -and (-not $_.ParentOptional) }
+            if ($requiredLoaded.Count -gt 0) {
+                Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Required Windows native addons load" -Actual "All loaded: $summary" -Status "PASS"
             } else {
-                Add-TestResult -TestId "6" -Category "Informational" `
-                  -Description "Native addon detection (all optional)" `
-                  -Expected "Optional addons documented" -Actual "Found: $summary" -Status "PASS"
+                Add-TestResult -TestId "6" -Category "Informational" -Description "Native addon detection (all optional/platform-n/a)" -Expected "Documented" -Actual "Found: $summary" -Status "PASS"
             }
         }
     } else {
-        # R1-07: Check transitive expectations from lockfile, not just direct deps
-        $expectedFromTransitive = $transitiveNativeExpected.Keys | Where-Object { $transitiveNativeExpected[$_].InLockfile }
-        if ($expectedFromTransitive.Count -gt 0) {
-            Add-TestResult -TestId "6" -Category "EvidenceDependent" `
-              -Description "Native addon detection" `
-              -Expected "Expected native addons (from lockfile): $($expectedFromTransitive -join ', ')" `
-              -Actual "None found in install tree" -Status "BLOCKED" `
-              -ErrorSummary "Expected native addons not found — may need Windows Phase A install"
+        $requiredMissing = $transitiveNativeExpected.Values | Where-Object { $_.InLockfile -and $_.PlatformApplicable -and (-not $_.ParentOptional) }
+        if ($requiredMissing.Count -gt 0) {
+            $missingNames = ($requiredMissing | ForEach-Object { $_.Name }) -join ", "
+            Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Required native addons: $missingNames" -Actual "None found" -Status "BLOCKED" -ErrorSummary "Required native addons not found"
         } else {
-            Add-TestResult -TestId "6" -Category "Informational" `
-              -Description "Native addon detection" -Expected "Document presence" `
-              -Actual "None of [$($nativeDepsToCheck -join ', ')] found; not expected from lockfile analysis" -Status "PASS"
+            Add-TestResult -TestId "6" -Category "Informational" -Description "Native addon detection" -Expected "Document presence" -Actual "None found as required; all expected are optional/platform-n/a" -Status "PASS"
         }
     }
 
@@ -1374,20 +1404,28 @@ try {
     if ($stillRunning.Count -gt 0) {
         $killResult = Stop-OwnedProcesses
         Start-Sleep -Seconds 1
+        # R3-02: Full-identity survivor check
         $afterKill = @()
         foreach ($record in $stillRunning) {
             $p = Get-Process -Id $record.PID -ErrorAction SilentlyContinue
             if ($p -and -not $p.HasExited) {
                 $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($record.PID)" -ErrorAction SilentlyContinue
                 if ($cim -and $cim.CreationDate -eq $record.CreationDate) {
-                    $afterKill += $record.PID
+                    $cmdOk = (-not $record.CommandLine) -or ($cim.CommandLine -eq $record.CommandLine)
+                    $exeOk = (-not $record.ExecutablePath) -or ($cim.ExecutablePath -eq $record.ExecutablePath)
+                    if ($cmdOk -and $exeOk) { $afterKill += $record.PID }
                 }
             }
         }
-        if ($afterKill.Count -gt 0) {
-            Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All terminated" -Actual "Survived: $($afterKill -join ', ')" -Status "FAIL" -ErrorSummary "Could not terminate"
+        # R3-02: Consume structured results directly
+        if ($killResult.Failed.Count -gt 0) {
+            Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All identity-confirmed terminated" -Actual "Failed=$($killResult.Failed.Count)" -Status "FAIL" -ErrorSummary "Kill/WaitForExit failure"
+        } elseif ($killResult.IdentityBlocked.Count -gt 0) {
+            Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All processes terminated or identity confirmed" -Actual "IdentityBlocked=$($killResult.IdentityBlocked.Count)" -Status "BLOCKED" -ErrorSummary "Identity unconfirmed"
+        } elseif ($afterKill.Count -gt 0) {
+            Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All terminated" -Actual "Survived: $($afterKill -join ', ')" -Status "FAIL" -ErrorSummary "Survived despite confirmed identity"
         } else {
-            Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All terminated" -Actual "Killed $($stillRunning.Count)" -Status "PASS"
+            Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All terminated" -Actual "Terminated=$($killResult.Terminated.Count), Exited=$($killResult.AlreadyExited.Count)" -Status "PASS"
         }
     } else {
         Add-TestResult -TestId "18" -Category "MandatoryFunctional" -Description "Force cleanup" -Expected "All terminated" -Actual "No owned processes running" -Status "PASS"
