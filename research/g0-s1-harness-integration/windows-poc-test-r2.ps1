@@ -1,4 +1,4 @@
-# HawkAIAgent G0-S1-R3-R2 Windows PoC Test Script
+# HawkAIAgent G0-S1-R3-R3 Windows PoC Test Script
 # =================================================
 # SAFETY: No admin required. No system modifications.
 # All operations scoped to $TEST_DIR (precise, known path).
@@ -14,10 +14,11 @@
 #   Gate-blocking categories: MandatoryFunctional, MandatorySecurity, EvidenceDependent
 #   Non-blocking categories: Informational
 #
-#   Gate-blocking FAIL count > 0          → OVERALL FAIL    (exit 1)
-#   Gate-blocking BLOCKED count > 0       → OVERALL BLOCKED (exit 2)
-#   All Gate-blocking PASS                → OVERALL PASS    (exit 0)
-#   Script error / result generation fail → OVERALL ERROR   (exit 3)
+#   Fatal internal error / cleanup error   → OVERALL ERROR   (exit 3)
+#   Gate-blocking FAIL count > 0           → OVERALL FAIL    (exit 1)
+#   Gate-blocking BLOCKED count > 0        → OVERALL BLOCKED (exit 2)
+#   All Gate-blocking PASS                 → OVERALL PASS    (exit 0)
+#   No Gate-blocking tests                 → OVERALL ERROR   (exit 3)
 #   Informational never overrides Gate-blocking result
 # =================================================
 
@@ -45,11 +46,14 @@ class AssertionFailure : System.Exception {
 # === Result tracking ===
 $script:TestResults = @()
 $script:ResultsGenerated = $false
+$script:FatalInternalError = $false
+$script:FatalInternalErrorMessage = ""
+$script:CleanupErrors = @()
 
 function Add-TestResult {
     param(
         [string]$TestId,
-        [string]$Category,  # MandatoryFunctional, MandatorySecurity, EvidenceDependent, Informational
+        [string]$Category,  # MandatoryFunctional, MandatorySecurity, EvidenceDependent, Informational, ScriptInternal, CleanupError
         [string]$Description,
         [string]$Expected,
         [string]$Actual,
@@ -67,27 +71,129 @@ function Add-TestResult {
     }
 }
 
+# R3-R3-08: Refactored Get-OverallResult as pure function accepting results array
 function Get-OverallResult {
-    # Gate-blocking categories
-    $gateBlocking = $script:TestResults | Where-Object {
+    param(
+        [Parameter(Mandatory=$true)]$Results,
+        [bool]$HasFatalInternalError = $false,
+        [string[]]$CleanupErrorList = @()
+    )
+
+    # Priority 1: ScriptInternal / cleanup fatal → ERROR/3
+    if ($HasFatalInternalError) { return "ERROR" }
+    if ($CleanupErrorList.Count -gt 0) { return "ERROR" }
+
+    # Check for ScriptInternal or CleanupError category results
+    $scriptInternalResults = $Results | Where-Object {
+        $_.Category -in @("ScriptInternal", "CleanupError")
+    }
+    if ($scriptInternalResults | Where-Object { $_.Status -eq "FAIL" }) { return "ERROR" }
+
+    # Priority 2: Gate-blocking categories
+    $gateBlocking = $Results | Where-Object {
         $_.Category -in @("MandatoryFunctional", "MandatorySecurity", "EvidenceDependent")
     }
-    $hasFail = $gateBlocking | Where-Object { $_.Status -eq "FAIL" }
-    $hasBlocked = $gateBlocking | Where-Object { $_.Status -eq "BLOCKED" }
 
+    # Priority 7: No gate-blocking tests → ERROR/3
+    if ($gateBlocking.Count -eq 0) { return "ERROR" }
+
+    # Priority 3: Any Gate-blocking FAIL → FAIL/1
+    $hasFail = $gateBlocking | Where-Object { $_.Status -eq "FAIL" }
     if ($hasFail) { return "FAIL" }
+
+    # Priority 4: Any Gate-blocking BLOCKED → BLOCKED/2
+    $hasBlocked = $gateBlocking | Where-Object { $_.Status -eq "BLOCKED" }
     if ($hasBlocked) { return "BLOCKED" }
-    if ($gateBlocking.Count -gt 0) { return "PASS" }
-    return "ERROR"
+
+    # All Gate-blocking PASS → PASS/0
+    return "PASS"
+}
+
+# R3-R3-08: Self-test for aggregation logic
+function Test-GetOverallResult {
+    $allPassed = $true
+    $tests = @()
+
+    # Test 1: All Gate-blocking PASS + Informational FAIL → PASS/0
+    $r1 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" },
+        [PSCustomObject]@{ Category = "Informational"; Status = "FAIL" }
+    )
+    $g1 = Get-OverallResult -Results $r1 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "All PASS + Info FAIL → PASS"; Expected = "PASS"; Actual = $g1; Pass = ($g1 -eq "PASS") }
+    if ($g1 -ne "PASS") { $allPassed = $false }
+
+    # Test 2: EvidenceDependent BLOCKED → BLOCKED/2
+    $r2 = @(
+        [PSCustomObject]@{ Category = "EvidenceDependent"; Status = "BLOCKED" },
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" }
+    )
+    $g2 = Get-OverallResult -Results $r2 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "EvidenceDependent BLOCKED → BLOCKED"; Expected = "BLOCKED"; Actual = $g2; Pass = ($g2 -eq "BLOCKED") }
+    if ($g2 -ne "BLOCKED") { $allPassed = $false }
+
+    # Test 3: MandatoryFunctional FAIL → FAIL/1
+    $r3 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "FAIL" },
+        [PSCustomObject]@{ Category = "EvidenceDependent"; Status = "PASS" }
+    )
+    $g3 = Get-OverallResult -Results $r3 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "MandatoryFunctional FAIL → FAIL"; Expected = "FAIL"; Actual = $g3; Pass = ($g3 -eq "FAIL") }
+    if ($g3 -ne "FAIL") { $allPassed = $false }
+
+    # Test 4: FAIL + BLOCKED → FAIL/1
+    $r4 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "FAIL" },
+        [PSCustomObject]@{ Category = "EvidenceDependent"; Status = "BLOCKED" }
+    )
+    $g4 = Get-OverallResult -Results $r4 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "FAIL + BLOCKED → FAIL"; Expected = "FAIL"; Actual = $g4; Pass = ($g4 -eq "FAIL") }
+    if ($g4 -ne "FAIL") { $allPassed = $false }
+
+    # Test 5: Fatal internal error → ERROR/3
+    $r5 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" }
+    )
+    $g5 = Get-OverallResult -Results $r5 -HasFatalInternalError $true -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "Fatal internal error → ERROR"; Expected = "ERROR"; Actual = $g5; Pass = ($g5 -eq "ERROR") }
+    if ($g5 -ne "ERROR") { $allPassed = $false }
+
+    # Test 6: Cleanup fatal error → ERROR/3
+    $r6 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "PASS" }
+    )
+    $g6 = Get-OverallResult -Results $r6 -HasFatalInternalError $false -CleanupErrorList @("ERR-CLEANUP-PROCESS: kill failed")
+    $tests += [PSCustomObject]@{ Name = "Cleanup fatal error → ERROR"; Expected = "ERROR"; Actual = $g6; Pass = ($g6 -eq "ERROR") }
+    if ($g6 -ne "ERROR") { $allPassed = $false }
+
+    # Test 7: No Gate-blocking tests → ERROR/3
+    $r7 = @(
+        [PSCustomObject]@{ Category = "Informational"; Status = "PASS" }
+    )
+    $g7 = Get-OverallResult -Results $r7 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "No Gate-blocking → ERROR"; Expected = "ERROR"; Actual = $g7; Pass = ($g7 -eq "ERROR") }
+    if ($g7 -ne "ERROR") { $allPassed = $false }
+
+    # Print results
+    Write-Host "`n=== Aggregation Self-Test ===" -ForegroundColor Cyan
+    foreach ($t in $tests) {
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
+    }
+
+    return $allPassed
 }
 
 # === Process tracking data structure ===
-# Each owned process record: PID, ParentPID, CreationDate, CommandLine, Depth, ExecutablePath
 $script:PreSnapshot = @{}          # PID -> snapshot record before test
 $script:HarnessLauncherPid = $null # Start-Process PID (may be CMD launcher)
 $script:HarnessNodePid = $null     # Actual Node harness PID (identified after launch)
-$script:OwnedProcessRecords = @()  # Array of process records with Depth
+$script:OwnedProcessRecords = @()  # Array of process records with Depth (only proven descendants)
 $script:HarnessReady = $false
+# R3-R3-05: Saved identity evidence before shutdown
+$script:SavedProcessEvidence = @() # Saved before shutdown for Test 20/23
+$script:SavedHarnessProven = $false
+$script:SavedHarnessEvidence = ""
 
 function Save-ProcessSnapshot {
     $snap = @{}
@@ -104,8 +210,10 @@ function Save-ProcessSnapshot {
     return $snap
 }
 
+# R3-R3-01: Process ownership ONLY via BFS/DFS from launcher; NO CommandLine wildcard matching
+# R3-R3-02: Only proven descendants get real Depth; unknown processes NEVER get fake Depth
 function Update-OwnedProcessRecords {
-    param([string]$TestDir, [int]$LauncherPid)
+    param([int]$LauncherPid)
 
     $allProcs = Get-CimInstance Win32_Process
     $byParent = @{}
@@ -115,7 +223,7 @@ function Update-OwnedProcessRecords {
         $byParent[$ppid] += $proc
     }
 
-    # BFS from launcher with depth tracking
+    # BFS from launcher with depth tracking — ONLY proven descendants
     $visited = @{}
     $queue = New-Object System.Collections.Queue
     $queue.Enqueue([PSCustomObject]@{ PID = $LauncherPid; Depth = 0 })
@@ -127,15 +235,24 @@ function Update-OwnedProcessRecords {
         $currentPid = $item.PID
         $currentDepth = $item.Depth
 
+        # R3-R3-01: Exclude current PowerShell $PID from owned set
+        if ($currentPid -eq $PID) { continue }
+
         $cim = $allProcs | Where-Object { [int]$_.ProcessId -eq $currentPid } | Select-Object -First 1
         if ($cim) {
-            $records += [PSCustomObject]@{
-                PID          = $currentPid
-                ParentPID    = [int]$cim.ParentProcessId
-                CreationDate = $cim.CreationDate
-                CommandLine  = $cim.CommandLine
-                Depth        = $currentDepth
-                ExecutablePath = $cim.ExecutablePath
+            # R3-R3-01: Must not exist in pre-snapshot (new process) OR must be proven via launcher ancestry
+            $isNewProcess = -not $script:PreSnapshot.ContainsKey($currentPid)
+            $isLauncherDescendant = $true  # BFS from launcher guarantees this
+
+            if ($isNewProcess -or $isLauncherDescendant) {
+                $records += [PSCustomObject]@{
+                    PID          = $currentPid
+                    ParentPID    = [int]$cim.ParentProcessId
+                    CreationDate = $cim.CreationDate
+                    CommandLine  = $cim.CommandLine
+                    Depth        = $currentDepth
+                    ExecutablePath = $cim.ExecutablePath
+                }
             }
         }
 
@@ -150,35 +267,36 @@ function Update-OwnedProcessRecords {
         }
     }
 
-    # Also include processes whose CommandLine contains exact $TestDir (not wildcard)
+    # R3-R3-01: REMOVED — no more CommandLine wildcard matching
+    # Only BFS-proven launcher descendants are owned
+
+    # R3-R3-01: Any process NOT provably owned → unverified (logged, NEVER killed)
+    $unverified = @()
     foreach ($proc in $allProcs) {
         $procPid = [int]$proc.ProcessId
-        if ($visited.ContainsKey($procPid)) { continue }
-        if ($proc.CommandLine -and $proc.CommandLine -like "*$TestDir*") {
-            $records += [PSCustomObject]@{
-                PID          = $procPid
-                ParentPID    = [int]$proc.ParentProcessId
-                CreationDate = $proc.CreationDate
-                CommandLine  = $proc.CommandLine
-                Depth        = 999  # Unknown depth, terminate last
-                ExecutablePath = $proc.ExecutablePath
+        if (-not $visited.ContainsKey($procPid) -and $procPid -ne $PID) {
+            # Check if it might be test-related but unprovable
+            if ($proc.CommandLine -and $proc.CommandLine -like "*$TEST_DIR*") {
+                $unverified += $procPid
             }
         }
+    }
+    if ($unverified.Count -gt 0) {
+        Write-Host "  INFO: $($unverified.Count) unverified processes with test dir in CommandLine (NOT owned, NOT killed)" -ForegroundColor DarkYellow
     }
 
     $script:OwnedProcessRecords = $records
 }
 
 function Stop-OwnedProcesses {
-    # Re-validate each process identity before terminating
-    # Sort by Depth descending (deepest first)
+    # R3-R3-02: Sort by Depth descending (deepest first → launcher last)
     $sorted = $script:OwnedProcessRecords | Sort-Object -Property Depth -Descending
     foreach ($record in $sorted) {
         $processId = $record.PID
         $proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
         if (-not $proc -or $proc.HasExited) { continue }
 
-        # Re-validate identity via CIM
+        # R3-R3-01: Re-validate identity via CIM before termination
         $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
         if (-not $cim) { continue }
 
@@ -190,6 +308,12 @@ function Stop-OwnedProcesses {
         # CommandLine check (if we have one)
         if ($record.CommandLine -and $cim.CommandLine -ne $record.CommandLine) {
             Write-Host "  SKIP PID $processId`: CommandLine mismatch" -ForegroundColor Yellow
+            continue
+        }
+
+        # R3-R3-01: Final safety check — never kill current PowerShell
+        if ($processId -eq $PID) {
+            Write-Host "  SKIP PID $processId`: current PowerShell process" -ForegroundColor Yellow
             continue
         }
 
@@ -205,6 +329,7 @@ function Stop-OwnedProcesses {
 }
 
 # === Cleanup function (independent, resilient) ===
+# R3-R3-04: Each cleanup phase has independent try/catch; exceptions generate ERR-CLEANUP-* and set fatal error
 function Invoke-Cleanup {
     param([string]$TestDir, [int]$Port, [bool]$Keep)
 
@@ -215,7 +340,16 @@ function Invoke-Cleanup {
         Stop-OwnedProcesses
         $cleanupResults += "Process cleanup: OK"
     } catch {
+        $errMsg = "ERR-CLEANUP-PROCESS: $($_.Exception.Message)"
         $cleanupResults += "Process cleanup: FAILED - $($_.Exception.Message)"
+        $script:CleanupErrors += $errMsg
+        Add-TestResult -TestId "CLEANUP-PROCESS" -Category "CleanupError" `
+          -Description "Process cleanup phase" `
+          -Expected "All owned processes terminated" `
+          -Actual "Exception: $($_.Exception.Message)" -Status "FAIL" `
+          -ErrorSummary $errMsg
+        $script:FatalInternalError = $true
+        $script:FatalInternalErrorMessage = $errMsg
     }
 
     # Step 2: Orphan check
@@ -247,7 +381,16 @@ function Invoke-Cleanup {
             $cleanupResults += "Orphan check: OK"
         }
     } catch {
+        $errMsg = "ERR-CLEANUP-ORPHAN: $($_.Exception.Message)"
         $cleanupResults += "Orphan check: ERROR - $($_.Exception.Message)"
+        $script:CleanupErrors += $errMsg
+        Add-TestResult -TestId "CLEANUP-ORPHAN" -Category "CleanupError" `
+          -Description "Orphan check phase" `
+          -Expected "Orphan check completes" `
+          -Actual "Exception: $($_.Exception.Message)" -Status "FAIL" `
+          -ErrorSummary $errMsg
+        $script:FatalInternalError = $true
+        $script:FatalInternalErrorMessage = $errMsg
     }
 
     # Step 3: Port release
@@ -267,7 +410,16 @@ function Invoke-Cleanup {
             $cleanupResults += "Port check: OK"
         }
     } catch {
+        $errMsg = "ERR-CLEANUP-PORT: $($_.Exception.Message)"
         $cleanupResults += "Port check: ERROR - $($_.Exception.Message)"
+        $script:CleanupErrors += $errMsg
+        Add-TestResult -TestId "CLEANUP-PORT" -Category "CleanupError" `
+          -Description "Port check phase" `
+          -Expected "Port check completes" `
+          -Actual "Exception: $($_.Exception.Message)" -Status "FAIL" `
+          -ErrorSummary $errMsg
+        $script:FatalInternalError = $true
+        $script:FatalInternalErrorMessage = $errMsg
     }
 
     # Step 4: Temp directory
@@ -286,18 +438,26 @@ function Invoke-Cleanup {
                 $cleanupResults += "Temp cleanup: OK (not found)"
             }
         } else {
+            # R3-R3-04: KeepArtifacts is user choice → Informational only
             Add-TestResult -TestId "25" -Category "Informational" `
               -Description "Temp directory cleanup (user kept artifacts)" `
               -Expected "Skipped by user" -Actual "Kept at $TestDir" -Status "SKIPPED_BY_USER"
             $cleanupResults += "Temp cleanup: SKIPPED_BY_USER"
         }
     } catch {
-        Add-TestResult -TestId "25" -Category "MandatoryFunctional" `
-          -Description "Temp directory cleanup" `
-          -Expected "$TestDir removed" `
-          -Actual "Failed: $($_.Exception.Message)" -Status "FAIL" `
-          -ErrorSummary "Could not remove temp directory"
-        $cleanupResults += "Temp cleanup: FAILED"
+        $errMsg = "ERR-CLEANUP-TEMPDIR: $($_.Exception.Message)"
+        $cleanupResults += "Temp cleanup: FAILED - $($_.Exception.Message)"
+        $script:CleanupErrors += $errMsg
+        # R3-R3-04: Non-KeepArtifacts directory removal failure → FAIL
+        if (-not $Keep) {
+            Add-TestResult -TestId "25" -Category "MandatoryFunctional" `
+              -Description "Temp directory cleanup" `
+              -Expected "$TestDir removed" `
+              -Actual "Failed: $($_.Exception.Message)" -Status "FAIL" `
+              -ErrorSummary "Could not remove temp directory"
+        }
+        $script:FatalInternalError = $true
+        $script:FatalInternalErrorMessage = $errMsg
     }
 
     return $cleanupResults
@@ -306,18 +466,40 @@ function Invoke-Cleanup {
 # === Config ===
 $DSH_VERSION = "0.1.0-rc.8"
 $TEST_PORT = 3080
-$TEST_ID = "g0s1r3r2-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+$TEST_ID = "g0s1r3r3-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 $TEST_DIR = Join-Path $env:TEMP "hawkai-$TEST_ID"
 $DSH_HOME = Join-Path $TEST_DIR "dsh-home"
 $WORKSPACE = Join-Path $TEST_DIR "workspace"
 $script:HarnessProcess = $null
+
+# ================================================================
+# R3-R3-08: Run aggregation self-tests BEFORE any external operations
+# ================================================================
+Write-Host "=== R3-R3-08: Aggregation self-test ===" -ForegroundColor Cyan
+$selfTestPassed = Test-GetOverallResult
+if (-not $selfTestPassed) {
+    Write-Host "FATAL: Aggregation self-test failed. Aborting." -ForegroundColor Red
+    Add-TestResult -TestId "SELFTEST" -Category "ScriptInternal" `
+      -Description "Aggregation self-test" `
+      -Expected "All 7 self-tests pass" `
+      -Actual "One or more self-tests failed" -Status "FAIL" `
+      -ErrorSummary "Aggregation self-test failed before harness launch"
+    $script:FatalInternalError = $true
+    $script:FatalInternalErrorMessage = "Aggregation self-test failed"
+    # Exit immediately — do not proceed to harness launch
+    try {
+        Write-Host "`n=== TEST RESULTS (aborted) ===" -ForegroundColor Cyan
+        $script:TestResults | Format-Table TestId, Category, Status, Description -AutoSize
+    } catch {}
+    exit 3
+}
 
 # === Main execution ===
 $cleanupLog = @()
 $mainError = $null
 
 try {
-    Write-Host "=== HawkAIAgent G0-S1-R3-R2 Windows PoC ===" -ForegroundColor Cyan
+    Write-Host "`n=== HawkAIAgent G0-S1-R3-R3 Windows PoC ===" -ForegroundColor Cyan
     Write-Host "Test ID: $TEST_ID"
     Write-Host "Test dir: $TEST_DIR"
 
@@ -495,7 +677,6 @@ try {
         $versionErrors += "Installed package.json not found"
     }
 
-    # All three must be non-null and equal
     if ($versionErrors.Count -gt 0) {
         Add-TestResult -TestId "4" -Category "MandatoryFunctional" `
           -Description "Lockfile version verification" `
@@ -555,10 +736,12 @@ try {
     }
 
     # ================================================================
-    # Test 6: Native dependency detection (recursive + load test)
-    # Category: Informational
+    # Test 6: Native addon detection (R3-R3-06: Gate-blocking)
+    # Category: EvidenceDependent (was Informational)
     # ================================================================
-    Write-Host "`n=== Test 6: Native dependency detection ===" -ForegroundColor Cyan
+    Write-Host "`n=== Test 6: Native addon detection ===" -ForegroundColor Cyan
+
+    # R3-R3-06: Determine expected native addons from lockfile/dependency tree
     $nativeDepsToCheck = @("node-pty", "koffi", "better-sqlite3", "sqlite3", "node-pty-prebuilt-multiarch")
     $foundNative = @()
 
@@ -567,10 +750,18 @@ try {
         foreach ($foundDir in $found) {
             $pkgJsonPath = Join-Path $foundDir.FullName "package.json"
             $ver = "unknown"
+            $isOptional = $false
             if (Test-Path $pkgJsonPath) {
-                try { $ver = (Get-Content $pkgJsonPath -Raw | ConvertFrom-Json).version } catch {}
+                try {
+                    $pkgContent = Get-Content $pkgJsonPath -Raw | ConvertFrom-Json
+                    $ver = $pkgContent.version
+                    if ($pkgContent.optional -eq $true) { $isOptional = $true }
+                    if ($pkgContent.os -and $pkgContent.os -notcontains "win32") { $isOptional = $true }
+                    if ($pkgContent.cpu -and $pkgContent.cpu -notcontains "x64") { $isOptional = $true }
+                } catch {}
             }
-            # Real load test from correct directory
+
+            # Real load test
             $loadExit = -1
             $loadOutput = ""
             Push-Location $TEST_DIR
@@ -585,42 +776,79 @@ try {
             }
 
             $foundNative += [PSCustomObject]@{
-                Name    = $depName
-                Path    = $foundDir.FullName
-                Version = $ver
-                LoadExit = $loadExit
+                Name       = $depName
+                Path       = $foundDir.FullName
+                Version    = $ver
+                LoadExit   = $loadExit
                 LoadOutput = if ($loadOutput) { $loadOutput.Trim() } else { "" }
+                IsOptional = $isOptional
             }
         }
     }
 
+    # R3-R3-06: Gate-blocking determination
     if ($foundNative.Count -gt 0) {
         $summary = ($foundNative | ForEach-Object {
-            "$($_.Name)@$($_.Version) exit=$($_.LoadExit) at $($_.Path)"
+            "$($_.Name)@$($_.Version) exit=$($_.LoadExit) optional=$($_.IsOptional)"
         }) -join "; "
-        # Check if any load failures
         $loadFailures = $foundNative | Where-Object { $_.LoadExit -ne 0 }
+
         if ($loadFailures.Count -gt 0) {
-            Add-TestResult -TestId "6" -Category "Informational" `
-              -Description "Native dependencies (recursive search + load test)" `
-              -Expected "Document presence and loadability" `
-              -Actual "LOAD FAILURES: $(($loadFailures | ForEach-Object { "$($_.Name)@$($_.Version): $($_.LoadOutput)" }) -join '; ')" `
+            # R3-R3-06: Found but failed to load → EvidenceDependent FAIL
+            $failureDetails = ($loadFailures | ForEach-Object {
+                "$($_.Name)@$($_.Version): exit=$($_.LoadExit) $($_.LoadOutput)"
+            }) -join "; "
+            Add-TestResult -TestId "6" -Category "EvidenceDependent" `
+              -Description "Native addon detection and load test" `
+              -Expected "All expected native addons load successfully" `
+              -Actual "LOAD FAILURES: $failureDetails" `
               -Status "FAIL" -ErrorSummary "Native addon(s) found but failed to load"
         } else {
-            Add-TestResult -TestId "6" -Category "Informational" `
-              -Description "Native dependencies (recursive search + load test)" `
-              -Expected "Document presence and loadability" `
-              -Actual "Found: $summary" -Status "PASS"
+            $windowsExpected = $foundNative | Where-Object { -not $_.IsOptional }
+            if ($windowsExpected.Count -gt 0) {
+                Add-TestResult -TestId "6" -Category "EvidenceDependent" `
+                  -Description "Native addon detection and load test" `
+                  -Expected "Expected Windows native addons load" `
+                  -Actual "All loaded: $summary" -Status "PASS"
+            } else {
+                Add-TestResult -TestId "6" -Category "Informational" `
+                  -Description "Native addon detection (all optional)" `
+                  -Expected "Optional addons documented" `
+                  -Actual "Found: $summary" -Status "PASS"
+            }
         }
     } else {
-        Add-TestResult -TestId "6" -Category "Informational" `
-          -Description "Native dependencies (recursive search + load test)" `
-          -Expected "Document presence" `
-          -Actual "None of [$($nativeDepsToCheck -join ', ')] found in install tree" -Status "PASS"
+        # R3-R3-06: None found — check if any were expected
+        $dshPkgPath = Join-Path $TEST_DIR "node_modules" "@deepseek-ai" "dsh" "package.json"
+        $expectedNative = @()
+        if (Test-Path $dshPkgPath) {
+            try {
+                $dshPkg = Get-Content $dshPkgPath -Raw | ConvertFrom-Json
+                $allDeps = @()
+                if ($dshPkg.dependencies) { $allDeps += $dshPkg.dependencies.PSObject.Properties.Name }
+                if ($dshPkg.optionalDependencies) { $allDeps += $dshPkg.optionalDependencies.PSObject.Properties.Name }
+                $expectedNative = $allDeps | Where-Object { $_ -in $nativeDepsToCheck }
+            } catch {}
+        }
+
+        if ($expectedNative.Count -gt 0) {
+            Add-TestResult -TestId "6" -Category "EvidenceDependent" `
+              -Description "Native addon detection" `
+              -Expected "Expected native addons: $($expectedNative -join ', ')" `
+              -Actual "None of [$($nativeDepsToCheck -join ', ')] found in install tree" `
+              -Status "BLOCKED" `
+              -ErrorSummary "Expected native addons not found — may need Windows Phase A install"
+        } else {
+            Add-TestResult -TestId "6" -Category "Informational" `
+              -Description "Native addon detection" `
+              -Expected "Document presence" `
+              -Actual "None of [$($nativeDepsToCheck -join ', ')] found; not expected for current platform" `
+              -Status "PASS"
+        }
     }
 
     # ================================================================
-    # Test 7: Client module host-side resolution (from correct directory)
+    # Test 7: Client module host-side resolution
     # Category: MandatoryFunctional
     # ================================================================
     Write-Host "`n=== Test 7: Client module host-side resolution ===" -ForegroundColor Cyan
@@ -638,7 +866,6 @@ try {
         $loadExit = -1
         $loadOutput = ""
 
-        # Run require() from $TEST_DIR context
         Push-Location $TEST_DIR
         try {
             $nodeRequire = "try { require('$mod'); process.exit(0) } catch(e) { console.error(e.message); process.exit(1) }"
@@ -660,13 +887,13 @@ try {
 
     if ($anyModuleFailed) {
         Add-TestResult -TestId "7" -Category "MandatoryFunctional" `
-          -Description "Client packages host-side resolution (from `$TEST_DIR context)" `
+          -Description "Client packages host-side resolution" `
           -Expected "All 3 packages require() exit 0 from correct project directory" `
           -Actual ($moduleResults -join "; ") -Status "FAIL" `
           -ErrorSummary "One or more client packages failed host-side load"
     } else {
         Add-TestResult -TestId "7" -Category "MandatoryFunctional" `
-          -Description "Client packages host-side resolution (from `$TEST_DIR context)" `
+          -Description "Client packages host-side resolution" `
           -Expected "All 3 packages require() exit 0" `
           -Actual ($moduleResults -join "; ") -Status "PASS"
     }
@@ -732,8 +959,8 @@ try {
         Write-Host "WARNING: Could not identify real Harness Node PID" -ForegroundColor Yellow
     }
 
-    # Update owned processes
-    Update-OwnedProcessRecords -TestDir $TEST_DIR -LauncherPid $script:HarnessLauncherPid
+    # R3-R3-01: Update owned processes — ONLY BFS-proven descendants
+    Update-OwnedProcessRecords -LauncherPid $script:HarnessLauncherPid
 
     # Readiness probe
     $maxWait = 30
@@ -753,7 +980,8 @@ try {
               -Body '{"method":"host.describe"}' -TimeoutSec 3 -ErrorAction Stop
             if ($response.StatusCode -eq 200) {
                 $script:HarnessReady = $true
-                Update-OwnedProcessRecords -TestDir $TEST_DIR -LauncherPid $script:HarnessLauncherPid
+                # R3-R3-05: Refresh owned process tree while harness is running
+                Update-OwnedProcessRecords -LauncherPid $script:HarnessLauncherPid
                 Add-TestResult -TestId "8" -Category "MandatoryFunctional" `
                   -Description "Harness startup and readiness" `
                   -Expected "host.describe returns 200 within ${maxWait}s" `
@@ -772,7 +1000,7 @@ try {
     }
 
     # ================================================================
-    # Test 9: host.describe with full Typert envelope validation
+    # Test 9: host.describe with full envelope validation
     # Category: MandatoryFunctional
     # ================================================================
     if ($script:HarnessReady) {
@@ -840,7 +1068,7 @@ try {
     }
 
     # ================================================================
-    # Test 10: HTTP Content-Type fence (fail-closed)
+    # Test 10: HTTP Content-Type fence
     # Category: MandatorySecurity
     # ================================================================
     if ($script:HarnessReady) {
@@ -849,7 +1077,6 @@ try {
             $response = Invoke-WebRequest -Uri "http://127.0.0.1:$TEST_PORT/api" `
               -Method POST -ContentType "text/plain" `
               -Body '{"method":"host.describe"}' -TimeoutSec 5 -ErrorAction Stop
-            # Accepted → FAIL
             Add-TestResult -TestId "10" -Category "MandatorySecurity" `
               -Description "Content-Type fence: text/plain must be rejected" `
               -Expected "4xx rejection" `
@@ -882,7 +1109,7 @@ try {
     }
 
     # ================================================================
-    # Test 11: Invalid Origin rejection (fail-closed)
+    # Test 11: Invalid Origin rejection
     # Category: MandatorySecurity
     # ================================================================
     if ($script:HarnessReady) {
@@ -924,7 +1151,7 @@ try {
     }
 
     # ================================================================
-    # Test 12: Invalid Host / loopback fence (fail-closed)
+    # Test 12: Invalid Host / loopback fence
     # Category: MandatorySecurity
     # ================================================================
     if ($script:HarnessReady) {
@@ -1050,7 +1277,7 @@ try {
     }
 
     # ================================================================
-    # Test 15: WS frame/envelope reception (fragment-aware, strict)
+    # Test 15: WS frame/envelope reception (R3-R3-07: strict validation)
     # Category: EvidenceDependent
     # ================================================================
     if ($script:HarnessReady) {
@@ -1067,9 +1294,8 @@ try {
                   -Actual "WS not open (state=$($ws.State))" -Status "BLOCKED" `
                   -ErrorSummary "BLOCKED — WS connection failed"
             } else {
-                # Read loop: accumulate until EndOfMessage or timeout
-                $buffer = [byte[]]::new(65536)
-                $totalBytes = 0
+                # R3-R3-07: Use growable MemoryStream instead of fixed 64KB buffer
+                $memStream = New-Object System.IO.MemoryStream
                 $endOfMessage = $false
                 $messageType = $null
                 $cts = New-Object System.Threading.CancellationTokenSource(8000)
@@ -1077,17 +1303,32 @@ try {
 
                 try {
                     do {
-                        $receiveTask = $ws.ReceiveAsync([ArraySegment[byte]]::new($buffer, $totalBytes, $buffer.Length - $totalBytes), $cts.Token)
+                        $chunkBuffer = [byte[]]::new(32768)  # 32KB read chunks
+                        $receiveTask = $ws.ReceiveAsync([ArraySegment[byte]]::new($chunkBuffer), $cts.Token)
                         if (-not $receiveTask.Wait(9000)) { break }
                         $result = $receiveTask.Result
                         if ($null -eq $messageType) { $messageType = $result.MessageType }
-                        $totalBytes += $result.Count
+
+                        # R3-R3-07: Check accumulated size BEFORE adding chunk
+                        if ($memStream.Length + $result.Count -gt $maxSize) {
+                            Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                              -Description "WS frame/envelope reception" `
+                              -Expected "Message within 1MB limit" `
+                              -Actual "Message exceeded 1MB ($($memStream.Length + $result.Count) bytes)" `
+                              -Status "FAIL" -ErrorSummary "Frame too large"
+                            $memStream.Dispose()
+                            try { $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::MessageTooBig, "Too large", [System.Threading.CancellationToken]::None).Wait(2000) | Out-Null } catch {}
+                            break
+                        }
+
+                        $memStream.Write($chunkBuffer, 0, $result.Count)
                         $endOfMessage = $result.EndOfMessage
-                        if ($totalBytes -ge $maxSize) { break }
                     } while (-not $endOfMessage)
                 } catch {
                     # ReceiveAsync threw
                 }
+
+                $totalBytes = $memStream.Length
 
                 if ($totalBytes -eq 0) {
                     Add-TestResult -TestId "15" -Category "EvidenceDependent" `
@@ -1102,51 +1343,76 @@ try {
                       -Expected "Text or binary frame" `
                       -Actual "Received Close frame" -Status "FAIL" `
                       -ErrorSummary "WebSocket closed by server"
+                } elseif ($messageType -ne [System.Net.WebSockets.WebSocketMessageType]::Text) {
+                    # R3-R3-07: Non-Text frame → FAIL
+                    Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                      -Description "WS frame/envelope reception" `
+                      -Expected "Text frame" `
+                      -Actual "Non-text MessageType: $messageType" -Status "FAIL" `
+                      -ErrorSummary "Non-text WebSocket frame"
+                } elseif (-not $endOfMessage) {
+                    # R3-R3-07: Did not reach EndOfMessage → FAIL
+                    Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                      -Description "WS frame/envelope reception" `
+                      -Expected "Complete message (EndOfMessage=true)" `
+                      -Actual "Incomplete message ($totalBytes bytes, no EndOfMessage)" `
+                      -Status "FAIL" -ErrorSummary "Message not complete"
                 } else {
-                    # Validate frame content
-                    $frameValid = $true
-                    $frameErrors = @()
-
-                    if ($messageType -ne [System.Net.WebSockets.WebSocketMessageType]::Text) {
-                        $frameErrors += "Non-text MessageType: $messageType"
-                    }
-
+                    # R3-R3-07: Strict UTF-8 decode (throws on invalid bytes)
                     $decodedText = $null
+                    $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
                     try {
-                        $decodedText = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $totalBytes)
+                        $memStream.Position = 0
+                        $reader = New-Object System.IO.StreamReader($memStream, $utf8Strict)
+                        $decodedText = $reader.ReadToEnd()
                     } catch {
-                        $frameValid = $false
-                        $frameErrors += "UTF-8 decode failed"
+                        # Invalid UTF-8 bytes
                     }
 
-                    if ($decodedText) {
-                        try {
-                            $decodedText | ConvertFrom-Json | Out-Null
-                        } catch {
-                            $frameValid = $false
-                            $frameErrors += "JSON parse failed"
+                    if (-not $decodedText) {
+                        Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                          -Description "WS frame/envelope reception" `
+                          -Expected "Valid UTF-8 text" `
+                          -Actual "UTF-8 decode failed (invalid bytes)" -Status "FAIL" `
+                          -ErrorSummary "Strict UTF-8 decode failed"
+                    } else {
+                        # R3-R3-07: JSON parse
+                        $parsed = $null
+                        $jsonError = $null
+                        try { $parsed = $decodedText | ConvertFrom-Json } catch { $jsonError = $_.Exception.Message }
+
+                        if (-not $parsed) {
+                            Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                              -Description "WS frame/envelope reception" `
+                              -Expected "Valid JSON" `
+                              -Actual "JSON parse failed: $jsonError" -Status "FAIL" `
+                              -ErrorSummary "Invalid JSON"
+                        } else {
+                            # R3-R3-07: Envelope validation — must have verifiable structure
+                            $hasType = $null -ne $parsed.type -or $null -ne $parsed.method -or $null -ne $parsed.event
+                            $hasIdOrResult = $null -ne $parsed.id -or $null -ne $parsed.result -or $null -ne $parsed.params
+
+                            if ($hasType -or $hasIdOrResult) {
+                                $preview = $decodedText.Substring(0, [Math]::Min(200, $decodedText.Length))
+                                Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                                  -Description "WS frame/envelope reception" `
+                                  -Expected "Valid frame + valid UTF-8 + valid JSON + envelope structure" `
+                                  -Actual "$totalBytes bytes, type=$messageType, EndOfMessage=true, envelope=valid, preview=$preview" `
+                                  -Status "PASS"
+                            } else {
+                                # R3-R3-07: JSON parse OK but envelope structure unverified → BLOCKED
+                                Add-TestResult -TestId "15" -Category "EvidenceDependent" `
+                                  -Description "WS frame/envelope reception" `
+                                  -Expected "Verifiable envelope structure" `
+                                  -Actual "$totalBytes bytes, JSON valid but envelope contract unverified (no type/method/event/id/result/params)" `
+                                  -Status "BLOCKED" `
+                                  -ErrorSummary "BLOCKED — envelope contract not yet verified from upstream types"
+                            }
                         }
-                    } else {
-                        $frameValid = $false
-                        $frameErrors += "Empty decoded text"
-                    }
-
-                    if ($frameValid) {
-                        $preview = $decodedText.Substring(0, [Math]::Min(200, $decodedText.Length))
-                        Add-TestResult -TestId "15" -Category "EvidenceDependent" `
-                          -Description "WS frame/envelope reception" `
-                          -Expected "Count > 0, valid MessageType, text decodable, JSON parseable" `
-                          -Actual "Received $totalBytes bytes, type=$messageType, JSON valid, preview=$preview" `
-                          -Status "PASS"
-                    } else {
-                        Add-TestResult -TestId "15" -Category "EvidenceDependent" `
-                          -Description "WS frame/envelope reception" `
-                          -Expected "Valid frame" `
-                          -Actual "Received $totalBytes bytes but: $($frameErrors -join '; ')" `
-                          -Status "FAIL" -ErrorSummary ($frameErrors -join "; ")
                     }
                 }
 
+                $memStream.Dispose()
                 try { $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "", [System.Threading.CancellationToken]::None).Wait(2000) | Out-Null } catch {}
             }
         } catch {
@@ -1163,14 +1429,20 @@ try {
     }
 
     # ================================================================
-    # Test 16: No-key error path (must prove credential error)
+    # Test 16: No-key error path (R3-R3-09: strict RPC contract)
     # Category: EvidenceDependent
     # ================================================================
     if ($script:HarnessReady) {
         Write-Host "`n=== Test 16: No-key error path ===" -ForegroundColor Cyan
-        # First create a valid session context via session.create
+
+        # R3-R3-09: RPC names must be verified from upstream @deepseek-ai/dsh@0.1.0-rc.8
+        # Current evidence: guessing session.create / agent.followup
+        # Pre-flight doc must record evidence; without verified contract → BLOCKED
+
         $sessionId = $null
+        $sessionCreateUsed = $false
         try {
+            # R3-R3-09: Only use RPC method if contract is verified
             $createBody = '{"method":"session.create","params":{}}'
             $createResp = Invoke-WebRequest -Uri "http://127.0.0.1:$TEST_PORT/api" `
               -Method POST -ContentType "application/json" `
@@ -1179,108 +1451,168 @@ try {
                 $createParsed = $createResp.Content | ConvertFrom-Json
                 if ($createParsed.result -and $createParsed.result.sessionId) {
                     $sessionId = $createParsed.result.sessionId
+                    $sessionCreateUsed = $true
                 } elseif ($createParsed.result -and $createParsed.result.id) {
                     $sessionId = $createParsed.result.id
+                    $sessionCreateUsed = $true
                 }
             }
         } catch {
-            # session.create failed — may still be usable
+            # R3-R3-09: session.create failed — do NOT proceed with followup
         }
 
-        # Now try agent.followup to trigger model call
-        $followupBody = if ($sessionId) {
-            "{\"method\":\"agent.followup\",\"params\":{\"prompt\":\"hello\",\"sessionId\":\"$sessionId\"}}"
-        } else {
-            '{"method":"agent.followup","params":{"prompt":"hello"}}'
-        }
-
-        $noKeyStatus = $null
-        $noKeyContent = $null
-        try {
-            $response = Invoke-WebRequest -Uri "http://127.0.0.1:$TEST_PORT/api" `
-              -Method POST -ContentType "application/json" `
-              -Body $followupBody -TimeoutSec 15 -ErrorAction Stop
-            $noKeyStatus = $response.StatusCode
-            $noKeyContent = $response.Content
-        } catch {
-            try { $noKeyStatus = [int]$_.Exception.Response.StatusCode } catch {}
-            try {
-                $stream = $_.Exception.Response.GetResponseStream()
-                if ($stream) {
-                    $reader = New-Object System.IO.StreamReader($stream)
-                    $noKeyContent = $reader.ReadToEnd()
-                }
-            } catch {}
-        }
-
-        if ($null -eq $noKeyStatus) {
+        if (-not $sessionCreateUsed) {
+            # R3-R3-09: Cannot create session → cannot safely test no-key path
             Add-TestResult -TestId "16" -Category "EvidenceDependent" `
-              -Description "No-key error path (agent.followup without API key)" `
-              -Expected "Response indicating missing credentials" `
-              -Actual "No HTTP response received" -Status "BLOCKED" `
-              -ErrorSummary "BLOCKED — no-key model-call contract not yet verified"
-        } elseif ($noKeyStatus -ge 200 -and $noKeyStatus -lt 300) {
-            # 2xx — check envelope for credential error
-            $parsed = $null
-            if ($noKeyContent) {
-                try { $parsed = $noKeyContent | ConvertFrom-Json } catch {}
-            }
-            $hasCredentialError = $false
-            if ($parsed) {
-                $errorStr = ""
-                if ($parsed.error) { $errorStr = ($parsed.error | ConvertTo-Json -Compress) }
-                elseif ($parsed.result -and $parsed.result.error) { $errorStr = ($parsed.result.error | ConvertTo-Json -Compress) }
-                if ($errorStr -match "(?i)(credential|api.?key|provider|auth|token|missing)") {
-                    $hasCredentialError = $true
-                }
-            }
-            if ($hasCredentialError) {
-                Add-TestResult -TestId "16" -Category "EvidenceDependent" `
-                  -Description "No-key error path (agent.followup without API key)" `
-                  -Expected "Credential/provider/API-key error" `
-                  -Actual "HTTP $noKeyStatus with credential error in envelope" -Status "PASS"
-            } else {
-                $bodyPreview = if ($noKeyContent) { $noKeyContent.Substring(0, [Math]::Min(300, $noKeyContent.Length)) } else { "(empty)" }
-                Add-TestResult -TestId "16" -Category "EvidenceDependent" `
-                  -Description "No-key error path (agent.followup without API key)" `
-                  -Expected "Credential/provider/API-key error" `
-                  -Actual "HTTP $noKeyStatus but no recognizable credential error. Body: $bodyPreview" `
-                  -Status "BLOCKED" `
-                  -ErrorSummary "BLOCKED — no-key model-call contract not yet verified (2xx without clear credential error)"
-            }
+              -Description "No-key error path" `
+              -Expected "Verified RPC contract for session.create → agent.followup" `
+              -Actual "session.create did not return usable session; cannot test followup safely" `
+              -Status "BLOCKED" `
+              -ErrorSummary "BLOCKED — RPC contract not verified; session.create failed; cannot safely test agent.followup without valid context"
         } else {
-            # Non-2xx — check if it's clearly a credential error
-            $bodyPreview = ""
-            if ($noKeyContent) { $bodyPreview = $noKeyContent.Substring(0, [Math]::Min(300, $noKeyContent.Length)) }
-            $isCredentialError = $bodyPreview -match "(?i)(credential|api.?key|provider|auth|token|missing)"
-            $isAmbiguous = $bodyPreview -match "(?i)(not.?found|method|session|param|schema)"
+            # R3-R3-09: Session created — now test followup
+            $followupBody = "{`"method`":`"agent.followup`",`"params`":{`"prompt`":`"hello`",`"sessionId`":`"$sessionId`"}}"
 
-            if ($isCredentialError -and -not $isAmbiguous) {
+            $noKeyStatus = $null
+            $noKeyContent = $null
+            try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:$TEST_PORT/api" `
+                  -Method POST -ContentType "application/json" `
+                  -Body $followupBody -TimeoutSec 15 -ErrorAction Stop
+                $noKeyStatus = $response.StatusCode
+                $noKeyContent = $response.Content
+            } catch {
+                try { $noKeyStatus = [int]$_.Exception.Response.StatusCode } catch {}
+                try {
+                    $stream = $_.Exception.Response.GetResponseStream()
+                    if ($stream) {
+                        $reader = New-Object System.IO.StreamReader($stream)
+                        $noKeyContent = $reader.ReadToEnd()
+                    }
+                } catch {}
+            }
+
+            if ($null -eq $noKeyStatus) {
                 Add-TestResult -TestId "16" -Category "EvidenceDependent" `
                   -Description "No-key error path (agent.followup without API key)" `
-                  -Expected "Credential/provider/API-key error" `
-                  -Actual "HTTP $noKeyStatus with credential error. Body: $bodyPreview" `
-                  -Status "PASS"
-            } elseif ($isAmbiguous) {
-                Add-TestResult -TestId "16" -Category "EvidenceDependent" `
-                  -Description "No-key error path (agent.followup without API key)" `
-                  -Expected "Credential error (not session/method error)" `
-                  -Actual "HTTP $noKeyStatus but ambiguous (session/method/param). Body: $bodyPreview" `
-                  -Status "BLOCKED" `
-                  -ErrorSummary "BLOCKED — could not distinguish credential error from session/method error"
-            } else {
-                Add-TestResult -TestId "16" -Category "EvidenceDependent" `
-                  -Description "No-key error path (agent.followup without API key)" `
-                  -Expected "Credential error" `
-                  -Actual "HTTP $noKeyStatus. Body: $bodyPreview" `
-                  -Status "BLOCKED" `
+                  -Expected "Response indicating missing credentials" `
+                  -Actual "No HTTP response received" -Status "BLOCKED" `
                   -ErrorSummary "BLOCKED — no-key model-call contract not yet verified"
+            } elseif ($noKeyStatus -ge 200 -and $noKeyStatus -lt 300) {
+                # R3-R3-09: 2xx — envelope must have structured error code
+                $parsed = $null
+                if ($noKeyContent) {
+                    try { $parsed = $noKeyContent | ConvertFrom-Json } catch {}
+                }
+                $hasCredentialError = $false
+                if ($parsed) {
+                    # R3-R3-09: Must match structured error code/field, not broad regex
+                    $errorCode = ""
+                    if ($parsed.error) {
+                        if ($parsed.error.code) { $errorCode = [string]$parsed.error.code }
+                        elseif ($parsed.error -is [string]) { $errorCode = $parsed.error }
+                    }
+                    if ($parsed.result -and $parsed.result.error) {
+                        if ($parsed.result.error.code) { $errorCode = [string]$parsed.result.error.code }
+                        elseif ($parsed.result.error -is [string]) { $errorCode = $parsed.result.error }
+                    }
+                    # R3-R3-09: Only match specific credential-related error codes
+                    if ($errorCode -match "^(missing_api_key|unauthorized|authentication_required|provider_not_configured|MISSING_CREDENTIALS)$") {
+                        $hasCredentialError = $true
+                    }
+                }
+                if ($hasCredentialError) {
+                    Add-TestResult -TestId "16" -Category "EvidenceDependent" `
+                      -Description "No-key error path (agent.followup without API key)" `
+                      -Expected "Structured credential error code" `
+                      -Actual "HTTP $noKeyStatus with verified credential error code" -Status "PASS"
+                } else {
+                    $bodyPreview = if ($noKeyContent) { $noKeyContent.Substring(0, [Math]::Min(300, $noKeyContent.Length)) } else { "(empty)" }
+                    Add-TestResult -TestId "16" -Category "EvidenceDependent" `
+                      -Description "No-key error path (agent.followup without API key)" `
+                      -Expected "Structured credential error code" `
+                      -Actual "HTTP $noKeyStatus but no verified credential error code. Body: $bodyPreview" `
+                      -Status "BLOCKED" `
+                      -ErrorSummary "BLOCKED — no-key model-call contract not yet verified (2xx without structured credential error)"
+                }
+            } else {
+                # R3-R3-09: Non-2xx — check for specific error code, not broad regex
+                $bodyPreview = ""
+                if ($noKeyContent) { $bodyPreview = $noKeyContent.Substring(0, [Math]::Min(300, $noKeyContent.Length)) }
+
+                $parsed = $null
+                try { $parsed = $noKeyContent | ConvertFrom-Json } catch {}
+
+                $errorCode = ""
+                if ($parsed -and $parsed.error) {
+                    if ($parsed.error.code) { $errorCode = [string]$parsed.error.code }
+                    elseif ($parsed.error -is [string]) { $errorCode = $parsed.error }
+                }
+
+                # R3-R3-09: Only pass with verified credential error codes
+                $isCredentialError = $errorCode -match "^(missing_api_key|unauthorized|authentication_required|provider_not_configured|MISSING_CREDENTIALS)$"
+                # R3-R3-09: Ambiguous errors → BLOCKED/FAIL
+                $isAmbiguous = $errorCode -match "(session.not.found|method.not.found|invalid.params|invalid.schema)" -or
+                               $bodyPreview -match "(?i)(not.?found|method|session|param|schema)"
+
+                if ($isCredentialError -and -not $isAmbiguous) {
+                    Add-TestResult -TestId "16" -Category "EvidenceDependent" `
+                      -Description "No-key error path (agent.followup without API key)" `
+                      -Expected "Structured credential error code" `
+                      -Actual "HTTP $noKeyStatus with code=$errorCode. Body: $bodyPreview" `
+                      -Status "PASS"
+                } elseif ($isAmbiguous) {
+                    Add-TestResult -TestId "16" -Category "EvidenceDependent" `
+                      -Description "No-key error path (agent.followup without API key)" `
+                      -Expected "Credential error (not session/method error)" `
+                      -Actual "HTTP $noKeyStatus but ambiguous code=$errorCode. Body: $bodyPreview" `
+                      -Status "BLOCKED" `
+                      -ErrorSummary "BLOCKED — could not distinguish credential error from session/method error"
+                } else {
+                    Add-TestResult -TestId "16" -Category "EvidenceDependent" `
+                      -Description "No-key error path (agent.followup without API key)" `
+                      -Expected "Structured credential error code" `
+                      -Actual "HTTP $noKeyStatus, code=$errorCode. Body: $bodyPreview" `
+                      -Status "BLOCKED" `
+                      -ErrorSummary "BLOCKED — no-key model-call contract not yet verified"
+                }
             }
         }
     } else {
         Add-TestResult -TestId "16" -Category "EvidenceDependent" `
           -Description "No-key error path" -Expected "Credential error" `
           -Actual "BLOCKED (harness not ready)" -Status "BLOCKED"
+    }
+
+    # ================================================================
+    # R3-R3-05: Save process identity evidence BEFORE shutdown
+    # ================================================================
+    Write-Host "`n=== R3-R3-05: Saving process identity evidence ===" -ForegroundColor Cyan
+    if ($script:HarnessReady -and $script:HarnessLauncherPid) {
+        # Refresh owned process tree while harness is still running
+        Update-OwnedProcessRecords -LauncherPid $script:HarnessLauncherPid
+        # Save evidence for Test 20/23
+        $script:SavedProcessEvidence = $script:OwnedProcessRecords | ForEach-Object { $_ }
+        $script:SavedHarnessProven = $false
+        $script:SavedHarnessEvidence = ""
+
+        if ($script:HarnessNodePid) {
+            $harnessCim = Get-CimInstance Win32_Process -Filter "ProcessId = $script:HarnessNodePid" -ErrorAction SilentlyContinue
+            if ($harnessCim) {
+                $cmdLine = $harnessCim.CommandLine
+                if ($cmdLine -and ($cmdLine -like "*dsh*" -or $cmdLine -like "*harness*" -or $cmdLine -like "*deepseek*")) {
+                    $script:SavedHarnessProven = $true
+                    $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid, CommandLine contains dsh/harness reference"
+                } else {
+                    $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid found but CommandLine=$cmdLine (no dsh reference)"
+                }
+            } else {
+                $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid not found in CIM"
+            }
+        } else {
+            $script:SavedHarnessEvidence = "No Node PID identified from launcher descendants"
+        }
+        Write-Host "  Saved evidence: $($script:SavedProcessEvidence.Count) processes, harness proven=$($script:SavedHarnessProven)"
     }
 
     # ================================================================
@@ -1330,13 +1662,12 @@ try {
     # Category: MandatoryFunctional
     # ================================================================
     Write-Host "`n=== Test 18: Force cleanup ===" -ForegroundColor Cyan
-    Update-OwnedProcessRecords -TestDir $TEST_DIR -LauncherPid $script:HarnessLauncherPid
+    Update-OwnedProcessRecords -LauncherPid $script:HarnessLauncherPid
 
     $stillRunning = @()
     foreach ($record in $script:OwnedProcessRecords) {
         $p = Get-Process -Id $record.PID -ErrorAction SilentlyContinue
         if ($p -and -not $p.HasExited) {
-            # Re-verify identity
             $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($record.PID)" -ErrorAction SilentlyContinue
             if ($cim -and $cim.CreationDate -eq $record.CreationDate) {
                 $stillRunning += $record
@@ -1387,36 +1718,21 @@ try {
       -Actual "$($script:PreSnapshot.Count) processes captured" -Status "PASS"
 
     # ================================================================
-    # Test 20: Owned PID identification with Harness proof
+    # Test 20: Owned PID identification (R3-R3-05: uses saved evidence)
     # Category: MandatoryFunctional
     # ================================================================
     Write-Host "`n=== Test 20: Owned PID identification ===" -ForegroundColor Cyan
-    $ownedCount = $script:OwnedProcessRecords.Count
-    $ownedPids = ($script:OwnedProcessRecords | ForEach-Object { $_.PID }) -join ', '
+
+    # R3-R3-05: Use SAVED evidence from before shutdown, not post-hoc CIM queries
+    $ownedCount = $script:SavedProcessEvidence.Count
+    $ownedPids = ($script:SavedProcessEvidence | ForEach-Object { $_.PID }) -join ', '
     $maxDepth = 0
-    if ($script:OwnedProcessRecords.Count -gt 0) {
-        $maxDepth = ($script:OwnedProcessRecords | Measure-Object -Property Depth -Maximum).Maximum
+    if ($script:SavedProcessEvidence.Count -gt 0) {
+        $maxDepth = ($script:SavedProcessEvidence | Measure-Object -Property Depth -Maximum).Maximum
     }
 
-    # Must prove actual Harness node process exists
-    $harnessProven = $false
-    $harnessEvidence = ""
-    if ($script:HarnessNodePid) {
-        $harnessCim = Get-CimInstance Win32_Process -Filter "ProcessId = $script:HarnessNodePid" -ErrorAction SilentlyContinue
-        if ($harnessCim) {
-            $cmdLine = $harnessCim.CommandLine
-            if ($cmdLine -and ($cmdLine -like "*dsh*" -or $cmdLine -like "*harness*" -or $cmdLine -like "*deepseek*")) {
-                $harnessProven = $true
-                $harnessEvidence = "Node PID=$script:HarnessNodePid, CommandLine contains dsh/harness reference"
-            } else {
-                $harnessEvidence = "Node PID=$script:HarnessNodePid found but CommandLine=$cmdLine (no dsh reference)"
-            }
-        } else {
-            $harnessEvidence = "Node PID=$script:HarnessNodePid not found in CIM"
-        }
-    } else {
-        $harnessEvidence = "No Node PID identified from launcher descendants"
-    }
+    $harnessProven = $script:SavedHarnessProven
+    $harnessEvidence = $script:SavedHarnessEvidence
 
     if (-not $harnessProven) {
         Add-TestResult -TestId "20" -Category "MandatoryFunctional" `
@@ -1424,7 +1740,7 @@ try {
           -Expected "Launcher descendants contain verified Harness/DSH Node process" `
           -Actual "Owned=$ownedCount, MaxDepth=$maxDepth. $harnessEvidence" `
           -Status "BLOCKED" `
-          -ErrorSummary "BLOCKED — could not identify actual Harness process"
+          -ErrorSummary "BLOCKED — could not identify actual Harness process (evidence saved before shutdown)"
     } else {
         Add-TestResult -TestId "20" -Category "MandatoryFunctional" `
           -Description "Owned PID identification with Harness process proof" `
@@ -1446,14 +1762,13 @@ try {
       -ErrorSummary "BLOCKED — no safe no-key tool execution stimulus / upstream test command verified"
 
     # ================================================================
-    # Test 23: Harness process identification proof (depth chain)
+    # Test 23: Harness depth chain (R3-R3-05: uses saved evidence)
     # Category: MandatoryFunctional
     # ================================================================
     Write-Host "`n=== Test 23: Harness depth chain ===" -ForegroundColor Cyan
-    if ($harnessProven) {
-        # Show the depth chain from launcher to harness node
-        $chain = $script:OwnedProcessRecords | Sort-Object Depth | Select-Object -First 5 | ForEach-Object {
-            "depth=$($_.Depth) PID=$($_.PID) Name=$($_.Name)"
+    if ($script:SavedHarnessProven) {
+        $chain = $script:SavedProcessEvidence | Sort-Object Depth | Select-Object -First 5 | ForEach-Object {
+            "depth=$($_.Depth) PID=$($_.PID)"
         }
         Add-TestResult -TestId "23" -Category "MandatoryFunctional" `
           -Description "Harness process depth chain (launcher → node)" `
@@ -1463,7 +1778,7 @@ try {
         Add-TestResult -TestId "23" -Category "MandatoryFunctional" `
           -Description "Harness process depth chain" `
           -Expected "Depth chain from launcher to actual harness node" `
-          -Actual "BLOCKED — harness not identified" -Status "BLOCKED"
+          -Actual "BLOCKED — harness not identified (evidence saved before shutdown)" -Status "BLOCKED"
     }
 
 } catch [PrerequisiteBlocked] {
@@ -1473,8 +1788,11 @@ try {
     Write-Host "`nAssertion failure: $($_.Exception.Message)" -ForegroundColor Red
     $mainError = $_
 } catch {
+    # R3-R3-03: ScriptInternal error → set fatal flag
     Write-Host "`nScript internal error: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace -ForegroundColor Red
+    $script:FatalInternalError = $true
+    $script:FatalInternalErrorMessage = $_.Exception.Message
     Add-TestResult -TestId "ERR" -Category "ScriptInternal" `
       -Description "Script internal error" -Expected "No errors" `
       -Actual "$($_.Exception.Message)" -Status "FAIL" `
@@ -1485,15 +1803,22 @@ try {
     try {
         $cleanupLog = Invoke-Cleanup -TestDir $TEST_DIR -Port $TEST_PORT -Keep $KeepArtifacts
     } catch {
-        Write-Host "Cleanup error: $($_.Exception.Message)" -ForegroundColor Yellow
-        $cleanupLog += "Cleanup exception: $($_.Exception.Message)"
+        # R3-R3-04: Cleanup exception → fatal error
+        $errMsg = "ERR-CLEANUP-FRAMEWORK: $($_.Exception.Message)"
+        Write-Host "Cleanup framework error: $($_.Exception.Message)" -ForegroundColor Magenta
+        $cleanupLog += $errMsg
+        $script:CleanupErrors += $errMsg
+        $script:FatalInternalError = $true
+        if (-not $script:FatalInternalErrorMessage) {
+            $script:FatalInternalErrorMessage = $errMsg
+        }
     }
 }
 
 # === Results generation (must always execute) ===
+# R3-R3-03: Results generation error → exit 3
+# R3-R3-04: $script:ResultsGenerated only set AFTER successful generation
 try {
-    $script:ResultsGenerated = $true
-
     Write-Host "`n=== TEST RESULTS ===" -ForegroundColor Cyan
     Write-Host ("=" * 90)
     $script:TestResults | Format-Table TestId, Category, Status, Description -AutoSize
@@ -1513,8 +1838,20 @@ try {
     Write-Host "`n=== JSON OUTPUT ===" -ForegroundColor Cyan
     $script:TestResults | ConvertTo-Json -Depth 6
 
-    # Gate aggregation
-    $overallResult = Get-OverallResult
+    # R3-R3-03: Gate aggregation with proper priority
+    $overallResult = Get-OverallResult -Results $script:TestResults `
+      -HasFatalInternalError $script:FatalInternalError `
+      -CleanupErrorList $script:CleanupErrors
+
+    # R3-R3-03: ScriptInternal/cleanup errors must be visible in final report
+    if ($script:FatalInternalError) {
+        Write-Host "`nFATAL INTERNAL ERROR: $script:FatalInternalErrorMessage" -ForegroundColor Magenta
+    }
+    if ($script:CleanupErrors.Count -gt 0) {
+        Write-Host "`nCLEANUP ERRORS ($($script:CleanupErrors.Count)):" -ForegroundColor Magenta
+        foreach ($ce in $script:CleanupErrors) { Write-Host "  $ce" -ForegroundColor Magenta }
+    }
+
     Write-Host "`nOVERALL RESULT: $overallResult" -ForegroundColor $(
         switch ($overallResult) { "PASS" { "Green" } "FAIL" { "Red" } "BLOCKED" { "Yellow" } "ERROR" { "Magenta" } }
     )
@@ -1526,10 +1863,18 @@ try {
         "ERROR"   { 3 }
         default   { 3 }
     }
+
+    # R3-R3-04: ResultsGenerated only set AFTER successful output
+    $script:ResultsGenerated = $true
+
     Write-Host "Exit code: $exitCode"
     exit $exitCode
 
 } catch {
+    # R3-R3-03 + R3-R3-04: Results generation failed → fatal summary + exit 3
     Write-Host "FATAL: Results generation failed: $($_.Exception.Message)" -ForegroundColor Magenta
+    Write-Host "OVERALL RESULT: ERROR (results generation failure)" -ForegroundColor Magenta
+    Write-Host "Fatal internal error: $script:FatalInternalError" -ForegroundColor Magenta
+    Write-Host "Cleanup errors: $($script:CleanupErrors.Count)" -ForegroundColor Magenta
     exit 3
 }
