@@ -292,12 +292,13 @@ function Update-OwnedProcessRecords {
     $script:OwnedProcessRecords = $records
 }
 
-# R1-02: Stop-OwnedProcesses returns structured results, does NOT silently swallow failures
+# R2-02: Stop-OwnedProcesses with four result categories
 function Stop-OwnedProcesses {
     $killResults = @{
-        Terminated = @()
-        Skipped    = @()
-        Failed     = @()
+        Terminated      = @()
+        AlreadyExited   = @()
+        IdentityBlocked = @()  # Still running but identity unconfirmed — NOT killed, Gate-blocking
+        Failed          = @()  # Identity confirmed but Kill/WaitForExit failed — FAIL
     }
 
     # R1-05: Sort by Depth DESC, then CaptureOrder ASC for deterministic ordering
@@ -306,29 +307,32 @@ function Stop-OwnedProcesses {
     foreach ($record in $sorted) {
         $processId = $record.PID
         $proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
-        if (-not $proc -or $proc.HasExited) { continue }
+        if (-not $proc -or $proc.HasExited) {
+            $killResults.AlreadyExited += $processId
+            continue
+        }
 
         # R1-01: Full identity re-verification
         $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
         if (-not $cim) {
-            $killResults.Skipped += [PSCustomObject]@{ PID = $processId; Reason = "CIM lookup failed" }
+            $killResults.IdentityBlocked += [PSCustomObject]@{ PID = $processId; Reason = "CIM lookup failed" }
             continue
         }
 
         if ($cim.CreationDate -ne $record.CreationDate) {
-            $killResults.Skipped += [PSCustomObject]@{ PID = $processId; Reason = "CreationDate mismatch (PID reuse)" }
+            $killResults.IdentityBlocked += [PSCustomObject]@{ PID = $processId; Reason = "CreationDate mismatch (PID reuse)" }
             continue
         }
         if ($record.CommandLine -and $cim.CommandLine -ne $record.CommandLine) {
-            $killResults.Skipped += [PSCustomObject]@{ PID = $processId; Reason = "CommandLine mismatch" }
+            $killResults.IdentityBlocked += [PSCustomObject]@{ PID = $processId; Reason = "CommandLine mismatch" }
             continue
         }
         if ($record.ExecutablePath -and $cim.ExecutablePath -ne $record.ExecutablePath) {
-            $killResults.Skipped += [PSCustomObject]@{ PID = $processId; Reason = "ExecutablePath mismatch" }
+            $killResults.IdentityBlocked += [PSCustomObject]@{ PID = $processId; Reason = "ExecutablePath mismatch" }
             continue
         }
         if ($processId -eq $PID) {
-            $killResults.Skipped += [PSCustomObject]@{ PID = $processId; Reason = "Current PowerShell" }
+            $killResults.IdentityBlocked += [PSCustomObject]@{ PID = $processId; Reason = "Current PowerShell" }
             continue
         }
 
@@ -356,22 +360,42 @@ function Invoke-Cleanup {
     $cleanupResults = @()
 
     # Step 1: Stop owned processes using SAVED records
+    # R2-02: IdentityBlocked -> Gate-blocking; Failed -> MandatoryFunctional FAIL
     try {
         $killResult = Stop-OwnedProcesses
-        if ($killResult.Failed.Count -gt 0) {
+        $hasFailure = $killResult.Failed.Count -gt 0
+        $hasIdentityBlock = $killResult.IdentityBlocked.Count -gt 0
+
+        if ($hasFailure) {
             $failSummary = ($killResult.Failed | ForEach-Object { "PID=$($_.PID): $($_.Reason)" }) -join "; "
             $errMsg = "ERR-CLEANUP-PROCESS: Could not terminate: $failSummary"
             $cleanupResults += "Process cleanup: FAILED ($($killResult.Failed.Count) failures)"
             $script:CleanupErrors += $errMsg
             Add-TestResult -TestId "CLEANUP-PROCESS" -Category "CleanupError" `
-              -Description "Process cleanup phase" `
-              -Expected "All owned processes terminated" `
-              -Actual "Terminated=$($killResult.Terminated.Count), Failed=$($killResult.Failed.Count), Skipped=$($killResult.Skipped.Count)" `
+              -Description "Process cleanup: Kill/WaitForExit failure" `
+              -Expected "Identity-confirmed processes terminated" `
+              -Actual "Terminated=$($killResult.Terminated.Count), Failed=$($killResult.Failed.Count), IdentityBlocked=$($killResult.IdentityBlocked.Count)" `
               -Status "FAIL" -ErrorSummary $errMsg
             $script:FatalInternalError = $true
             $script:FatalInternalErrorMessage = $errMsg
-        } else {
-            $cleanupResults += "Process cleanup: OK (terminated=$($killResult.Terminated.Count), skipped=$($killResult.Skipped.Count))"
+        }
+
+        if ($hasIdentityBlock) {
+            $blockSummary = ($killResult.IdentityBlocked | ForEach-Object { "PID=$($_.PID): $($_.Reason)" }) -join "; "
+            $errMsg = "ERR-CLEANUP-IDENTITY: Unverified processes still running: $blockSummary"
+            $cleanupResults += "Process cleanup: IDENTITY BLOCKED ($($killResult.IdentityBlocked.Count) unverified)"
+            $script:CleanupErrors += $errMsg
+            Add-TestResult -TestId "CLEANUP-IDENTITY" -Category "CleanupError" `
+              -Description "Process cleanup: identity unconfirmed" `
+              -Expected "All still-running processes have confirmed identity" `
+              -Actual "IdentityBlocked=$($killResult.IdentityBlocked.Count): $blockSummary" `
+              -Status "FAIL" -ErrorSummary $errMsg
+            $script:FatalInternalError = $true
+            if (-not $script:FatalInternalErrorMessage) { $script:FatalInternalErrorMessage = $errMsg }
+        }
+
+        if (-not $hasFailure -and -not $hasIdentityBlock) {
+            $cleanupResults += "Process cleanup: OK (terminated=$($killResult.Terminated.Count), exited=$($killResult.AlreadyExited.Count))"
         }
     } catch {
         $errMsg = "ERR-CLEANUP-PROCESS: $($_.Exception.Message)"
@@ -395,7 +419,12 @@ function Invoke-Cleanup {
             if ($p -and -not $p.HasExited) {
                 $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($record.PID)" -ErrorAction SilentlyContinue
                 if ($cim -and $cim.CreationDate -eq $record.CreationDate) {
-                    $orphans += $record.PID
+                    # R2-02: Verify CommandLine and ExecutablePath too
+                    $cmdMatch = (-not $record.CommandLine) -or ($cim.CommandLine -eq $record.CommandLine)
+                    $exeMatch = (-not $record.ExecutablePath) -or ($cim.ExecutablePath -eq $record.ExecutablePath)
+                    if ($cmdMatch -and $exeMatch) {
+                        $orphans += $record.PID
+                    }
                 }
             }
         }
@@ -726,7 +755,16 @@ try {
             # Walk all packages in lockfile to find native deps and their parents
             if ($lockfileJson.packages) {
                 foreach ($pkgEntry in $lockfileJson.packages.PSObject.Properties) {
-                    $pkgName = $pkgEntry.Name -replace '^node_modules/', '' -replace '^node_modules\\', ''
+                    # R2-04: Correctly parse nested lockfile paths (e.g. node_modules/<parent>/node_modules/node-pty)
+                    $rawName = $pkgEntry.Name
+                    # Extract the actual package name from the last node_modules segment
+                    if ($rawName -match 'node_modules[/\\]([^/\\]+)$') {
+                        $pkgName = $Matches[1]
+                    } elseif ($rawName -match 'node_modules[/\\].+[/\\]node_modules[/\\]([^/\\]+)$') {
+                        $pkgName = $Matches[1]
+                    } else {
+                        $pkgName = $rawName -replace '^node_modules/', '' -replace '^node_modules\\', ''
+                    }
                     $pkgData = $pkgEntry.Value
                     if ($pkgName -in $nativeDepsToCheck) {
                         # Found a native dep in lockfile — determine optionality
@@ -734,9 +772,20 @@ try {
                         # Check if parent package lists it in optionalDependencies
                         # In lockfile v2/v3, the package entry itself may have "optional": true
                         if ($pkgData.optional -eq $true) { $isOptional = $true }
-                        # Also check os/cpu constraints on the native package itself
-                        if ($pkgData.os -and $pkgData.os -notcontains "win32") { $isOptional = $true }
-                        if ($pkgData.cpu -and $pkgData.cpu -notcontains "x64") { $isOptional = $true }
+                        # R2-04: npm allow/deny semantics for os/cpu
+                        # Positive items = allowlist; !value = denylist; no positive = allow unless denied
+                        if ($pkgData.os) {
+                            $hasPositive = $pkgData.os | Where-Object { $_ -notlike '!*' }
+                            $denied = $pkgData.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
+                            if ($denied) { $isOptional = $true }
+                            elseif ($hasPositive -and ($pkgData.os -notcontains "win32")) { $isOptional = $true }
+                        }
+                        if ($pkgData.cpu) {
+                            $hasPositive = $pkgData.cpu | Where-Object { $_ -notlike '!*' }
+                            $denied = $pkgData.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
+                            if ($denied) { $isOptional = $true }
+                            elseif ($hasPositive -and ($pkgData.cpu -notcontains "x64")) { $isOptional = $true }
+                        }
                         $transitiveNativeExpected[$pkgName] = [PSCustomObject]@{
                             Name = $pkgName
                             Version = $pkgData.version
@@ -760,8 +809,19 @@ try {
                     $pkgContent = Get-Content $pkgJsonPath -Raw | ConvertFrom-Json
                     $ver = $pkgContent.version
                     if ($pkgContent.optional -eq $true) { $isOptional = $true }
-                    if ($pkgContent.os -and $pkgContent.os -notcontains "win32") { $isOptional = $true }
-                    if ($pkgContent.cpu -and $pkgContent.cpu -notcontains "x64") { $isOptional = $true }
+                    # R2-04: npm allow/deny semantics
+                    if ($pkgContent.os) {
+                        $hasPositive = $pkgContent.os | Where-Object { $_ -notlike '!*' }
+                        $denied = $pkgContent.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
+                        if ($denied) { $isOptional = $true }
+                        elseif ($hasPositive -and ($pkgContent.os -notcontains "win32")) { $isOptional = $true }
+                    }
+                    if ($pkgContent.cpu) {
+                        $hasPositive = $pkgContent.cpu | Where-Object { $_ -notlike '!*' }
+                        $denied = $pkgContent.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
+                        if ($denied) { $isOptional = $true }
+                        elseif ($hasPositive -and ($pkgContent.cpu -notcontains "x64")) { $isOptional = $true }
+                    }
                 } catch {}
             }
 
@@ -1043,7 +1103,7 @@ try {
         Write-Host "`n=== Test 15: WS frame/envelope ===" -ForegroundColor Cyan
         # R1-06: Single terminal state flag — once set, no more results for Test 15
         $test15Finalized = $false
-        $ws = $null; $memStream = $null; $cts = $null
+        $ws = $null; $memStream = $null; $cts = $null; $reader = $null
 
         try {
             $ws = [System.Net.WebSockets.ClientWebSocket]::new()
@@ -1113,7 +1173,7 @@ try {
                         $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
                         try {
                             $memStream.Position = 0
-                            $reader = New-Object System.IO.StreamReader($memStream, $utf8Strict)
+                            $reader = New-Object System.IO.StreamReader($memStream, $utf8Strict, $true)
                             $decodedText = $reader.ReadToEnd()
                         } catch {}
 
@@ -1153,6 +1213,8 @@ try {
             }
         } finally {
             # R1-06: Always dispose resources in finally
+            # R2-05: Dispose StreamReader, MemoryStream, CTS, WebSocket independently
+            if ($reader) { try { $reader.Dispose() } catch {} }
             if ($memStream) { try { $memStream.Dispose() } catch {} }
             if ($cts) { try { $cts.Dispose() } catch {} }
             if ($ws) {
@@ -1232,7 +1294,14 @@ try {
                 if ($harnessCim) {
                     $cmdLine = $harnessCim.CommandLine
                     $nameOk = $harnessCim.Name -eq "node.exe"
-                    $cmdOk = $cmdLine -and ($cmdLine -like "*dsh*" -or $cmdLine -like "*deepseek*")
+                    # R2-03: Match exact dsh binary path, not broad wildcard
+                    $cmdOk = $cmdLine -and $cmdLine -like "*$dshBin*"
+                    # R2-03: Full identity comparison against owned record
+                    $identityOk = $true
+                    if ($harnessCim.CreationDate -ne $inOwnedTree.CreationDate) { $identityOk = $false }
+                    if ($harnessCim.CommandLine -ne $inOwnedTree.CommandLine) { $identityOk = $false }
+                    if ($harnessCim.ExecutablePath -ne $inOwnedTree.ExecutablePath) { $identityOk = $false }
+                    if ($harnessCim.ParentProcessId -ne $inOwnedTree.ParentPID) { $identityOk = $false }
 
                     # R1-03: Verify parent chain leads to launcher
                     $parentChainOk = $false
@@ -1246,11 +1315,11 @@ try {
                         $traceDepth++
                     }
 
-                    if ($nameOk -and $cmdOk -and $parentChainOk) {
+                    if ($nameOk -and $cmdOk -and $parentChainOk -and $identityOk) {
                         $script:SavedHarnessProven = $true
-                        $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid in owned tree, CommandLine matches dsh, parent chain reaches launcher"
+                        $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid in owned tree, full identity match (CreationDate+CommandLine+ExecutablePath+ParentPID), CommandLine matches dshBin, parent chain reaches launcher"
                     } else {
-                        $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid: nameOk=$nameOk cmdOk=$cmdOk parentChainOk=$parentChainOk"
+                        $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid: nameOk=$nameOk cmdOk=$cmdOk parentChainOk=$parentChainOk identityOk=$identityOk"
                     }
                 } else {
                     $script:SavedHarnessEvidence = "Node PID=$script:HarnessNodePid not found in CIM"
@@ -1383,8 +1452,8 @@ try {
             # R1-04: Verify Depth is monotonically decreasing along chain
             $depthsOk = $true
             $prevDepth = -1
-            foreach ($pid in $chainPids) {
-                $rec = $script:SavedProcessEvidence | Where-Object { $_.PID -eq $pid } | Select-Object -First 1
+            foreach ($chainProcessId in $chainPids) {
+                $rec = $script:SavedProcessEvidence | Where-Object { $_.PID -eq $chainProcessId } | Select-Object -First 1
                 if ($rec) {
                     if ($prevDepth -ge 0 -and $rec.Depth -ge $prevDepth) { $depthsOk = $false; break }
                     $prevDepth = $rec.Depth
@@ -1392,10 +1461,14 @@ try {
             }
 
             if ($depthsOk) {
-                $chainDesc = ($chainPids | ForEach-Object {
-                    $rec = $script:SavedProcessEvidence | Where-Object { $_.PID -eq $_ } | Select-Object -First 1
+                # R2-05: Reverse for launcher -> node display order
+                $reversedChain = @($chainPids)
+                [Array]::Reverse($reversedChain)
+                $chainDesc = ($reversedChain | ForEach-Object {
+                    $chainPid = $_
+                    $rec = $script:SavedProcessEvidence | Where-Object { $_.PID -eq $chainPid } | Select-Object -First 1
                     $d = if ($rec) { $rec.Depth } else { "?" }
-                    "depth=$d PID=$_"
+                    "depth=$d PID=$chainPid"
                 }) -join " -> "
                 Add-TestResult -TestId "23" -Category "MandatoryFunctional" `
                   -Description "Harness depth chain (launcher -> node)" `

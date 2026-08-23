@@ -1,180 +1,124 @@
-# G0-S1-R3-R3-R1 Preflight & Verification Report
+# G0-S1-R3-R3-R2 Preflight & Verification Report
 
-**Gate:** HawkAIAgent-G0-S1-R3-R3-R1 (Windows PoC Safety — Remaining Gaps)
+**Gate:** HawkAIAgent-G0-S1-R3-R3-R2 (Final Identity and Platform Checks)
 **Date:** 2026-08-23
-**Previous Head:** `5620268f21e9a1f6aaefd46e9db038a0b84aec34`
+**Previous Head:** `bb367903bff207cdb082266483be157e675241d2`
 **Gate Result:** REMEDIATION COMPLETE — pending Windows 11 x64 execution
 
 ---
 
-## 1. R1-01: Pre-Snapshot Process Exclusion
+## 1. Mandatory 1: `$pid` Variable
 
-**Finding:** `$isLauncherDescendant = $true` was a tautology — every BFS node passed the `$isNewProcess -or $isLauncherDescendant` check regardless of pre-snapshot membership.
+**Finding:** Test 23 used `foreach ($pid in $chainPids)` which writes to read-only `$PID`.
 
-**Fix Applied:**
-- Removed `$isLauncherDescendant` variable entirely
-- `Update-OwnedProcessRecords` now takes `LauncherCreationDate` parameter
-- Launcher is verified via CIM `ProcessId` + `CreationDate` match before BFS starts
-- If launcher exited/PID reused → function returns WITHOUT modifying `$OwnedProcessRecords`
-- Each BFS node must be NOT in `$PreSnapshot` to become owned (`$isNewProcess = -not $script:PreSnapshot.ContainsKey($currentPid)`)
-- `$PID` always excluded
-- Unverified processes (CommandLine contains `$TEST_DIR` but not BFS-proven) logged only
-
-**Invariant:** A process enters kill list IF AND ONLY IF:
-1. BFS from verified launcher discovered it, AND
-2. It was NOT in the pre-harness snapshot (new process), AND
-3. It is NOT `$PID`, AND
-4. Identity (PID + CreationDate + CommandLine + ExecutablePath) is re-verified before termination
+**Fix:** Changed to `$chainProcessId`. Full file search confirms zero lowercase `$pid` assignments/loop variables.
 
 ---
 
-## 2. R1-02: Launcher Exit Preserves Cleanup Candidates
+## 2. Mandatory 2: Identity Mismatch Gate Impact
 
-**Finding:** Test 18 called `Update-OwnedProcessRecords -LauncherPid $launcherPid`. If launcher exited, BFS from dead PID returns empty set → Node processes orphaned, reported as PASS.
+**Finding:** `Stop-OwnedProcesses` put all identity mismatches in `Skipped`; `Invoke-Cleanup` only checked `Failed.Count`.
 
-**Fix Applied:**
-- `Update-OwnedProcessRecords` checks launcher CreationDate; if mismatch → returns immediately, preserving existing `$OwnedProcessRecords`
-- Test 18 and `Invoke-Cleanup` use `$script:SavedProcessEvidence` (saved while harness was running), NOT re-BFS
-- `Stop-OwnedProcesses` returns structured result: `{Terminated, Skipped, Failed}`
-- Kill failure → `MandatoryFunctional FAIL` (not silently swallowed)
-- Identity mismatch → recorded as Skipped with reason, never killed
-- `Invoke-Cleanup` only writes "Process cleanup: OK" when `$killResult.Failed.Count -eq 0`
-
-**Evidence flow:**
-```
-Harness running → Update-OwnedProcessRecords → Save to SavedProcessEvidence
-Test 17 (shutdown)
-Test 18 → iterate SavedProcessEvidence → verify identity → kill → report
-Invoke-Cleanup → Stop-OwnedProcesses (uses OwnedProcessRecords, which was saved)
-Orphan check → iterates SavedProcessEvidence
-```
+**Fix:**
+- Four result categories: `Terminated`, `AlreadyExited`, `IdentityBlocked`, `Failed`
+- `IdentityBlocked` = still running but identity unconfirmed → NOT killed, generates Gate-blocking `BLOCKED` via `CLEANUP-IDENTITY` result
+- `Failed` = identity confirmed but Kill/WaitForExit failed → `MandatoryFunctional FAIL`
+- `Invoke-Cleanup` only writes "OK" when BOTH `Failed` and `IdentityBlocked` are empty
+- Orphan check now verifies CreationDate + CommandLine + ExecutablePath (not just CreationDate)
+- Test 18 consumes structured result from `Stop-OwnedProcesses`
 
 ---
 
-## 3. R1-03: Harness Node Must Be In Owned Tree
+## 3. Mandatory 3: Harness Proof PID Reuse Protection
 
-**Finding:** `HarnessNodePid` was selected from all post-launch new processes matching `CommandLine -like "*dsh*"` — could pick up an unrelated dsh process.
+**Finding:** `cmdOk` used broad `*dsh*` wildcard; no CreationDate/CommandLine/ExecutablePath/ParentPID comparison.
 
-**Fix Applied:**
-- Harness Node is selected ONLY from `$script:OwnedProcessRecords` (BFS-proven descendants)
-- Must have `Name -eq "node.exe"` AND `CommandLine -like "*dsh*"`
-- Prefers deepest node (most likely actual harness, not wrapper)
-- `SavedHarnessProven` now requires:
-  1. PID is in `$OwnedProcessRecords`
-  2. CIM `Name` is `node.exe`
-  3. CIM `CommandLine` contains `dsh` or `deepseek`
-  4. Parent chain from node traced via `ParentPID` reaches `HarnessLauncherPid`
+**Fix:**
+- `cmdOk` now matches exact `$dshBin` path
+- Full identity comparison: CIM CreationDate, CommandLine, ExecutablePath, ParentPID vs owned record
+- Any mismatch → `SavedHarnessProven = false`
+- Chain display order: reversed for `launcher -> node` presentation
 
 ---
 
-## 4. R1-04: Real Ancestor Chain for Test 23
+## 4. Mandatory 4: npm os/cpu Allow/Deny Semantics
 
-**Finding:** Test 23 sorted by Depth and took first 5 records — could include siblings, didn't verify chain continuity.
+**Finding:** `$pkgData.os -notcontains "win32"` treats `["!darwin"]` as "not for Windows".
 
-**Fix Applied:**
-- Test 23 traces from `HarnessNodePid` backwards via `ParentPID` to `LauncherPid`
-- Each hop verified in `SavedProcessEvidence`
-- Cycle detection via `$visited` set
-- Chain must reach launcher within 50 hops
-- Depth must be monotonically decreasing along chain
-- Siblings never enter chain
-- Broken chain or cycle → FAIL
+**Fix:**
+- Positive items = allowlist; `!value` = denylist; no positive items = allow unless denied
+- `["!win32"]` → denied (correct)
+- `["!darwin"]` → NOT denied for win32 (correct)
+- `["win32"]` → allowed (correct)
+- `["!win32", "linux"]` → denied (correct)
+- Missing/empty → allowed (correct)
+- Nested lockfile paths parsed correctly: `node_modules/<parent>/node_modules/node-pty` extracts `node-pty`
+- Unresolvable → EvidenceDependent BLOCKED
 
----
+**Static judgment cases:**
 
-## 5. R1-05: Deterministic Termination Order
+| os value | win32 result |
+|----------|-------------|
+| `["win32"]` | Allowed ✅ |
+| `["!darwin"]` | Allowed ✅ (no win32 deny) |
+| `["!win32"]` | Denied ✅ |
+| `["linux"]` | Denied ✅ (allowlist, win32 not in it) |
+| `[]` or missing | Allowed ✅ (default) |
 
-**Finding:** Relied on PowerShell `Sort-Object` stable sort behavior, which is not guaranteed in PS 5.1.
-
-**Fix Applied:**
-- Each process record now has `CaptureOrder` (incrementing integer from BFS discovery order)
-- Sort key: `Depth DESC, CaptureOrder ASC`
-- This is explicit and deterministic regardless of `Sort-Object` stability
-- PID value never used as Depth substitute
-
----
-
-## 6. R1-06: WebSocket Single Terminal State
-
-**Finding:** Oversize path could `Dispose` MemoryStream then `$memStream.Length` accessed; JSON with `id/result/params` accepted as valid envelope.
-
-**Fix Applied:**
-- `$test15Finalized` flag — once true, no more Test 15 results generated
-- Oversize → sets `$test15Finalized = $true` immediately, breaks out of read loop
-- Envelope validation: JSON with `id/result/params/type/method/event` → still `BLOCKED` (official envelope contract not verified from upstream types/source)
-- Only FAIL conditions: Close frame, non-Text, no EndOfMessage, invalid UTF-8, invalid JSON
-- `BLOCKED` for: no stimulus, envelope unverified
-- Resources (`MemoryStream`, `CTS`, `WebSocket`) disposed in `finally` block
-- Each TestId produces exactly one result via normal path
+| cpu value | x64 result |
+|-----------|-----------|
+| `["x64"]` | Allowed ✅ |
+| `["!arm"]` | Allowed ✅ |
+| `["!x64"]` | Denied ✅ |
+| `[]` or missing | Allowed ✅ |
 
 ---
 
-## 7. R1-07: Transitive Native Dependency Check
+## 5. Mandatory 5: Test 15 Resource & Single-Result
 
-**Finding:** Only checked `dsh/package.json` direct dependencies; missed transitive native deps from host packages.
+**Finding:** `$reader` not disposed in finally; each path already produces one result (verified).
 
-**Fix Applied:**
-- Parses `package-lock.json` entries to find ALL native deps in the tree (transitive)
-- For each found native dep, checks `optional: true` in lockfile entry AND `os/cpu` constraints
-- Optionality from lockfile metadata overrides local `package.json` self-declaration
-- `os: ["!darwin"]` does NOT mean "not for Windows" — only explicit non-win32 os list blocks
-- Expected from lockfile but not installed → `EvidenceDependent BLOCKED`
-- Found but load failed → `EvidenceDependent FAIL`
-- All optional → `Informational`
+**Fix:**
+- `$reader = $null` declared at Test 15 start
+- `$reader.Dispose()` in `finally` block (before `$memStream.Dispose()`)
+- StreamReader created with `UTF8Encoding($false, $true, $true)` (encoder + throwOnInvalid + detectBOM)
+- All 8 paths verified to produce exactly one Test 15 result
 
----
+**Single-result matrix:**
 
-## 8. R1-08: Self-Test Evidence Language
-
-**Finding:** Ubuntu has no `pwsh`; claiming "7/7 self-tests passed" is fabrication.
-
-**Fix Applied:**
-- Self-test comment: "7 test cases implemented and verified via static analysis"
-- Runtime execution: `PENDING WINDOWS HERMES PHASE A`
-- Self-test function still runs (and passes) in script logic — on Windows it will execute in PowerShell
-- Report distinguishes "implemented" from "executed in PowerShell runtime"
-
----
-
-## 9. Script Metadata
-
-- **SHA-256:** [computed at commit time]
-- **Exit codes:** 0=PASS, 1=FAIL, 2=BLOCKED, 3=ERROR
+| Path | Result |
+|------|--------|
+| WS not open | BLOCKED |
+| Oversize | FAIL (test15Finalized=true, break) |
+| Timeout, 0 bytes | BLOCKED |
+| Close frame | FAIL |
+| Non-Text | FAIL |
+| No EndOfMessage | FAIL |
+| Invalid UTF-8 | FAIL |
+| Invalid JSON | FAIL |
+| Valid JSON, unverified envelope | BLOCKED |
 
 ---
 
-## 10. Static Analysis Results (Ubuntu)
+## 6. Script SHA-256
+
+`4ea9102e53b437362b2536f6e60224dc785841357f48ea7e5420168013879425`
+
+---
+
+## 7. Static Analysis Summary
 
 | Check | Result |
 |-------|--------|
-| `$isLauncherDescendant` tautology | ✅ Removed |
-| `$pid` lowercase | ✅ None found (only `$PID`) |
-| `Depth=999` | ✅ None found |
-| CommandLine-only ownership | ✅ Removed |
-| Launcher exit → empty cleanup | ✅ Fixed: uses saved records |
-| Harness Node outside owned tree | ✅ Fixed: must be in owned records |
-| Test 23 sibling contamination | ✅ Fixed: real ancestor chain |
-| Sort-Object stability assumption | ✅ Fixed: CaptureOrder tie-breaker |
-| WS double result | ✅ Fixed: $test15Finalized flag |
-| WS envelope false positive | ✅ Fixed: always BLOCKED |
-| Transitive native deps | ✅ Fixed: lockfile analysis |
-| Self-test fabrication | ✅ Fixed: language corrected |
-| Secret scan | ✅ Clean |
-| Dangerous commands | ✅ Clean |
-| Allowlist diff | ✅ Only 2 files |
-| PowerShell parser | `PENDING WINDOWS HERMES PHASE A` |
-| PSScriptAnalyzer | `PENDING WINDOWS HERMES PHASE A` |
-
----
-
-## 11. Confirmation
-
-- [x] NOT pushed to remote (pending commit)
-- [x] NOT merged PR
-- [x] NOT force pushed
-- [x] NOT exposed credentials
-- [x] NOT modified master
-- [x] NOT changed Draft status
-- [x] NOT entered G0-S2
-- [x] NOT started Windows Hermes
-- [x] All 8 R1 findings addressed
+| Lowercase `$pid` variable | ✅ None found |
+| IdentityBlocked in gate | ✅ 12 references |
+| KillResults.Skipped | ✅ 0 references |
+| Harness dshBin path match | ✅ Exact path |
+| identityOk in harness proof | ✅ 7 references |
+| os/cpu denylist (`!`) | ✅ 8 references |
+| reader.Dispose in finally | ✅ Present |
+| chainProcessId | ✅ 2 references |
+| ReversedChain display | ✅ Present |
+| PowerShell parser | PENDING WINDOWS HERMES PHASE A |
+| PSScriptAnalyzer | PENDING WINDOWS HERMES PHASE A |
+| Aggregation runtime | PENDING WINDOWS HERMES PHASE A |
