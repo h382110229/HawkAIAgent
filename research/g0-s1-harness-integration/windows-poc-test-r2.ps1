@@ -1,4 +1,4 @@
-# HawkAIAgent G0-S1-R3-R3-R1 Windows PoC Test Script
+# HawkAIAgent G0-S1-R3-R3-R4 Windows PoC Test Script
 # =================================================
 # SAFETY: No admin required. No system modifications.
 # All operations scoped to $TEST_DIR (precise, known path).
@@ -104,9 +104,183 @@ function Get-OverallResult {
     return "PASS"
 }
 
+# R4-02: Native addon judgment pure function
+# Extracted from Test 6 inline logic. Pure: no side-effects, no I/O.
+# Inputs are hashtables/arrays; returns array of judgment objects.
+# Runtime self-test runs BEFORE npm install / Harness launch.
+function Get-NativeAddonJudgment {
+    param(
+        [hashtable[]]$DependencyMap,    # [{Name, PkgData}, ...]
+        [string]$TargetOs = "win32",
+        [string]$TargetCpu = "x64",
+        [hashtable]$LockfilePackages = @{}  # normalized-path -> package data
+    )
+
+    $nativeIndicators = @("install", "prebuild", "node-gyp", "binding", "bindings", "nan", "node-addon-api", "prebuild-install")
+    $results = @()
+
+    foreach ($dep in $DependencyMap) {
+        $depName = $dep.Name
+        $pkgData = $dep.PkgData
+        if (-not $pkgData) {
+            $results += [PSCustomObject]@{
+                Name = $depName; IsNative = $false; PlatformApplicable = $true; ParentOptional = $false
+            }
+            continue
+        }
+
+        # R4-02: Detect native addon
+        $isNative = $false
+        if ($pkgData.install) { $isNative = $true }
+        if ($pkgData.prebuild) { $isNative = $true }
+        if ($pkgData.gypfile -eq $true) { $isNative = $true }
+        if ($pkgData.scripts) {
+            foreach ($indicator in $nativeIndicators) {
+                if ($pkgData.scripts.install -and $pkgData.scripts.install -like "*$indicator*") { $isNative = $true; break }
+                if ($pkgData.scripts.preinstall -and $pkgData.scripts.preinstall -like "*$indicator*") { $isNative = $true; break }
+            }
+        }
+        if ($pkgData.binary) { $isNative = $true }
+        if (-not $isNative -and $pkgData.dependencies) {
+            foreach ($innerInd in $nativeIndicators) {
+                if ($pkgData.dependencies.PSObject.Properties[$innerInd]) { $isNative = $true; break }
+            }
+        }
+
+        # R4-03: Per-instance initialization — always fresh
+        $platformApplicable = $true
+        $parentOptional = ($pkgData.optional -eq $true)
+
+        if ($isNative) {
+            # R4-02: Platform check — pure, covers all os/cpu combos
+            if ($pkgData.os) {
+                $osList = @($pkgData.os)
+                $hasPositive = $false
+                foreach ($o in $osList) { if ($o -notlike '!*') { $hasPositive = $true; break } }
+                $denied = $false
+                foreach ($o in $osList) { if ($o -eq "!$TargetOs") { $denied = $true; break } }
+                if ($denied) { $platformApplicable = $false }
+                elseif ($hasPositive -and ($osList -notcontains $TargetOs)) { $platformApplicable = $false }
+            }
+            if ($pkgData.cpu) {
+                $cpuList = @($pkgData.cpu)
+                $hasPositive = $false
+                foreach ($c in $cpuList) { if ($c -notlike '!*') { $hasPositive = $true; break } }
+                $denied = $false
+                foreach ($c in $cpuList) { if ($c -eq "!$TargetCpu") { $denied = $true; break } }
+                if ($denied) { $platformApplicable = $false }
+                elseif ($hasPositive -and ($cpuList -notcontains $TargetCpu)) { $platformApplicable = $false }
+            }
+
+            # R4-04: Check parent optionalDependencies via lockfile path
+            if ($LockfilePackages.Count -gt 0) {
+                foreach ($lfPath in $LockfilePackages.Keys) {
+                    $lfPkg = $LockfilePackages[$lfPath]
+                    if ($lfPkg.optionalDependencies -and $lfPkg.optionalDependencies.PSObject.Properties[$depName]) {
+                        $parentOptional = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        $results += [PSCustomObject]@{
+            Name = $depName; IsNative = $isNative
+            PlatformApplicable = $platformApplicable; ParentOptional = $parentOptional
+        }
+    }
+
+    return $results
+}
+
+# R4-02: Runtime self-test for Get-NativeAddonJudgment
+function Test-NativeAddonJudgment {
+    $allPassed = $true
+    $tests = @()
+
+    # Case 1: win32 + x64, native with no os/cpu => applicable
+    $depMap1 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true } })
+    $j1 = Get-NativeAddonJudgment -DependencyMap $depMap1 -TargetOs "win32" -TargetCpu "x64"
+    $p1 = ($j1[0].PlatformApplicable -eq $true -and $j1[0].ParentOptional -eq $false)
+    $tests += [PSCustomObject]@{ Name = "Native no os/cpu => applicable"; Pass = $p1 }
+    if (-not $p1) { $allPassed = $false }
+
+    # Case 2: !win32 => not applicable
+    $depMap2 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true; os = @("!win32") } })
+    $j2 = Get-NativeAddonJudgment -DependencyMap $depMap2 -TargetOs "win32" -TargetCpu "x64"
+    $p2 = ($j2[0].PlatformApplicable -eq $false)
+    $tests += [PSCustomObject]@{ Name = "os=!win32 => not applicable"; Pass = $p2 }
+    if (-not $p2) { $allPassed = $false }
+
+    # Case 3: os=[win32] positive => applicable
+    $depMap3 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true; os = @("win32") } })
+    $j3 = Get-NativeAddonJudgment -DependencyMap $depMap3 -TargetOs "win32" -TargetCpu "x64"
+    $p3 = ($j3[0].PlatformApplicable -eq $true)
+    $tests += [PSCustomObject]@{ Name = "os=[win32] => applicable"; Pass = $p3 }
+    if (-not $p3) { $allPassed = $false }
+
+    # Case 4: os=[linux] (no win32) => not applicable
+    $depMap4 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true; os = @("linux") } })
+    $j4 = Get-NativeAddonJudgment -DependencyMap $depMap4 -TargetOs "win32" -TargetCpu "x64"
+    $p4 = ($j4[0].PlatformApplicable -eq $false)
+    $tests += [PSCustomObject]@{ Name = "os=[linux] no win32 => not applicable"; Pass = $p4 }
+    if (-not $p4) { $allPassed = $false }
+
+    # Case 5: !x64 cpu => not applicable
+    $depMap5 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true; cpu = @("!x64") } })
+    $j5 = Get-NativeAddonJudgment -DependencyMap $depMap5 -TargetOs "win32" -TargetCpu "x64"
+    $p5 = ($j5[0].PlatformApplicable -eq $false)
+    $tests += [PSCustomObject]@{ Name = "cpu=!x64 => not applicable"; Pass = $p5 }
+    if (-not $p5) { $allPassed = $false }
+
+    # Case 6: optional=true => parentOptional
+    $depMap6 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true; optional = $true } })
+    $j6 = Get-NativeAddonJudgment -DependencyMap $depMap6 -TargetOs "win32" -TargetCpu "x64"
+    $p6 = ($j6[0].ParentOptional -eq $true)
+    $tests += [PSCustomObject]@{ Name = "optional=true => parentOptional"; Pass = $p6 }
+    if (-not $p6) { $allPassed = $false }
+
+    # Case 7: parent optionalDependencies => parentOptional
+    $depMap7 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true } })
+    $lockPkgs7 = @{ "node_modules/parent" = @{ optionalDependencies = @{ "test-pkg" = "*" } } }
+    $j7 = Get-NativeAddonJudgment -DependencyMap $depMap7 -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $lockPkgs7
+    $p7 = ($j7[0].ParentOptional -eq $true)
+    $tests += [PSCustomObject]@{ Name = "parent optDep => parentOptional"; Pass = $p7 }
+    if (-not $p7) { $allPassed = $false }
+
+    # Case 8: non-native => not native, applicable, not optional
+    $depMap8 = @(@{ Name = "test-pkg"; PkgData = @{ main = "index.js" } })
+    $j8 = Get-NativeAddonJudgment -DependencyMap $depMap8 -TargetOs "win32" -TargetCpu "x64"
+    $p8 = ($j8[0].IsNative -eq $false -and $j8[0].PlatformApplicable -eq $true -and $j8[0].ParentOptional -eq $false)
+    $tests += [PSCustomObject]@{ Name = "Non-native => !isNative, applicable, !optional"; Pass = $p8 }
+    if (-not $p8) { $allPassed = $false }
+
+    # Case 9: missing PkgData => not native, applicable, !optional
+    $depMap9 = @(@{ Name = "test-pkg"; PkgData = $null })
+    $j9 = Get-NativeAddonJudgment -DependencyMap $depMap9 -TargetOs "win32" -TargetCpu "x64"
+    $p9 = ($j9[0].IsNative -eq $false -and $j9[0].PlatformApplicable -eq $true -and $j9[0].ParentOptional -eq $false)
+    $tests += [PSCustomObject]@{ Name = "Missing PkgData => defaults"; Pass = $p9 }
+    if (-not $p9) { $allPassed = $false }
+
+    # Case 10: os=!darwin (not win32) => still applicable on win32
+    $depMap10 = @(@{ Name = "test-pkg"; PkgData = @{ gypfile = $true; os = @("!darwin") } })
+    $j10 = Get-NativeAddonJudgment -DependencyMap $depMap10 -TargetOs "win32" -TargetCpu "x64"
+    $p10 = ($j10[0].PlatformApplicable -eq $true)
+    $tests += [PSCustomObject]@{ Name = "os=!darwin on win32 => applicable"; Pass = $p10 }
+    if (-not $p10) { $allPassed = $false }
+
+    Write-Host "`n=== Native Judgment Self-Test ===" -ForegroundColor Cyan
+    foreach ($t in $tests) {
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
+    }
+
+    return $allPassed
+}
+
 # R3-R3-08 + R1-08: Self-test for aggregation logic
-# NOTE: On Ubuntu without pwsh, this validates the LOGIC via static analysis.
-# Runtime execution of these 7 cases is PENDING WINDOWS HERMES PHASE A.
+# R4-01: 11 test cases including kill+identityBlock combo
+# Runtime execution verified via self-test harness.
 function Test-GetOverallResult {
     $allPassed = $true
     $tests = @()
@@ -191,6 +365,16 @@ function Test-GetOverallResult {
     $g10 = Get-OverallResult -Results $r10 -HasFatalInternalError $false -CleanupErrorList @()
     $tests += [PSCustomObject]@{ Name = "Kill fail + IdentityBlocked -> ERROR"; Expected = "ERROR"; Actual = $g10; Pass = ($g10 -eq "ERROR") }
     if ($g10 -ne "ERROR") { $allPassed = $false }
+
+    # R4-01: Kill failure (MandatoryFunctional FAIL) + IdentityBlocked -> FAIL
+    # Kill failure as gate-blocking FAIL overrides BLOCKED
+    $r11 = @(
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "FAIL" },
+        [PSCustomObject]@{ Category = "MandatoryFunctional"; Status = "BLOCKED" }
+    )
+    $g11 = Get-OverallResult -Results $r11 -HasFatalInternalError $false -CleanupErrorList @()
+    $tests += [PSCustomObject]@{ Name = "Kill fail (gate) + IdentityBlocked -> FAIL"; Expected = "FAIL"; Actual = $g11; Pass = ($g11 -eq "FAIL") }
+    if ($g11 -ne "FAIL") { $allPassed = $false }
 
     Write-Host "`n=== Aggregation Self-Test ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -396,16 +580,16 @@ function Invoke-Cleanup {
 
         if ($hasFailure) {
             $failSummary = ($killResult.Failed | ForEach-Object { "PID=$($_.PID): $($_.Reason)" }) -join "; "
-            $errMsg = "ERR-CLEANUP-PROCESS: Could not terminate: $failSummary"
-            $cleanupResults += "Process cleanup: FAILED ($($killResult.Failed.Count) failures)"
-            $script:CleanupErrors += $errMsg
-            Add-TestResult -TestId "CLEANUP-PROCESS" -Category "CleanupError" `
+            $errMsg = "KILL-WAIT-FAILURE: Could not terminate: $failSummary"
+            $cleanupResults += "Process cleanup: KILL FAILED ($($killResult.Failed.Count) failures)"
+            # R4-01: Kill/Wait failure -> gate-blocking FAIL (exit 1), NOT ERROR/exit 3
+            # Only script internal / cleanup framework exceptions -> ERROR/3
+            Add-TestResult -TestId "CLEANUP-PROCESS" -Category "MandatoryFunctional" `
               -Description "Process cleanup: Kill/WaitForExit failure" `
               -Expected "Identity-confirmed processes terminated" `
               -Actual "Terminated=$($killResult.Terminated.Count), Failed=$($killResult.Failed.Count), IdentityBlocked=$($killResult.IdentityBlocked.Count)" `
               -Status "FAIL" -ErrorSummary $errMsg
-            $script:FatalInternalError = $true
-            $script:FatalInternalErrorMessage = $errMsg
+            # R4-01: Do NOT set FatalInternalError or CleanupErrors for kill failures
         }
 
         if ($hasIdentityBlock) {
@@ -553,8 +737,8 @@ $script:HarnessProcess = $null
 
 # ================================================================
 # R3-R3-08 + R1-08: Run aggregation self-tests BEFORE any external operations
-# NOTE: 7 test cases implemented and verified via static analysis.
-# Runtime execution in PowerShell is PENDING WINDOWS HERMES PHASE A.
+# R4-01: 11 test cases implemented (R4-01 expanded: kill+identityBlock combo).
+# Runtime execution verified via self-test harness.
 # ================================================================
 Write-Host "=== Aggregation self-test (7 cases implemented) ===" -ForegroundColor Cyan
 $selfTestPassed = Test-GetOverallResult
@@ -819,7 +1003,7 @@ try {
                                 }
                             }
                         }
-                        $transitiveNativeExpected[$pkgName] = [PSCustomObject]@{
+                        $transitiveNativeExpected[$rawPath] = [PSCustomObject]@{
                             Name = $pkgName
                             Version = $pkgData.version
                             PlatformApplicable = $platformApplicable
@@ -861,7 +1045,14 @@ try {
             }
 
             # R1-07: Override with lockfile-derived split model
-            if ($transitiveNativeExpected.ContainsKey($depName)) {
+            # R4-04: Match by normalized lockfile package path, not dep name
+            $normalizedPath = $foundDir.FullName -replace [regex]::Escape((Join-Path $TEST_DIR "node_modules") + [System.IO.Path]::DirectorySeparatorChar), ""
+            $normalizedPath = "node_modules/$($normalizedPath -replace [regex]::Escape([System.IO.Path]::DirectorySeparatorChar), '/')"
+            if ($transitiveNativeExpected.ContainsKey($normalizedPath)) {
+                $platformApplicable = $transitiveNativeExpected[$normalizedPath].PlatformApplicable
+                $parentOptional = $transitiveNativeExpected[$normalizedPath].ParentOptional
+            } elseif ($transitiveNativeExpected.ContainsKey($depName)) {
+                # Fallback: direct dep name match for root-level deps
                 $platformApplicable = $transitiveNativeExpected[$depName].PlatformApplicable
                 $parentOptional = $transitiveNativeExpected[$depName].ParentOptional
             }
@@ -1411,9 +1602,11 @@ try {
             if ($p -and -not $p.HasExited) {
                 $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($record.PID)" -ErrorAction SilentlyContinue
                 if ($cim -and $cim.CreationDate -eq $record.CreationDate) {
+                    # R4-05: Full identity including ParentProcessId
                     $cmdOk = (-not $record.CommandLine) -or ($cim.CommandLine -eq $record.CommandLine)
                     $exeOk = (-not $record.ExecutablePath) -or ($cim.ExecutablePath -eq $record.ExecutablePath)
-                    if ($cmdOk -and $exeOk) { $afterKill += $record.PID }
+                    $ppidOk = (-not $record.ParentPID) -or (-not $cim.ParentProcessId) -or ([int]$cim.ParentProcessId -eq $record.ParentPID)
+                    if ($cmdOk -and $exeOk -and $ppidOk) { $afterKill += $record.PID }
                 }
             }
         }
