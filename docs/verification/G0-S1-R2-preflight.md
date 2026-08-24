@@ -277,9 +277,9 @@ This section and the static analysis table updated to reflect R6 changes.
 | PowerShell parser | PASS (0 errors, PS 5.1.26100.9168) |
 | PSScriptAnalyzer | PASS (0 Error, 94 Warning, module 1.24.0) |
 | Aggregation runtime | PASS (11/11, R8) |
-| Native judgment runtime | PASS (24/24, R8) |
+| Native judgment runtime | PASS (24/24, R9) |
 | Resolve-LockfileParentPath runtime | PASS (4/4 cases, isolated AST harness) |
-| NativeGateSummary runtime | PASS (15/15, R8) |
+| NativeGateSummary runtime | PASS (15/15, R9) |
 
 ---
 
@@ -385,3 +385,73 @@ Audited all 27 pipeline assignments across the script:
 
 **PowerShell:** 5.1.26100.9168
 **Harness:** AST-extracted allowlist (no dot-source, no full script execution)
+
+---
+
+## 13. R9 Remediation: PS5.1-Safe Lockfile Parsing
+
+**Date:** 2026-08-24
+**Trigger:** ChatGPT identified that PS5.1 `ConvertFrom-Json` cannot handle empty-string keys (the root `""` in `package-lock.json` `packages`), and PS5.1 does not support `-AsHashtable`. Direct `ConvertFrom-Json` on a real lockfile would fail at the lockfile parsing stage.
+
+### R9-01: Safe Lockfile Reader
+
+New `ConvertFrom-LockfileSafe` pure function:
+- Uses Node.js `JSON.parse` to read the lockfile (Node is a project prerequisite)
+- Converts `packages` entries to a JSON array `[{Path, Data}]` where root `""` is a value, not a JSON key
+- Parses the array with PS5.1-safe `ConvertFrom-Json` (no empty-string keys)
+- Builds a Hashtable map: exact normalized path → package data
+- Fail-closed: any error returns `Parsed=$false` with `Error` message
+- Records Node exit code, stderr, output; validates `packages` exists, no duplicate paths
+
+Test 4 (lockfile version) and Test 6 (native addon detection) now use `ConvertFrom-LockfileSafe` instead of direct `ConvertFrom-Json`.
+
+### R9-02: Hashtable Map with Exact Paths
+
+The reader builds `@{ path -> pkgData }` Hashtable preserving:
+- Root key `""` (empty string as Hashtable key)
+- Nested paths (`node_modules/parent/node_modules/child`)
+- Scoped paths (`node_modules/@scope/parent/node_modules/pkg`)
+- Same-name different instances (distinct paths)
+
+Runtime Test 6 iterates `$lockfilePackages.Keys` (Hashtable) instead of `$lockfileJson.packages.PSObject.Properties` (PSCustomObject).
+
+### R9-03: Shared Judgment Logic
+
+Test 6 now calls `Get-NativeAddonJudgment` pure function for platform/optional judgment instead of maintaining duplicate inline logic. This eliminates semantic divergence between runtime and self-test.
+
+The inline `$hasPositive`/`$denied` platform checks and `$parentOptional` lookup in Test 6 have been replaced by a single call to the shared pure function with the parsed lockfile map.
+
+### R9-04: Test Fixtures
+
+9 fixture tests in `Test-LockfileReader` (run in `$env:TEMP`, cleaned up after):
+
+| Case | Scenario | Expected |
+|------|----------|----------|
+| F1 | Root key `""` + optionalDependencies + required | Parsed, all keys present |
+| F2 | Nested dependency | Parsed, nested key present |
+| F3 | Scoped parent | Parsed, scoped key present |
+| F4 | Same-name different paths | Parsed, 5 entries, both paths distinct |
+| F5 | Malformed JSON | Parsed=false, error message |
+| F6 | Missing `packages` | Parsed=false, error about packages |
+| F7 | Non-existent file | Parsed=false, "not found" |
+| F8 | Root optDep via reader → Get-NativeAddonJudgment | ParentOptional=true, IsNative=true |
+| F9 | Nested optDep via reader → Get-NativeAddonJudgment | ParentOptional=true |
+
+### R9-05: Self-Test Results
+
+| Suite | Cases | Result | Exit Code |
+|-------|-------|--------|-----------|
+| Lockfile Reader | 9 | 9/9 PASS | 0 |
+| Aggregation | 11 | 11/11 PASS | 0 |
+| Parent Resolver | 4 | 4/4 PASS | 0 |
+| Native Judgment | 24 | 24/24 PASS | 0 |
+| Gate Summary | 15 | 15/15 PASS | 0 |
+| **Overall** | **63** | **63/63 PASS** | **0** |
+
+**PowerShell:** 5.1.26100.9168
+**Node.js:** v22.22.2
+**Harness:** AST-extracted allowlist (no dot-source, no full script execution)
+
+### Key Correction
+
+R8-03's "PSCustomObject graceful fallback" conclusion was **incorrect**. PS5.1 `ConvertFrom-Json` cannot handle empty-string keys at all — the error occurs during JSON parsing, not during property access. The `Test-HasKey` fallback is irrelevant because the JSON never parses successfully. The only correct approach is to avoid `ConvertFrom-Json` on the raw lockfile and use an intermediate format (Node.js JSON array) that doesn't contain empty-string keys.

@@ -242,6 +242,107 @@ function Test-HasKey {
     return $false
 }
 
+# R9-01: PS5.1-safe lockfile reader.
+# PS5.1 ConvertFrom-Json cannot handle empty-string keys (the root "" in package-lock.json).
+# PS5.1 does not support -AsHashtable. This function uses Node.js JSON.parse to safely
+# convert the lockfile packages into an array of {Path, Data} entries, then builds a
+# Hashtable map with exact normalized paths as keys.
+#
+# Returns: @{ Parsed=$true/$false; Error=""; Packages=@{ path -> pkgData } }
+# Fail-closed: any error returns Parsed=$false with Error message.
+function ConvertFrom-LockfileSafe {
+    param(
+        [Parameter(Mandatory=$true)][string]$LockfilePath
+    )
+
+    $result = @{ Parsed = $false; Error = ""; Packages = @{} }
+
+    if (-not (Test-Path $LockfilePath)) {
+        $result.Error = "Lockfile not found: $LockfilePath"
+        return $result
+    }
+
+    # R9-01: Node.js helper — reads lockfile, outputs packages as JSON array
+    # Each entry: { "Path": "<normalized>", "Data": { ...package data... } }
+    # Root entry has Path="" (empty string as a value, not a JSON key).
+    $nodeScript = @'
+const fs = require("fs");
+try {
+    const raw = fs.readFileSync(process.argv[2], "utf8");
+    const lock = JSON.parse(raw);
+    if (!lock.packages || typeof lock.packages !== "object") {
+        process.stderr.write("ERROR: missing or invalid packages field");
+        process.exit(1);
+    }
+    const entries = [];
+    const seen = new Set();
+    for (const [key, val] of Object.entries(lock.packages)) {
+        if (seen.has(key)) {
+            process.stderr.write("ERROR: duplicate path: " + key);
+            process.exit(2);
+        }
+        seen.add(key);
+        entries.push({ Path: key, Data: val });
+    }
+    process.stdout.write(JSON.stringify(entries));
+    process.exit(0);
+} catch (e) {
+    process.stderr.write("ERROR: " + e.message);
+    process.exit(3);
+}
+'@
+
+    # Write node helper to temp file (not in repo)
+    $nodeHelperPath = Join-Path $env:TEMP "lockfile-reader-$([guid]::NewGuid().ToString('N').Substring(0,8)).js"
+    try {
+        $nodeScript | Out-File -FilePath $nodeHelperPath -Encoding ASCII -NoNewline
+
+        # Invoke Node.js
+        $nodeOutput = & node $nodeHelperPath $LockfilePath 2>&1
+        $nodeExit = $LASTEXITCODE
+
+        if ($nodeExit -ne 0) {
+            $stderr = ($nodeOutput | Out-String).Trim()
+            $result.Error = "Node lockfile reader failed (exit $nodeExit): $stderr"
+            return $result
+        }
+
+        $jsonOut = ($nodeOutput | Out-String).Trim()
+        if (-not $jsonOut) {
+            $result.Error = "Node lockfile reader produced empty output"
+            return $result
+        }
+
+        # Parse the array output — safe because no empty-string keys
+        $entries = $jsonOut | ConvertFrom-Json
+
+        # Build Hashtable map: exact path -> package data
+        $pkgMap = @{}
+        $seenPaths = @{}
+        foreach ($entry in $entries) {
+            $path = [string]$entry.Path
+            $data = $entry.Data
+            if ($seenPaths.ContainsKey($path)) {
+                $result.Error = "Duplicate normalized path: $path"
+                return $result
+            }
+            $seenPaths[$path] = $true
+            # Convert PSCustomObject data to hashtable for representation-agnostic access
+            $pkgMap[$path] = $data
+        }
+
+        $result.Parsed = $true
+        $result.Packages = $pkgMap
+        return $result
+
+    } catch {
+        $result.Error = "Lockfile reader exception: $($_.Exception.Message)"
+        return $result
+    } finally {
+        if (Test-Path $nodeHelperPath) { Remove-Item $nodeHelperPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 # R4-02 + R5-03 + R6-03: Native addon judgment pure function
 # Each DependencyMap item carries InstancePath and ParentPath.
 # Only queries the exact parent for that instance — never scans all packages.
@@ -536,6 +637,167 @@ function Test-NativeAddonJudgment {
     if (-not $p18) { $allPassed = $false }
 
     Write-Host "`n=== Native Judgment Self-Test (24 cases) ===" -ForegroundColor Cyan
+    foreach ($t in $tests) {
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
+    }
+
+    return $allPassed
+}
+
+# R9-04: Self-test for ConvertFrom-LockfileSafe with real Node.js fixtures.
+# Creates minimal package-lock.json fixtures in $env:TEMP, calls the reader,
+# and verifies the Hashtable map. All fixtures are cleaned up after the test.
+function Test-LockfileReader {
+    $allPassed = $true
+    $tests = @()
+    $fixtureDir = Join-Path $env:TEMP "lockfile-test-fixtures-$(Get-Random)"
+    New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+
+    try {
+        # F1: packages with root key "" and root optionalDependencies
+        $f1 = Join-Path $fixtureDir "f1-root-optdep.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0", "optionalDependencies": { "opt-pkg": "*" } },
+    "node_modules/opt-pkg": { "name": "opt-pkg", "version": "1.0.0", "os": ["linux"] },
+    "node_modules/req-pkg": { "name": "req-pkg", "version": "2.0.0" }
+  }
+}
+'@ | Out-File -FilePath $f1 -Encoding ASCII
+        $r1 = ConvertFrom-LockfileSafe -LockfilePath $f1
+        $p1 = $r1.Parsed -and $r1.Packages.ContainsKey("") -and $r1.Packages.ContainsKey("node_modules/opt-pkg") -and $r1.Packages.ContainsKey("node_modules/req-pkg")
+        $tests += [PSCustomObject]@{ Name="F1: root key + optdep + required"; Pass=$p1 }
+        if (-not $p1) { $allPassed = $false }
+
+        # F2: nested dependency
+        $f2 = Join-Path $fixtureDir "f2-nested.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/parent": { "name": "parent", "version": "1.0.0" },
+    "node_modules/parent/node_modules/child": { "name": "child", "version": "1.0.0" }
+  }
+}
+'@ | Out-File -FilePath $f2 -Encoding ASCII
+        $r2 = ConvertFrom-LockfileSafe -LockfilePath $f2
+        $p2 = $r2.Parsed -and $r2.Packages.ContainsKey("node_modules/parent/node_modules/child")
+        $tests += [PSCustomObject]@{ Name="F2: nested dependency"; Pass=$p2 }
+        if (-not $p2) { $allPassed = $false }
+
+        # F3: scoped parent
+        $f3 = Join-Path $fixtureDir "f3-scoped.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/@scope/parent": { "name": "parent", "version": "1.0.0", "optionalDependencies": { "child": "*" } },
+    "node_modules/@scope/parent/node_modules/child": { "name": "child", "version": "1.0.0" }
+  }
+}
+'@ | Out-File -FilePath $f3 -Encoding ASCII
+        $r3 = ConvertFrom-LockfileSafe -LockfilePath $f3
+        $p3 = $r3.Parsed -and $r3.Packages.ContainsKey("node_modules/@scope/parent/node_modules/child")
+        $tests += [PSCustomObject]@{ Name="F3: scoped parent"; Pass=$p3 }
+        if (-not $p3) { $allPassed = $false }
+
+        # F4: same-name different paths
+        $f4 = Join-Path $fixtureDir "f4-samename.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/a": { "name": "a", "version": "1.0.0" },
+    "node_modules/a/node_modules/shared": { "name": "shared", "version": "1.0.0" },
+    "node_modules/b": { "name": "b", "version": "1.0.0" },
+    "node_modules/b/node_modules/shared": { "name": "shared", "version": "2.0.0" }
+  }
+}
+'@ | Out-File -FilePath $f4 -Encoding ASCII
+        $r4 = ConvertFrom-LockfileSafe -LockfilePath $f4
+        $p4 = $r4.Parsed -and $r4.Packages.ContainsKey("node_modules/a/node_modules/shared") -and $r4.Packages.ContainsKey("node_modules/b/node_modules/shared") -and ($r4.Packages.Count -eq 5)
+        $tests += [PSCustomObject]@{ Name="F4: same-name different paths"; Pass=$p4 }
+        if (-not $p4) { $allPassed = $false }
+
+        # F5: malformed JSON → BLOCKED
+        $f5 = Join-Path $fixtureDir "f5-malformed.json"
+        '{ invalid json }' | Out-File -FilePath $f5 -Encoding ASCII
+        $r5 = ConvertFrom-LockfileSafe -LockfilePath $f5
+        $p5 = (-not $r5.Parsed) -and $r5.Error -ne ""
+        $tests += [PSCustomObject]@{ Name="F5: malformed JSON => Parsed=false"; Pass=$p5 }
+        if (-not $p5) { $allPassed = $false }
+
+        # F6: missing packages → BLOCKED
+        $f6 = Join-Path $fixtureDir "f6-nopackages.json"
+        '{ "name": "test", "lockfileVersion": 3 }' | Out-File -FilePath $f6 -Encoding ASCII
+        $r6 = ConvertFrom-LockfileSafe -LockfilePath $f6
+        $p6 = (-not $r6.Parsed) -and $r6.Error -match "packages"
+        $tests += [PSCustomObject]@{ Name="F6: missing packages => Parsed=false"; Pass=$p6 }
+        if (-not $p6) { $allPassed = $false }
+
+        # F7: non-existent file → BLOCKED
+        $f7 = Join-Path $fixtureDir "nonexistent.json"
+        $r7 = ConvertFrom-LockfileSafe -LockfilePath $f7
+        $p7 = (-not $r7.Parsed) -and $r7.Error -match "not found"
+        $tests += [PSCustomObject]@{ Name="F7: missing file => Parsed=false"; Pass=$p7 }
+        if (-not $p7) { $allPassed = $false }
+
+        # F8: Integration — root optionalDependencies resolved correctly
+        # F1's opt-pkg has os:["linux"] but no native indicator, so we create a
+        # fixture with gypfile=true to trigger the native+optional check path
+        $f8 = Join-Path $fixtureDir "f8-root-optdep-native.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0", "optionalDependencies": { "native-opt": "*" } },
+    "node_modules/native-opt": { "name": "native-opt", "version": "1.0.0", "gypfile": true, "os": ["linux"] }
+  }
+}
+'@ | Out-File -FilePath $f8 -Encoding ASCII
+        $r8lock = ConvertFrom-LockfileSafe -LockfilePath $f8
+        $d8 = @( @{ Name="native-opt"; PkgData=$r8lock.Packages["node_modules/native-opt"]; InstancePath="node_modules/native-opt"; ParentPath=(Resolve-LockfileParentPath "node_modules/native-opt") } )
+        $j8 = Get-NativeAddonJudgment -DependencyMap $d8 -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $r8lock.Packages
+        $p8 = ($j8[0].ParentOptional -eq $true -and $j8[0].IsNative -eq $true)  # root optionalDependency + native
+        $tests += [PSCustomObject]@{ Name="F8: root optDep via reader => ParentOptional"; Pass=$p8 }
+        if (-not $p8) { $allPassed = $false }
+
+        # F9: Integration — nested optionalDependency resolved correctly
+        $f9 = Join-Path $fixtureDir "f9-nested-optdep.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/myparent": { "name": "myparent", "version": "1.0.0", "optionalDependencies": { "mychild": "*" } },
+    "node_modules/myparent/node_modules/mychild": { "name": "mychild", "version": "1.0.0", "gypfile": true }
+  }
+}
+'@ | Out-File -FilePath $f9 -Encoding ASCII
+        $r9lock = ConvertFrom-LockfileSafe -LockfilePath $f9
+        $d9 = @( @{ Name="mychild"; PkgData=$r9lock.Packages["node_modules/myparent/node_modules/mychild"]; InstancePath="node_modules/myparent/node_modules/mychild"; ParentPath=(Resolve-LockfileParentPath "node_modules/myparent/node_modules/mychild") } )
+        $j9 = Get-NativeAddonJudgment -DependencyMap $d9 -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $r9lock.Packages
+        $p9 = ($j9[0].ParentOptional -eq $true)
+        $tests += [PSCustomObject]@{ Name="F9: nested optDep via reader => ParentOptional"; Pass=$p9 }
+        if (-not $p9) { $allPassed = $false }
+
+    } finally {
+        Remove-Item $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "`n=== Lockfile Reader Self-Test (9 cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
@@ -1368,12 +1630,15 @@ try {
         throw [AssertionFailure]::new("4", "No lockfile")
     }
 
-    try {
-        $lockContent = Get-Content $lockfile -Raw | ConvertFrom-Json
-        $lockDsh = $lockContent.packages."node_modules/@deepseek-ai/dsh"
+    # R9-01: Use safe lockfile reader (PS5.1 can't handle empty-string keys)
+    $lockResult = ConvertFrom-LockfileSafe -LockfilePath $lockfile
+    if (-not $lockResult.Parsed) {
+        $versionErrors += "Lockfile parse error: $($lockResult.Error)"
+    } else {
+        $lockDsh = $lockResult.Packages["node_modules/@deepseek-ai/dsh"]
         if ($lockDsh -and $lockDsh.version) { $lockfileVer = $lockDsh.version }
         else { $versionErrors += "dsh not in lockfile or version field missing" }
-    } catch { $versionErrors += "Lockfile parse error: $($_.Exception.Message)" }
+    }
 
     $installedPkg = Join-Path $TEST_DIR "node_modules" "@deepseek-ai" "dsh" "package.json"
     if (Test-Path $installedPkg) {
@@ -1441,26 +1706,20 @@ try {
     $lockfileJson = $null
     $transitiveNativeExpected = @{}
 
-    if (-not (Test-Path $lockfile)) {
-        $lockfileParseError = "Lockfile not found at $lockfile"
+    # R9-01: Use safe lockfile reader (PS5.1 can't handle empty-string keys in ConvertFrom-Json)
+    $lockResult = ConvertFrom-LockfileSafe -LockfilePath $lockfile
+    if (-not $lockResult.Parsed) {
+        $lockfileParseError = $lockResult.Error
     } else {
-        try {
-            $lockfileJson = Get-Content $lockfile -Raw | ConvertFrom-Json
-            # R6-02: Validate packages key exists
-            if (-not $lockfileJson.packages) {
-                $lockfileParseError = "Lockfile JSON parsed but 'packages' key missing"
-            } else {
-                $lockfileParsed = $true
-            }
-        } catch {
-            $lockfileParseError = "Lockfile JSON parse error: $($_.Exception.Message)"
-        }
+        $lockfileParsed = $true
+        $lockfilePackages = $lockResult.Packages  # Hashtable: exact path -> package data
     }
 
     if ($lockfileParsed) {
-        # R1-07: Build transitive dependency map from package-lock.json
-        foreach ($pkgEntry in $lockfileJson.packages.PSObject.Properties) {
-            $rawName = $pkgEntry.Name
+        # R1-07: Build transitive dependency map from lockfile packages
+        # R9-02: Iterate Hashtable (not PSObject.Properties) — supports "" root key
+        foreach ($rawName in @($lockfilePackages.Keys)) {
+            $pkgData = $lockfilePackages[$rawName]
             # Extract the actual package name from the last node_modules segment
             if ($rawName -match 'node_modules[/\\]([^/\\]+)$') {
                 $pkgName = $Matches[1]
@@ -1469,36 +1728,17 @@ try {
             } else {
                 $pkgName = $rawName -replace '^node_modules/', '' -replace '^node_modules\\', ''
             }
-            $pkgData = $pkgEntry.Value
             if ($pkgName -in $nativeDepsToCheck) {
-                # R3-03: Split platform-applicable vs parent-optional
-                $platformApplicable = $true
-                if ($pkgData.os) {
-                    $hasPositive = $pkgData.os | Where-Object { $_ -notlike '!*' }
-                    $denied = $pkgData.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
-                    if ($denied) { $platformApplicable = $false }
-                    elseif ($hasPositive -and ($pkgData.os -notcontains "win32")) { $platformApplicable = $false }
-                }
-                if ($pkgData.cpu) {
-                    $hasPositive = $pkgData.cpu | Where-Object { $_ -notlike '!*' }
-                    $denied = $pkgData.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
-                    if ($denied) { $platformApplicable = $false }
-                    elseif ($hasPositive -and ($pkgData.cpu -notcontains "x64")) { $platformApplicable = $false }
-                }
-                $parentOptional = ($pkgData.optional -eq $true)
-                # R6-03: Use Resolve-LockfileParentPath for consistent parent resolution
-                $resolvedParent = Resolve-LockfileParentPath -InstancePath $rawName
-                if ($resolvedParent -and $lockfileJson.packages.PSObject.Properties[$resolvedParent]) {
-                    $parentPkg = $lockfileJson.packages.PSObject.Properties[$resolvedParent].Value
-                    if ($parentPkg.optionalDependencies -and $parentPkg.optionalDependencies.PSObject.Properties[$pkgName]) {
-                        $parentOptional = $true
-                    }
-                }
+                # R9-03: Use Get-NativeAddonJudgment pure function for platform/optional judgment
+                # This eliminates the duplicate inline platform/optional logic
+                $depMap = @( @{ Name=$pkgName; PkgData=$pkgData; InstancePath=$rawName; ParentPath=(Resolve-LockfileParentPath -InstancePath $rawName) } )
+                $judgments = Get-NativeAddonJudgment -DependencyMap $depMap -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $lockfilePackages
+                $judgment = $judgments[0]
                 $transitiveNativeExpected[$rawName] = [PSCustomObject]@{
                     Name = $pkgName
                     Version = $pkgData.version
-                    PlatformApplicable = $platformApplicable
-                    ParentOptional = $parentOptional
+                    PlatformApplicable = $judgment.PlatformApplicable
+                    ParentOptional = $judgment.ParentOptional
                     InLockfile = $true
                 }
             }
