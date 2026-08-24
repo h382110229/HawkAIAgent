@@ -159,22 +159,11 @@ function Get-NativeGateSummary {
     $requiredLoadFailures = @($requiredResolved | Where-Object { $_.LoadExit -ne 0 })
     $requiredLoaded = @($requiredResolved | Where-Object { $_.LoadExit -eq 0 })
 
-    # Decision logic (priority: BLOCKED > FAIL > Informational)
+    # R8-01: Decision logic (priority: FAIL > BLOCKED > Informational)
+    # Known required load failures are a definitive negative signal and must not
+    # be masked by unresolved/blocked instances that may resolve later.
 
-    # R6-01: Any blocked instance → BLOCKED (even if load succeeded)
-    if ($blockedInstances.Count -gt 0) {
-        $blockedDetails = ($blockedInstances | ForEach-Object { "$($_.Name)@$($_.Version): $($_.ResolutionStatus) — $($_.BlockReason)" }) -join "; "
-        return [PSCustomObject]@{
-            Status = "BLOCKED"
-            Category = "EvidenceDependent"
-            Description = "Native addon detection"
-            Expected = "All instances resolved"
-            Actual = "Blocked instances: $blockedDetails"
-            ErrorSummary = "BLOCKED — instance resolution incomplete"
-        }
-    }
-
-    # Required load failures → FAIL
+    # Required load failures → FAIL (highest priority among gate-blocking)
     if ($requiredLoadFailures.Count -gt 0) {
         $failureDetails = ($requiredLoadFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) $($_.LoadOutput)" }) -join "; "
         return [PSCustomObject]@{
@@ -184,6 +173,19 @@ function Get-NativeGateSummary {
             Expected = "Required Windows native addons load"
             Actual = "REQUIRED LOAD FAILURES: $failureDetails"
             ErrorSummary = "Required native addon(s) failed to load on Windows x64"
+        }
+    }
+
+    # R8-01: Blocked/unresolved instances → BLOCKED (after required FAIL)
+    if ($blockedInstances.Count -gt 0) {
+        $blockedDetails = ($blockedInstances | ForEach-Object { "$($_.Name)@$($_.Version): $($_.ResolutionStatus) — $($_.BlockReason)" }) -join "; "
+        return [PSCustomObject]@{
+            Status = "BLOCKED"
+            Category = "EvidenceDependent"
+            Description = "Native addon detection"
+            Expected = "All instances resolved"
+            Actual = "Blocked instances: $blockedDetails"
+            ErrorSummary = "BLOCKED — instance resolution incomplete"
         }
     }
 
@@ -317,7 +319,8 @@ function Get-NativeAddonJudgment {
 
             # R5-03: Check ONLY the exact parent for this instance
             $parentOptional = ($pkgData.optional -eq $true)
-            if ($parentPath -and (Test-HasKey $LockfilePackages $parentPath)) {
+            # R8-03: Test-HasKey supports empty-string root key; no falsy skip
+            if (Test-HasKey $LockfilePackages $parentPath) {
                 # R7-02: Use .$key for representation-agnostic access (works for Hashtable and PSCustomObject)
                 $lfPkg = $LockfilePackages.$parentPath
                 if ($lfPkg.optionalDependencies -and (Test-HasKey $lfPkg.optionalDependencies $depName)) {
@@ -442,6 +445,26 @@ function Test-NativeAddonJudgment {
     $tests += [PSCustomObject]@{ Name="C11c: nested optDep (PSCustomObject) => parentOptional"; Pass=$p11c }
     if (-not $p11c) { $allPassed = $false }
 
+    # R8-03: Case 11d: root optionalDependencies (ParentPath="") via Hashtable
+    # PkgData.optional=false, but packages[''].optionalDependencies contains dep
+    $d11d = @(@{ Name="pkg11d"; PkgData=@{ gypfile=$true; optional=$false }; InstancePath="node_modules/pkg11d"; ParentPath="" })
+    $lock11d = @{ "" = @{ optionalDependencies=@{ "pkg11d"="*" } } }
+    $j11d = Get-NativeAddonJudgment -DependencyMap $d11d -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $lock11d
+    $p11d = ($j11d[0].ParentOptional -eq $true)
+    $tests += [PSCustomObject]@{ Name="C11d: root optDep (Hashtable, PkgData.optional=false) => parentOptional"; Pass=$p11d }
+    if (-not $p11d) { $allPassed = $false }
+
+    # R8-03: Case 11e: root optDep with PSCustomObject that has NO "" key
+    # PSCustomObject cannot have empty-string property names (PS limitation).
+    # When ParentPath="" and LockfilePackages is PSCustomObject, Test-HasKey
+    # returns $false → lookup skipped → $parentOptional stays $false (PkgData.optional).
+    # This is correct: root optionalDependencies via JSON is not a real scenario.
+    $lock11e = [PSCustomObject]@{ "somepkg" = [PSCustomObject]@{ optionalDependencies = [PSCustomObject]@{ "pkg11d" = "*" } } }
+    $j11e = Get-NativeAddonJudgment -DependencyMap $d11d -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $lock11e
+    $p11e = ($j11e[0].ParentOptional -eq $false)  # $false because "" key not in PSCustomObject
+    $tests += [PSCustomObject]@{ Name="C11e: root no-key (PSCustomObject) => stays PkgData.optional"; Pass=$p11e }
+    if (-not $p11e) { $allPassed = $false }
+
     # Case 12a: nested parent via Hashtable
     $d12 = @(@{ Name="pkg12"; PkgData=@{ gypfile=$true }; InstancePath="node_modules/parent/node_modules/pkg12"; ParentPath="node_modules/parent" })
     $lock12 = @{ "node_modules/parent" = @{ optionalDependencies=@{ "pkg12"="*" } } }
@@ -512,7 +535,7 @@ function Test-NativeAddonJudgment {
     $tests += [PSCustomObject]@{ Name="C18: os=!win32 cpu=!arm => not applicable"; Pass=$p18 }
     if (-not $p18) { $allPassed = $false }
 
-    Write-Host "`n=== Native Judgment Self-Test (22 cases) ===" -ForegroundColor Cyan
+    Write-Host "`n=== Native Judgment Self-Test (24 cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
@@ -641,14 +664,14 @@ function Test-NativeGateSummary {
     $tests += [PSCustomObject]@{ Name="T12: bare 1 loaded => PASS"; Expected="PASS"; Actual=$g12.Status; Pass=($g12.Status -eq "PASS") }
     if ($g12.Status -ne "PASS") { $allPassed = $false }
 
-    # T13: 1 FAIL + 1 BLOCKED → FAIL has priority
+    # R8-01: T13: 1 FAIL + 1 BLOCKED → FAIL (required failure takes priority)
     $i13 = @(
         [PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$true; ParentOptional=$false; LoadExit=1; LoadOutput="ERR" },
         [PSCustomObject]@{ Name="b"; Version="2.0"; ResolutionStatus="Blocked"; BlockReason="No mapping"; PlatformApplicable=$true; ParentOptional=$false; LoadExit=0; LoadOutput="" }
     )
     $g13 = Get-NativeGateSummary -InstanceResults $i13 -LockfileParsed $true
-    $tests += [PSCustomObject]@{ Name="T13: 1 FAIL + 1 BLOCKED => BLOCKED (priority)"; Expected="BLOCKED"; Actual=$g13.Status; Pass=($g13.Status -eq "BLOCKED") }
-    if ($g13.Status -ne "BLOCKED") { $allPassed = $false }
+    $tests += [PSCustomObject]@{ Name="T13: 1 FAIL + 1 BLOCKED => FAIL (R8-01 priority)"; Expected="FAIL"; Actual=$g13.Status; Pass=($g13.Status -eq "FAIL") }
+    if ($g13.Status -ne "FAIL") { $allPassed = $false }
 
     # T14: Bare PSCustomObject optional/platform-n/a → Informational PASS
     $i14bare = [PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$false; ParentOptional=$false; LoadExit=1; LoadOutput="ERR" }
@@ -1626,9 +1649,10 @@ try {
     Update-OwnedProcessRecords -LauncherPid $script:HarnessLauncherPid -LauncherCreationDate $script:HarnessLauncherCreationDate
 
     # R1-03: Select Harness Node ONLY from owned records
-    $candidateNodes = $script:OwnedProcessRecords | Where-Object {
+    # R8-02: @() for PS 5.1 scalar-safe pipeline (.Count used below)
+    $candidateNodes = @($script:OwnedProcessRecords | Where-Object {
         $_.Name -eq "node.exe" -and $_.CommandLine -and $_.CommandLine -like "*dsh*"
-    }
+    })
     if ($candidateNodes.Count -gt 0) {
         # R1-03: Pick the deepest one (most likely the actual harness, not a launcher wrapper)
         $script:HarnessNodePid = ($candidateNodes | Sort-Object -Property Depth -Descending | Select-Object -First 1).PID

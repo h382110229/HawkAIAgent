@@ -239,7 +239,7 @@ This section and the static analysis table updated to reflect R6 changes.
 | Yes | Resolved + required | failure | FAIL |
 | Yes | Resolved + optional/n-a | failure | Informational PASS |
 | Yes | Resolved + optional/n-a | success | Informational PASS |
-| Yes | mixed Blocked + Resolved | any | BLOCKED |
+| Yes | mixed Blocked + Resolved | any | FAIL if required load failure present, else BLOCKED (R8-01) |
 | Yes | no instances | — | Informational PASS |
 
 ---
@@ -252,7 +252,7 @@ This section and the static analysis table updated to reflect R6 changes.
 | IdentityBlocked as MandatoryFunctional | PASS |
 | Kill failure as MandatoryFunctional FAIL | PASS |
 | Has Get-NativeAddonJudgment pure function | PASS |
-| Has Test-NativeAddonJudgment self-test (22 cases) | PASS |
+| Has Test-NativeAddonJudgment self-test (24 cases, R8) | PASS |
 | Has Resolve-LockfileParentPath pure function (R6-03) | PASS |
 | Has Test-ResolveLockfileParentPath self-test (4 cases) | PASS |
 | Has Get-NativeGateSummary pure function (R6-04) | PASS |
@@ -276,10 +276,10 @@ This section and the static analysis table updated to reflect R6 changes.
 | Empty catch in lockfile parsing | 0 (removed) |
 | PowerShell parser | PASS (0 errors, PS 5.1.26100.9168) |
 | PSScriptAnalyzer | PASS (0 Error, 94 Warning, module 1.24.0) |
-| Aggregation runtime | PASS (11/11 cases, isolated AST harness) |
-| Native judgment runtime | PASS (22/22 cases, isolated AST harness) |
+| Aggregation runtime | PASS (11/11, R8) |
+| Native judgment runtime | PASS (24/24, R8) |
 | Resolve-LockfileParentPath runtime | PASS (4/4 cases, isolated AST harness) |
-| NativeGateSummary runtime | PASS (15/15 cases, isolated AST harness) |
+| NativeGateSummary runtime | PASS (15/15, R8) |
 
 ---
 
@@ -328,9 +328,9 @@ Root parent case (ParentPath="") uses `$pkgData.optional` by design (empty strin
 |-------|-------|--------|-----------|
 | Aggregation (Get-OverallResult) | 11 | 11/11 PASS | 0 |
 | Parent Resolver (Resolve-LockfileParentPath) | 4 | 4/4 PASS | 0 |
-| Native Judgment (Get-NativeAddonJudgment) | 22 | 22/22 PASS | 0 |
+| Native Judgment (Get-NativeAddonJudgment) | 24 | 24/24 PASS | 0 |
 | Gate Summary (Get-NativeGateSummary) | 15 | 15/15 PASS | 0 |
-| **Overall** | **52** | **52/52 PASS** | **0** |
+| **Overall** | **54** | **54/54 PASS** | **0** |
 
 **PowerShell version:** 5.1.26100.9168
 **Harness method:** AST-extracted allowlist (no dot-source, no full script execution)
@@ -340,3 +340,48 @@ Root parent case (ParentPath="") uses `$pkgData.optional` by design (empty strin
 - PS 5.1 single-item pipeline unwrapping is a **runtime risk**, not test-only. Any `Where-Object` returning 0/1 items produces a bare object, not an array. `.Count` on bare `PSCustomObject` returns `$null`.
 - `ConvertFrom-Json` produces `PSCustomObject`, not `Hashtable`. Code using `.ContainsKey()` or `[$key]` indexer on JSON output will fail. `Test-HasKey` and `.$key` property access resolve this.
 - No complete PoC or Harness was executed. Only pure-function isolated self-tests were run.
+
+---
+
+## 12. R8 Remediation: Gate Precedence and Runtime Scalar Safety
+
+**Date:** 2026-08-24
+**Trigger:** ChatGPT review identified gate precedence mismatch, remaining unwrapped pipeline, and root parent falsy skip.
+
+### R8-01: Unified Gate Precedence FAIL > BLOCKED
+
+`Get-NativeGateSummary` previously checked BLOCKED before FAIL. When both a required load failure and an unresolved instance exist, the BLOCKED result masked the definitive FAIL.
+
+**Fix:** Reordered to check `$requiredLoadFailures` (FAIL) first, then `$blockedInstances` (BLOCKED). T13 updated: `1 FAIL + 1 BLOCKED → FAIL`.
+
+### R8-02: Full Script Pipeline Audit
+
+Audited all 27 pipeline assignments across the script:
+- 11 already wrapped with `@()` (R7)
+- 15 unwrapped but safe (boolean truthiness, `-join` string, `Select-Object -First 1` scalar)
+- 1 needed fixing: `$candidateNodes` (L1650) — uses `.Count` on unwrapped `Where-Object` result
+
+**Fix:** `$candidateNodes` wrapped with `@()`. All other unwrapped pipelines documented as safe.
+
+### R8-03: Root Parent Empty-String Key Support
+
+`if ($parentPath -and (Test-HasKey ...))` skipped the lookup when `$parentPath` was `""` (empty string is falsy in PowerShell). This prevented root optionalDependencies from being checked.
+
+**Fix:** Changed to `if (Test-HasKey $LockfilePackages $parentPath)` — `Test-HasKey` handles empty string correctly for Hashtable (returns `$true` if key exists). PSCustomObject cannot have empty-string property names, so `Test-HasKey` returns `$false` gracefully.
+
+**New test cases:**
+- C11d: root optDep via Hashtable with `PkgData.optional=false` → `ParentOptional=true`
+- C11e: root no-key via PSCustomObject → `ParentOptional` stays `$false` (graceful fallback)
+
+### R8-04: Self-Test Coverage
+
+| Suite | Cases | Result | Exit Code |
+|-------|-------|--------|-----------|
+| Aggregation | 11 | 11/11 PASS | 0 |
+| Parent Resolver | 4 | 4/4 PASS | 0 |
+| Native Judgment | 24 | 24/24 PASS | 0 |
+| Gate Summary | 15 | 15/15 PASS | 0 |
+| **Overall** | **54** | **54/54 PASS** | **0** |
+
+**PowerShell:** 5.1.26100.9168
+**Harness:** AST-extracted allowlist (no dot-source, no full script execution)
