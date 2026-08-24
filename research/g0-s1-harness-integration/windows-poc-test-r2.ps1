@@ -104,9 +104,131 @@ function Get-OverallResult {
     return "PASS"
 }
 
-# R4-02 + R5-03: Native addon judgment pure function
+# R6-03: Pure function to resolve lockfile parent path from instance path.
+# Single implementation used by both runtime code and self-tests.
+# Returns the normalized parent lockfile path, or "" for root packages.
+function Resolve-LockfileParentPath {
+    param(
+        [Parameter(Mandatory=$true)][string]$InstancePath  # normalized lockfile path, e.g. "node_modules/parent/node_modules/pkg"
+    )
+
+    # node_modules/@scope/parent/node_modules/pkg → node_modules/@scope/parent
+    if ($InstancePath -match '^(.+[/\\])node_modules[/\\]') {
+        return $Matches[1].TrimEnd('/').TrimEnd('\\')
+    }
+    # node_modules/parent/node_modules/pkg → node_modules/parent
+    # node_modules/pkg → "" (root)
+    return ""
+}
+
+# R6-04: Native gate summary pure function.
+# Encapsulates gate determination logic for native addon detection.
+# Input: array of instance results with ResolutionStatus, PlatformApplicable, ParentOptional, LoadExit
+# Input: lockfile parse status
+# Returns: [PSCustomObject]@{ Status; Category; Description; Expected; Actual; ErrorSummary }
+function Get-NativeGateSummary {
+    param(
+        [Parameter(Mandatory=$true)]$InstanceResults,  # array of {Name, Path, Version, ResolutionStatus, BlockReason, PlatformApplicable, ParentOptional, LoadExit, LoadOutput}
+        [Parameter(Mandatory=$true)][bool]$LockfileParsed,
+        [string]$LockfileParseError = ""
+    )
+
+    # R6-02: If lockfile not parsed, BLOCKED regardless of what was found
+    if (-not $LockfileParsed) {
+        return [PSCustomObject]@{
+            Status = "BLOCKED"
+            Category = "EvidenceDependent"
+            Description = "Native addon detection"
+            Expected = "Lockfile parsed successfully"
+            Actual = "Lockfile parse failed: $LockfileParseError"
+            ErrorSummary = "BLOCKED — lockfile not parsed; cannot determine native dependency status"
+        }
+    }
+
+    # R6-01: Any instance with ResolutionStatus not "Resolved" is a blocker
+    $blockedInstances = $InstanceResults | Where-Object { $_.ResolutionStatus -ne "Resolved" }
+    $resolvedInstances = $InstanceResults | Where-Object { $_.ResolutionStatus -eq "Resolved" }
+
+    # R6-01: Among resolved, split by platform/optional
+    $requiredResolved = $resolvedInstances | Where-Object { $_.PlatformApplicable -and (-not $_.ParentOptional) }
+    $optionalOrNaResolved = $resolvedInstances | Where-Object { (-not $_.PlatformApplicable) -or $_.ParentOptional }
+
+    # R6-01: Among required resolved, check load status
+    $requiredLoadFailures = $requiredResolved | Where-Object { $_.LoadExit -ne 0 }
+    $requiredLoaded = $requiredResolved | Where-Object { $_.LoadExit -eq 0 }
+
+    # Decision logic (priority: BLOCKED > FAIL > Informational)
+
+    # R6-01: Any blocked instance → BLOCKED (even if load succeeded)
+    if ($blockedInstances.Count -gt 0) {
+        $blockedDetails = ($blockedInstances | ForEach-Object { "$($_.Name)@$($_.Version): $($_.ResolutionStatus) — $($_.BlockReason)" }) -join "; "
+        return [PSCustomObject]@{
+            Status = "BLOCKED"
+            Category = "EvidenceDependent"
+            Description = "Native addon detection"
+            Expected = "All instances resolved"
+            Actual = "Blocked instances: $blockedDetails"
+            ErrorSummary = "BLOCKED — instance resolution incomplete"
+        }
+    }
+
+    # Required load failures → FAIL
+    if ($requiredLoadFailures.Count -gt 0) {
+        $failureDetails = ($requiredLoadFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) $($_.LoadOutput)" }) -join "; "
+        return [PSCustomObject]@{
+            Status = "FAIL"
+            Category = "EvidenceDependent"
+            Description = "Native addon detection"
+            Expected = "Required Windows native addons load"
+            Actual = "REQUIRED LOAD FAILURES: $failureDetails"
+            ErrorSummary = "Required native addon(s) failed to load on Windows x64"
+        }
+    }
+
+    # Optional/platform-n/a load failures → Informational
+    $optionalLoadFailures = $optionalOrNaResolved | Where-Object { $_.LoadExit -ne 0 }
+    if ($optionalLoadFailures.Count -gt 0) {
+        $failureDetails = ($optionalLoadFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) optional=$($_.ParentOptional) platform=$($_.PlatformApplicable)" }) -join "; "
+        $summary = ($InstanceResults | ForEach-Object { "$($_.Name)@$($_.Version) exit=$($_.LoadExit) platform=$($_.PlatformApplicable) optional=$($_.ParentOptional)" }) -join "; "
+        return [PSCustomObject]@{
+            Status = "PASS"
+            Category = "Informational"
+            Description = "Native addon detection (optional/platform-n/a failures)"
+            Expected = "Documented"
+            Actual = "Optional failures: $failureDetails"
+            ErrorSummary = ""
+        }
+    }
+
+    # All required loaded → PASS
+    if ($requiredLoaded.Count -gt 0) {
+        $summary = ($InstanceResults | ForEach-Object { "$($_.Name)@$($_.Version) exit=$($_.LoadExit) platform=$($_.PlatformApplicable) optional=$($_.ParentOptional)" }) -join "; "
+        return [PSCustomObject]@{
+            Status = "PASS"
+            Category = "EvidenceDependent"
+            Description = "Native addon detection"
+            Expected = "Required Windows native addons load"
+            Actual = "All loaded: $summary"
+            ErrorSummary = ""
+        }
+    }
+
+    # All optional/platform-n/a → Informational
+    $summary = ($InstanceResults | ForEach-Object { "$($_.Name)@$($_.Version) exit=$($_.LoadExit) platform=$($_.PlatformApplicable) optional=$($_.ParentOptional)" }) -join "; "
+    return [PSCustomObject]@{
+        Status = "PASS"
+        Category = "Informational"
+        Description = "Native addon detection (all optional/platform-n/a)"
+        Expected = "Documented"
+        Actual = "Found: $summary"
+        ErrorSummary = ""
+    }
+}
+
+# R4-02 + R5-03 + R6-03: Native addon judgment pure function
 # Each DependencyMap item carries InstancePath and ParentPath.
 # Only queries the exact parent for that instance — never scans all packages.
+# R6-03: Uses Resolve-LockfileParentPath for consistent parent resolution.
 function Get-NativeAddonJudgment {
     param(
         [hashtable[]]$DependencyMap,    # [{Name, PkgData, InstancePath, ParentPath}, ...]
@@ -344,6 +466,99 @@ function Test-NativeAddonJudgment {
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
+    }
+
+    return $allPassed
+}
+
+# R6-03: Self-test for Resolve-LockfileParentPath
+function Test-ResolveLockfileParentPath {
+    $allPassed = $true
+    $tests = @()
+
+    # T1: node_modules/pkg → root parent ""
+    $t1 = Resolve-LockfileParentPath -InstancePath "node_modules/pkg"
+    $tests += [PSCustomObject]@{ Name="T1: root pkg"; Expected=""; Actual=$t1; Pass=($t1 -eq "") }
+    if ($t1 -ne "") { $allPassed = $false }
+
+    # T2: node_modules/parent/node_modules/pkg → node_modules/parent
+    $t2 = Resolve-LockfileParentPath -InstancePath "node_modules/parent/node_modules/pkg"
+    $tests += [PSCustomObject]@{ Name="T2: nested pkg"; Expected="node_modules/parent"; Actual=$t2; Pass=($t2 -eq "node_modules/parent") }
+    if ($t2 -ne "node_modules/parent") { $allPassed = $false }
+
+    # T3: node_modules/@scope/parent/node_modules/pkg → node_modules/@scope/parent
+    $t3 = Resolve-LockfileParentPath -InstancePath "node_modules/@scope/parent/node_modules/pkg"
+    $tests += [PSCustomObject]@{ Name="T3: scoped nested pkg"; Expected="node_modules/@scope/parent"; Actual=$t3; Pass=($t3 -eq "node_modules/@scope/parent") }
+    if ($t3 -ne "node_modules/@scope/parent") { $allPassed = $false }
+
+    # T4: node_modules/a/node_modules/b/node_modules/pkg → node_modules/a/node_modules/b (deeply nested)
+    $t4 = Resolve-LockfileParentPath -InstancePath "node_modules/a/node_modules/b/node_modules/pkg"
+    $tests += [PSCustomObject]@{ Name="T4: deeply nested"; Expected="node_modules/a/node_modules/b"; Actual=$t4; Pass=($t4 -eq "node_modules/a/node_modules/b") }
+    if ($t4 -ne "node_modules/a/node_modules/b") { $allPassed = $false }
+
+    Write-Host "\n=== Resolve-LockfileParentPath Self-Test (4 cases) ===" -ForegroundColor Cyan
+    foreach ($t in $tests) {
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected='$($t.Expected)' actual='$($t.Actual)')" -ForegroundColor $color
+    }
+
+    return $allPassed
+}
+
+# R6-04: Self-test for Get-NativeGateSummary (7 cases)
+function Test-NativeGateSummary {
+    $allPassed = $true
+    $tests = @()
+
+    # T1: All required resolved + loaded → PASS
+    $i1 = @([PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$true; ParentOptional=$false; LoadExit=0; LoadOutput="" })
+    $g1 = Get-NativeGateSummary -InstanceResults $i1 -LockfileParsed $true
+    $tests += [PSCustomObject]@{ Name="T1: required resolved+loaded => PASS"; Expected="PASS"; Actual=$g1.Status; Pass=($g1.Status -eq "PASS") }
+    if ($g1.Status -ne "PASS") { $allPassed = $false }
+
+    # T2: Required load failure → FAIL
+    $i2 = @([PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$true; ParentOptional=$false; LoadExit=1; LoadOutput="ERR" })
+    $g2 = Get-NativeGateSummary -InstanceResults $i2 -LockfileParsed $true
+    $tests += [PSCustomObject]@{ Name="T2: required load fail => FAIL"; Expected="FAIL"; Actual=$g2.Status; Pass=($g2.Status -eq "FAIL") }
+    if ($g2.Status -ne "FAIL") { $allPassed = $false }
+
+    # T3: Blocked instance (even if load succeeded) → BLOCKED
+    $i3 = @([PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Blocked"; BlockReason="No mapping"; PlatformApplicable=$true; ParentOptional=$false; LoadExit=0; LoadOutput="" })
+    $g3 = Get-NativeGateSummary -InstanceResults $i3 -LockfileParsed $true
+    $tests += [PSCustomObject]@{ Name="T3: blocked instance => BLOCKED"; Expected="BLOCKED"; Actual=$g3.Status; Pass=($g3.Status -eq "BLOCKED") }
+    if ($g3.Status -ne "BLOCKED") { $allPassed = $false }
+
+    # T4: Lockfile not parsed → BLOCKED
+    $i4 = @([PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$true; ParentOptional=$false; LoadExit=0; LoadOutput="" })
+    $g4 = Get-NativeGateSummary -InstanceResults $i4 -LockfileParsed $false -LockfileParseError "JSON invalid"
+    $tests += [PSCustomObject]@{ Name="T4: lockfile not parsed => BLOCKED"; Expected="BLOCKED"; Actual=$g4.Status; Pass=($g4.Status -eq "BLOCKED") }
+    if ($g4.Status -ne "BLOCKED") { $allPassed = $false }
+
+    # T5: All optional/platform-n/a → Informational
+    $i5 = @([PSCustomObject]@{ Name="a"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$false; ParentOptional=$false; LoadExit=0; LoadOutput="" })
+    $g5 = Get-NativeGateSummary -InstanceResults $i5 -LockfileParsed $true
+    $tests += [PSCustomObject]@{ Name="T5: all optional/n-a => Info PASS"; Expected="PASS"; Actual=$g5.Status; Pass=($g5.Status -eq "PASS" -and $g5.Category -eq "Informational") }
+    if ($g5.Status -ne "PASS" -or $g5.Category -ne "Informational") { $allPassed = $false }
+
+    # T6: Same-name different paths — one blocked, one loaded → BLOCKED
+    $i6 = @(
+        [PSCustomObject]@{ Name="x"; Version="1.0"; ResolutionStatus="Resolved"; BlockReason=""; PlatformApplicable=$true; ParentOptional=$false; LoadExit=0; LoadOutput="" },
+        [PSCustomObject]@{ Name="x"; Version="1.0"; ResolutionStatus="Blocked"; BlockReason="Ambiguous"; PlatformApplicable=$true; ParentOptional=$false; LoadExit=0; LoadOutput="" }
+    )
+    $g6 = Get-NativeGateSummary -InstanceResults $i6 -LockfileParsed $true
+    $tests += [PSCustomObject]@{ Name="T6: mixed blocked/resolved => BLOCKED"; Expected="BLOCKED"; Actual=$g6.Status; Pass=($g6.Status -eq "BLOCKED") }
+    if ($g6.Status -ne "BLOCKED") { $allPassed = $false }
+
+    # T7: Empty instance list + lockfile parsed → Informational PASS (no native deps)
+    $i7 = @()
+    $g7 = Get-NativeGateSummary -InstanceResults $i7 -LockfileParsed $true
+    $tests += [PSCustomObject]@{ Name="T7: empty list => Info PASS"; Expected="PASS"; Actual=$g7.Status; Pass=($g7.Status -eq "PASS" -and $g7.Category -eq "Informational") }
+    if ($g7.Status -ne "PASS" -or $g7.Category -ne "Informational") { $allPassed = $false }
+
+    Write-Host "\n=== Native Gate Summary Self-Test (7 cases) ===" -ForegroundColor Cyan
+    foreach ($t in $tests) {
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
     }
 
     return $allPassed
@@ -859,6 +1074,36 @@ if (-not $nativeTestPassed) {
     exit 3
 }
 
+# R6-03: Run Resolve-LockfileParentPath self-test BEFORE any external operations
+Write-Host "=== Resolve-LockfileParentPath self-test (4 cases) ===" -ForegroundColor Cyan
+$parentPathTestPassed = Test-ResolveLockfileParentPath
+if (-not $parentPathTestPassed) {
+    Write-Host "FATAL: Resolve-LockfileParentPath self-test failed. Aborting." -ForegroundColor Red
+    Add-TestResult -TestId "SELFTEST-PARENTPATH" -Category "ScriptInternal" `
+      -Description "Resolve-LockfileParentPath self-test" `
+      -Expected "All parent path self-tests pass" `
+      -Actual "One or more parent path self-tests failed" -Status "FAIL" `
+      -ErrorSummary "Resolve-LockfileParentPath self-test failed before harness launch"
+    $script:FatalInternalError = $true
+    $script:FatalInternalErrorMessage = "Resolve-LockfileParentPath self-test failed"
+    exit 3
+}
+
+# R6-04: Run Native Gate Summary self-test BEFORE any external operations
+Write-Host "=== Native Gate Summary self-test (7 cases) ===" -ForegroundColor Cyan
+$gateSummaryTestPassed = Test-NativeGateSummary
+if (-not $gateSummaryTestPassed) {
+    Write-Host "FATAL: Native Gate Summary self-test failed. Aborting." -ForegroundColor Red
+    Add-TestResult -TestId "SELFTEST-GATESUMMARY" -Category "ScriptInternal" `
+      -Description "Native Gate Summary self-test" `
+      -Expected "All gate summary self-tests pass" `
+      -Actual "One or more gate summary self-tests failed" -Status "FAIL" `
+      -ErrorSummary "Native Gate Summary self-test failed before harness launch"
+    $script:FatalInternalError = $true
+    $script:FatalInternalErrorMessage = "Native Gate Summary self-test failed"
+    exit 3
+}
+
 # === Main execution ===
 $cleanupLog = @()
 $mainError = $null
@@ -1048,79 +1293,94 @@ try {
           -Description "npm ls integrity" -Expected "Exit 0, valid JSON" `
           -Actual "Exit $npmLsExit. $npmLsError" -Status "FAIL" -ErrorSummary "npm ls reported issues"
     }
-
     # ================================================================
     # Test 6: Native addon detection (R1-07: transitive deps from lockfile)
+    # R6-01: Blocked resolution state enters gate via Get-NativeGateSummary
+    # R6-02: Lockfile parsing fail-closed — no empty catch
+    # R6-03: Parent path via Resolve-LockfileParentPath (single implementation)
+    # R6-04: Gate determination via Get-NativeGateSummary (pure function)
     # ================================================================
     Write-Host "`n=== Test 6: Native addon detection ===" -ForegroundColor Cyan
 
     $nativeDepsToCheck = @("node-pty", "koffi", "better-sqlite3", "sqlite3", "node-pty-prebuilt-multiarch")
     $foundNative = @()
 
-    # R1-07: Build transitive dependency map from package-lock.json
+    # R6-02: Explicit lockfile parse status — fail-closed
+    $lockfileParsed = $false
+    $lockfileParseError = ""
     $lockfileJson = $null
     $transitiveNativeExpected = @{}
-    if (Test-Path $lockfile) {
+
+    if (-not (Test-Path $lockfile)) {
+        $lockfileParseError = "Lockfile not found at $lockfile"
+    } else {
         try {
             $lockfileJson = Get-Content $lockfile -Raw | ConvertFrom-Json
-            # Walk all packages in lockfile to find native deps and their parents
-            if ($lockfileJson.packages) {
-                foreach ($pkgEntry in $lockfileJson.packages.PSObject.Properties) {
-                    # R2-04: Correctly parse nested lockfile paths (e.g. node_modules/<parent>/node_modules/node-pty)
-                    $rawName = $pkgEntry.Name
-                    # Extract the actual package name from the last node_modules segment
-                    if ($rawName -match 'node_modules[/\\]([^/\\]+)$') {
-                        $pkgName = $Matches[1]
-                    } elseif ($rawName -match 'node_modules[/\\].+[/\\]node_modules[/\\]([^/\\]+)$') {
-                        $pkgName = $Matches[1]
-                    } else {
-                        $pkgName = $rawName -replace '^node_modules/', '' -replace '^node_modules\\', ''
-                    }
-                    $pkgData = $pkgEntry.Value
-                    if ($pkgName -in $nativeDepsToCheck) {
-                        # R3-03: Split platform-applicable vs parent-optional
-                        $platformApplicable = $true
-                        if ($pkgData.os) {
-                            $hasPositive = $pkgData.os | Where-Object { $_ -notlike '!*' }
-                            $denied = $pkgData.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
-                            if ($denied) { $platformApplicable = $false }
-                            elseif ($hasPositive -and ($pkgData.os -notcontains "win32")) { $platformApplicable = $false }
-                        }
-                        if ($pkgData.cpu) {
-                            $hasPositive = $pkgData.cpu | Where-Object { $_ -notlike '!*' }
-                            $denied = $pkgData.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
-                            if ($denied) { $platformApplicable = $false }
-                            elseif ($hasPositive -and ($pkgData.cpu -notcontains "x64")) { $platformApplicable = $false }
-                        }
-                        $parentOptional = ($pkgData.optional -eq $true)
-                        # R3-03: Check parent optionalDependencies edge
-                        $rawPath = $pkgEntry.Name
-                        if ($rawPath -match '^(.+[/\\])node_modules[/\\]') {
-                            $parentPath = $Matches[1].TrimEnd('/').TrimEnd('\\')
-                            if ($lockfileJson.packages.PSObject.Properties[$parentPath]) {
-                                $parentPkg = $lockfileJson.packages.PSObject.Properties[$parentPath].Value
-                                if ($parentPkg.optionalDependencies -and $parentPkg.optionalDependencies.PSObject.Properties[$pkgName]) {
-                                    $parentOptional = $true
-                                }
-                            }
-                        }
-                        $transitiveNativeExpected[$rawPath] = [PSCustomObject]@{
-                            Name = $pkgName
-                            Version = $pkgData.version
-                            PlatformApplicable = $platformApplicable
-                            ParentOptional = $parentOptional
-                            InLockfile = $true
-                        }
+            # R6-02: Validate packages key exists
+            if (-not $lockfileJson.packages) {
+                $lockfileParseError = "Lockfile JSON parsed but 'packages' key missing"
+            } else {
+                $lockfileParsed = $true
+            }
+        } catch {
+            $lockfileParseError = "Lockfile JSON parse error: $($_.Exception.Message)"
+        }
+    }
+
+    if ($lockfileParsed) {
+        # R1-07: Build transitive dependency map from package-lock.json
+        foreach ($pkgEntry in $lockfileJson.packages.PSObject.Properties) {
+            $rawName = $pkgEntry.Name
+            # Extract the actual package name from the last node_modules segment
+            if ($rawName -match 'node_modules[/\\]([^/\\]+)$') {
+                $pkgName = $Matches[1]
+            } elseif ($rawName -match 'node_modules[/\\].+[/\\]node_modules[/\\]([^/\\]+)$') {
+                $pkgName = $Matches[1]
+            } else {
+                $pkgName = $rawName -replace '^node_modules/', '' -replace '^node_modules\\', ''
+            }
+            $pkgData = $pkgEntry.Value
+            if ($pkgName -in $nativeDepsToCheck) {
+                # R3-03: Split platform-applicable vs parent-optional
+                $platformApplicable = $true
+                if ($pkgData.os) {
+                    $hasPositive = $pkgData.os | Where-Object { $_ -notlike '!*' }
+                    $denied = $pkgData.os | Where-Object { $_ -like '!*' -and $_ -eq '!win32' }
+                    if ($denied) { $platformApplicable = $false }
+                    elseif ($hasPositive -and ($pkgData.os -notcontains "win32")) { $platformApplicable = $false }
+                }
+                if ($pkgData.cpu) {
+                    $hasPositive = $pkgData.cpu | Where-Object { $_ -notlike '!*' }
+                    $denied = $pkgData.cpu | Where-Object { $_ -like '!*' -and $_ -eq '!x64' }
+                    if ($denied) { $platformApplicable = $false }
+                    elseif ($hasPositive -and ($pkgData.cpu -notcontains "x64")) { $platformApplicable = $false }
+                }
+                $parentOptional = ($pkgData.optional -eq $true)
+                # R6-03: Use Resolve-LockfileParentPath for consistent parent resolution
+                $resolvedParent = Resolve-LockfileParentPath -InstancePath $rawName
+                if ($resolvedParent -and $lockfileJson.packages.PSObject.Properties[$resolvedParent]) {
+                    $parentPkg = $lockfileJson.packages.PSObject.Properties[$resolvedParent].Value
+                    if ($parentPkg.optionalDependencies -and $parentPkg.optionalDependencies.PSObject.Properties[$pkgName]) {
+                        $parentOptional = $true
                     }
                 }
+                $transitiveNativeExpected[$rawName] = [PSCustomObject]@{
+                    Name = $pkgName
+                    Version = $pkgData.version
+                    PlatformApplicable = $platformApplicable
+                    ParentOptional = $parentOptional
+                    InLockfile = $true
+                }
             }
-        } catch {}
+        }
+    } else {
+        Write-Host "  Lockfile parse failed: $lockfileParseError" -ForegroundColor Yellow
     }
 
     foreach ($depName in $nativeDepsToCheck) {
         $found = Get-ChildItem -Path (Join-Path $TEST_DIR "node_modules") -Filter $depName -Recurse -Directory -ErrorAction SilentlyContinue
         foreach ($foundDir in $found) {
-            # R5-04: Per-instance initialization — fail-closed defaults
+            # R5-04 + R6-01: Per-instance initialization — fail-closed defaults
             $resolutionStatus = "Unresolved"
             $platformApplicable = $true
             $parentOptional = $false
@@ -1134,7 +1394,7 @@ try {
                     $pkgContent = Get-Content $pkgJsonPath -Raw | ConvertFrom-Json
                     $ver = $pkgContent.version
                 } catch {
-                    # R5-04: parse failure → BLOCKED, do NOT use stale values
+                    # R5-04: parse failure → BLOCKED
                     $blockReason = "package.json parse failure: $($_.Exception.Message)"
                 }
             } else {
@@ -1145,16 +1405,18 @@ try {
             $normalizedPath = $foundDir.FullName -replace [regex]::Escape((Join-Path $TEST_DIR "node_modules") + [System.IO.Path]::DirectorySeparatorChar), ""
             $normalizedPath = "node_modules/$($normalizedPath -replace [regex]::Escape([System.IO.Path]::DirectorySeparatorChar), '/')"
 
+            # R6-01: Resolution status must be determined BEFORE load test
             if ($blockReason) {
-                # R5-04: Parse failure or missing → BLOCKED
                 $resolutionStatus = "Blocked"
+            } elseif (-not $lockfileParsed) {
+                # R6-02: Lockfile not parsed → all instances BLOCKED
+                $resolutionStatus = "Blocked"
+                $blockReason = "Lockfile not parsed: $lockfileParseError"
             } elseif ($transitiveNativeExpected.ContainsKey($normalizedPath)) {
-                # R5-04: Exact path match → Resolved
                 $platformApplicable = $transitiveNativeExpected[$normalizedPath].PlatformApplicable
                 $parentOptional = $transitiveNativeExpected[$normalizedPath].ParentOptional
                 $resolutionStatus = "Resolved"
             } else {
-                # R5-04: No lockfile mapping → BLOCKED (fail-closed, no fallback)
                 $resolutionStatus = "Blocked"
                 $blockReason = "No lockfile mapping for $normalizedPath"
             }
@@ -1162,57 +1424,34 @@ try {
             $loadExit = -1; $loadOutput = ""
             Push-Location $TEST_DIR
             try {
-                $nodeRequire = "try { require('$($foundDir.FullName -replace '\','/')'); process.exit(0) } catch(e) { console.error(e.message); process.exit(1) }"
+                $nodeRequire = "try { require('$($foundDir.FullName -replace '\\','/'); process.exit(0) } catch(e) { console.error(e.message); process.exit(1) }"
                 $loadOutput = (node -e $nodeRequire 2>&1) | Out-String
                 $loadExit = $LASTEXITCODE
             } catch { $loadOutput = $_.Exception.Message }
             finally { Pop-Location }
 
+            # R6-01: Include ResolutionStatus and BlockReason in result
             $foundNative += [PSCustomObject]@{
                 Name = $depName; Path = $foundDir.FullName; Version = $ver
                 LoadExit = $loadExit
                 LoadOutput = if ($loadOutput) { $loadOutput.Trim() } else { "" }
                 PlatformApplicable = $platformApplicable
                 ParentOptional = $parentOptional
+                ResolutionStatus = $resolutionStatus
+                BlockReason = $blockReason
             }
         }
     }
 
-    # R3-03: Gate determination with split platform/optional model
-    if ($foundNative.Count -gt 0) {
-        $summary = ($foundNative | ForEach-Object { "$($_.Name)@$($_.Version) exit=$($_.LoadExit) platform=$($_.PlatformApplicable) optional=$($_.ParentOptional)" }) -join "; "
-        $loadFailures = $foundNative | Where-Object { $_.LoadExit -ne 0 }
-        $requiredFailures = $loadFailures | Where-Object { $_.PlatformApplicable -and (-not $_.ParentOptional) }
-        $optionalFailures = $loadFailures | Where-Object { (-not $_.PlatformApplicable) -or $_.ParentOptional }
+    # R6-04: Gate determination via Get-NativeGateSummary pure function
+    $gateResult = Get-NativeGateSummary -InstanceResults $foundNative -LockfileParsed $lockfileParsed -LockfileParseError $lockfileParseError
 
-        if ($requiredFailures.Count -gt 0) {
-            $failureDetails = ($requiredFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) $($_.LoadOutput)" }) -join "; "
-            Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Required Windows native addons load" -Actual "REQUIRED LOAD FAILURES: $failureDetails" -Status "FAIL" -ErrorSummary "Required native addon(s) failed to load on Windows x64"
-        } elseif ($optionalFailures.Count -gt 0) {
-            $failureDetails = ($optionalFailures | ForEach-Object { "$($_.Name)@$($_.Version): exit=$($_.LoadExit) optional=$($_.ParentOptional) platform=$($_.PlatformApplicable)" }) -join "; "
-            Add-TestResult -TestId "6" -Category "Informational" -Description "Native addon detection (optional/platform-n/a failures)" -Expected "Documented" -Actual "Optional failures: $failureDetails" -Status "PASS"
-        } else {
-            $requiredLoaded = $foundNative | Where-Object { $_.PlatformApplicable -and (-not $_.ParentOptional) }
-            if ($requiredLoaded.Count -gt 0) {
-                Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Required Windows native addons load" -Actual "All loaded: $summary" -Status "PASS"
-            } else {
-                Add-TestResult -TestId "6" -Category "Informational" -Description "Native addon detection (all optional/platform-n/a)" -Expected "Documented" -Actual "Found: $summary" -Status "PASS"
-            }
-        }
+    # R6-01: No native dirs found and lockfile not parsed → BLOCKED (not Informational/PASS)
+    if ($foundNative.Count -eq 0 -and -not $lockfileParsed) {
+        Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Lockfile parsed" -Actual "Lockfile not parsed: $lockfileParseError" -Status "BLOCKED" -ErrorSummary "BLOCKED — lockfile not parsed; cannot determine native dependency status"
     } else {
-        $requiredMissing = $transitiveNativeExpected.Values | Where-Object { $_.InLockfile -and $_.PlatformApplicable -and (-not $_.ParentOptional) }
-        if ($requiredMissing.Count -gt 0) {
-            $missingNames = ($requiredMissing | ForEach-Object { $_.Name }) -join ", "
-            Add-TestResult -TestId "6" -Category "EvidenceDependent" -Description "Native addon detection" -Expected "Required native addons: $missingNames" -Actual "None found" -Status "BLOCKED" -ErrorSummary "Required native addons not found"
-        } else {
-            Add-TestResult -TestId "6" -Category "Informational" -Description "Native addon detection" -Expected "Document presence" -Actual "None found as required; all expected are optional/platform-n/a" -Status "PASS"
-        }
+        Add-TestResult -TestId "6" -Category $gateResult.Category -Description $gateResult.Description -Expected $gateResult.Expected -Actual $gateResult.Actual -Status $gateResult.Status -ErrorSummary $gateResult.ErrorSummary
     }
-
-    # ================================================================
-    # Test 7: Client module host-side resolution
-    # ================================================================
-    Write-Host "`n=== Test 7: Client module resolution ===" -ForegroundColor Cyan
     $testModules = @("@deepseek-ai/dsh-client-connection", "@deepseek-ai/dsh-api-remotes", "@deepseek-ai/dsh-api-gateway")
     $moduleResults = @(); $anyModuleFailed = $false
 

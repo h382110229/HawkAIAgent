@@ -165,7 +165,86 @@ R5-06: Cases 9 and 10 clarified — CleanupError FAIL is script exception (NOT k
 
 ---
 
-## 8. Static Analysis Summary
+## 8. Finding R6: Native Gate Fail-Closed Remediation
+
+### R6-01: Blocked Resolution State Enters Gate
+
+**Finding:** Test 6 could report PASS when native instances had unresolved/blocked resolution status, because `require()` success was checked before resolution status.
+
+**Fix:**
+- ResolutionStatus and BlockReason determined BEFORE load test
+- `foundNative` results now include ResolutionStatus and BlockReason fields
+- Gate determination delegated to `Get-NativeGateSummary` pure function
+- Any instance with ResolutionStatus ≠ "Resolved" → gate BLOCKED
+- Unresolved/Blocked/missing/ambiguous mapping → gate-blocking BLOCKED
+
+### R6-02: Lockfile Parsing Fail-Closed
+
+**Finding:** Lockfile parsing used empty `catch {}` block, silently swallowing errors.
+
+**Fix:**
+- Explicit `$lockfileParsed` boolean and `$lockfileParseError` string
+- Three failure modes tracked: file not found, JSON parse error, packages key missing
+- Lockfile not parsed → ALL instances BLOCKED (even if no native dirs found)
+- Lockfile not parsed + no instances → EvidenceDependent BLOCKED (not Informational/PASS)
+- No empty catch blocks in lockfile parsing path
+
+### R6-03: Single Parent Path Resolution Implementation
+
+**Finding:** Parent path resolution logic was inline in both `Get-NativeAddonJudgment` and Test 6 runtime, with inconsistent implementations.
+
+**Fix:**
+- Extracted `Resolve-LockfileParentPath` pure function (line 110)
+- Single implementation used by: `Get-NativeAddonJudgment`, Test 6 runtime, self-tests
+- Self-test covers 4 cases: root, nested, scoped, deeply nested
+- Self-test runs BEFORE harness startup; failure → ERROR/3
+
+### R6-04: Native Gate Summary Pure Function
+
+**Finding:** Gate determination logic was inline in Test 6, not independently testable.
+
+**Fix:**
+- Extracted `Get-NativeGateSummary` pure function (line 129)
+- 7 self-test cases covering all gate outcomes:
+  1. Required resolved + loaded → PASS
+  2. Required load failure → FAIL
+  3. Blocked instance (even if load succeeded) → BLOCKED
+  4. Lockfile not parsed → BLOCKED
+  5. All optional/platform-n/a → Informational PASS
+  6. Mixed blocked/resolved → BLOCKED
+  7. Empty instance list → Informational PASS
+- Self-test runs BEFORE harness startup; failure → ERROR/3
+- Does NOT break existing R5 aggregation self-test (11 cases)
+
+### R6-05: Security Invariants Preserved
+
+- PID, CreationDate, CommandLine, ExecutablePath, ParentProcessId identity checks unchanged
+- No process-name batch termination or wide taskkill introduced
+- No lowercase `$pid` reintroduced
+- BFS ownership model preserved
+
+### R6-06: Documentation Updated
+
+This section and the static analysis table updated to reflect R6 changes.
+
+---
+
+## 9. Native Gate Truth Table
+
+| Lockfile Parsed | Instance Status | Load Result | Gate Outcome |
+|-----------------|-----------------|-------------|---------------|
+| No | any | any | BLOCKED |
+| Yes | Blocked/Unresolved | any | BLOCKED |
+| Yes | Resolved + required | success | PASS |
+| Yes | Resolved + required | failure | FAIL |
+| Yes | Resolved + optional/n-a | failure | Informational PASS |
+| Yes | Resolved + optional/n-a | success | Informational PASS |
+| Yes | mixed Blocked + Resolved | any | BLOCKED |
+| Yes | no instances | — | Informational PASS |
+
+---
+
+## 10. Static Analysis Summary
 
 | Check | Result |
 |-------|--------|
@@ -174,9 +253,19 @@ R5-06: Cases 9 and 10 clarified — CleanupError FAIL is script exception (NOT k
 | Kill failure as MandatoryFunctional FAIL | PASS |
 | Has Get-NativeAddonJudgment pure function | PASS |
 | Has Test-NativeAddonJudgment self-test (18 cases) | PASS |
+| Has Resolve-LockfileParentPath pure function (R6-03) | PASS |
+| Has Test-ResolveLockfileParentPath self-test (4 cases) | PASS |
+| Has Get-NativeGateSummary pure function (R6-04) | PASS |
+| Has Test-NativeGateSummary self-test (7 cases) | PASS |
+| Resolve-LockfileParentPath self-test called before main | PASS |
+| NativeGateSummary self-test called before main | PASS |
 | Per-instance PlatformApplicable init | PASS |
 | Per-instance ParentOptional init | PASS |
 | Lockfile key by normalized path | PASS |
+| Test 6 lockfile parse fail-closed (R6-02) | PASS |
+| Test 6 ResolutionStatus/BlockReason in results (R6-01) | PASS |
+| Test 6 uses Get-NativeGateSummary (R6-04) | PASS |
+| Test 6 uses Resolve-LockfileParentPath (R6-03) | PASS |
 | Test 18 ParentProcessId check (fail-closed) | PASS |
 | Stop-OwnedProcesses ParentPID check | PASS |
 | Orphan check ParentPID match | PASS |
@@ -184,7 +273,10 @@ R5-06: Cases 9 and 10 clarified — CleanupError FAIL is script exception (NOT k
 | Get-NativeAddonJudgment per-instance ParentPath | PASS |
 | ResolutionStatus/BlockReason in results | PASS |
 | Lowercase `$pid` | 0 occurrences |
-| PowerShell parser | PENDING WINDOWS HERMES PHASE A |
-| PSScriptAnalyzer | PENDING WINDOWS HERMES PHASE A |
-| Aggregation runtime | PENDING WINDOWS HERMES PHASE A |
-| Native judgment runtime | PENDING WINDOWS HERMES PHASE A |
+| Empty catch in lockfile parsing | 0 (removed) |
+| PowerShell parser | PENDING WINDOWS PHASE A |
+| PSScriptAnalyzer | PENDING WINDOWS PHASE A |
+| Aggregation runtime | PENDING WINDOWS PHASE A |
+| Native judgment runtime | PENDING WINDOWS PHASE A |
+| Resolve-LockfileParentPath runtime | PENDING WINDOWS PHASE A |
+| NativeGateSummary runtime | PENDING WINDOWS PHASE A |
