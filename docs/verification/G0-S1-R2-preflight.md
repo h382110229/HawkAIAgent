@@ -1,239 +1,262 @@
-# G0-S1-R11 Preflight & Verification Report
+# G0-S1-R12 Preflight & Verification Report
 
-**Gate:** HawkAIAgent-G0-S1-R11 (Hardening and Remediation of R10 PoC)
+**Gate:** HawkAIAgent-G0-S1-R12 (Self-Test Mode, Fail-Closed Mapping, and Evidence Consolidation)
 **Date:** 2026-08-24
-**Previous Head (R10):** Script SHA-256 `c9523143b78784eef4a867f2f7904c5206d5180165b6560ea099dd147d3b2871`
-**Previous Preflight SHA-256:** `4d11d153cded6cfa872b8270fd5461f8e4619e1aabe0fcc2e8cc1b72bfe78d89`
-**R10 Baseline Test Counts:** 25 lockfile reader tests, 79 total across all suites
-**Gate Result:** REMEDIATION PUBLISHED FOR INDEPENDENT REVIEW
+**Previous Head (R11):** `c8cc541942a3961046736a7b76d53d7bb27dcbd0`
+**Gate Result:** REMEDIATION PUBLISHED FOR INDEPENDENT REVIEW — Phase B remains BLOCKED
 
 ---
 
-## 1. REV-01: R10 Coverage Gaps
+## 1. R11-REV-01: Preflight/evidence contradiction resolved
 
-**Finding:** R10 coverage matrix listed several cases as "N/A — Cannot reproduce" or "Code review" that were actually testable via custom Node script injection or direct function calls.
+**Finding:** R11 committed preflight said F25–F39 were PENDING; returned report said they all PASS.
+
+**Fix:** This R12 report is the single authoritative post-execution document. All test results below were captured from an actual `-SelfTestOnly` run against the committed R12 head. No PENDING entries remain.
+
+---
+
+## 2. R11-REV-02 / R11-REV-11: Self-test-only mode
+
+**Finding:** Dot-sourcing the full script executes main flow. No safe standalone self-test route existed.
+
+**Fix:** Added `-SelfTestOnly` switch parameter. When set:
+1. Runs all pure-function self-tests (Aggregation, NativeJudgment, ParentPath, GateSummary)
+2. Resolves Node executable with fail-closed checks
+3. Runs Node-backed integration tests (LockfileReader)
+4. Records gate-blocking PASS results for proper aggregation
+5. Exits before Test 1, ports, npm, snapshots, process management, or Harness
+
+**Command:**
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "path\to\windows-poc-test-r2.ps1" -SelfTestOnly
+```
+
+---
+
+## 3. R11-REV-03: Test 6 uses shared transitive function
+
+**Finding:** Test 6 contained its own inline loop calling `Get-NativeAddonJudgment` directly, duplicating `ConvertFrom-TransitiveMapping`.
+
+**Fix:** Replaced the entire inline loop (50+ lines) with:
+```powershell
+$transitiveNativeExpected = ConvertFrom-TransitiveMapping `
+  -LockfilePackages $lockfilePackages `
+  -NativeDepsToCheck $nativeDepsToCheck `
+  -TargetOs "win32" -TargetCpu "x64"
+```
+
+---
+
+## 4. R11-REV-04: F23 exercises real shared runtime path
+
+**Finding:** F23 constructed a synthetic blocked object and called `Get-NativeGateSummary` directly.
+
+**Fix:** F23 now:
+1. Creates a lockfile fixture with a native dep (`os: ["linux"]`, not applicable on win32)
+2. Calls `ConvertFrom-LockfileSafe` to parse it
+3. Calls `ConvertFrom-TransitiveMapping` with the parsed packages
+4. Builds instance results from the mapping (simulating Test 6 runtime)
+5. Calls `Get-NativeGateSummary` with those results
+6. Verifies the gate result is not FAIL (PASS/Informational for platform-n/a)
+
+---
+
+## 5. R11-REV-05: Shared mapping is fail-closed
+
+**Finding:** `ConvertFrom-TransitiveMapping` accepted `$judgments.Count -ge 1`, silently selected index 0, accepted IsNative=$false, did not validate fields.
+
+**Fix:** Now requires:
+- Exactly one judgment (Count -ne 1 → blocked entry)
+- Valid Name (non-null/non-empty)
+- Valid ResolutionStatus (in allowed set)
+- BlockReason present when Blocked
+- IsNative non-null and equal to `$true`
+- PlatformApplicable and ParentOptional non-null
+- Any invalid result → structured blocked mapping entry (not silent omission)
+
+---
+
+## 6. R11-REV-06: IsNative=$true required for native candidates
+
+**Finding:** Inline Test 6 only rejected `IsNative=$null`; accepted `$false`.
+
+**Fix:** Shared function now requires `IsNative -eq $true` for native candidates. `IsNative=$false` produces a blocked entry with reason "IsNative is not true".
+
+---
+
+## 7. R11-REV-07: Node ambiguity is fail-closed
+
+**Finding:** `Resolve-NodeExecutable` set both Path and AMBIGUOUS error. `Get-Command` was called without `-All`.
 
 **Fix:**
-- Added 15 new test cases (F25–F39) using `-TestCustomNodeScriptPath`, `-TestMaxInputBytes`, `-TestCleanupFail`, and direct `ConvertFrom-LockfilePathPolicy` / `Resolve-NodeExecutable` calls
-- All previously non-reproducible cases now have explicit test coverage
-- Test count increased from 25 to 40 in Test-LockfileReader
+- Uses `Get-Command node -All` to detect all candidates
+- Rejects aliases/functions/scripts (Application type only)
+- Requires exactly one Application (multiple → AMBIGUOUS error, no Path set)
+- Requires Error empty whenever Path is accepted
+- Validates resolved path exists and is a file
+- Reports shadowed non-Application commands as Warning
+- Node gate check now requires `$nodeResolution.Error -eq ""`
 
 ---
 
-## 2. REV-02: Lockfile Reader Tests Expanded (F25–F39)
+## 8. R11-REV-08: Path validation is complete
 
-**Finding:** R10 lacked tests for: truly empty stdout on exit 0, unexpected stderr on exit 0, oversized stdout/stderr, oversized input, non-string Path in intermediate entries, non-object Data in intermediate entries, cleanup failure, Node resolution, and non-canonical path spellings.
+**Finding:** Regexes were prefix-only; terminal `/.`, `/..`, incomplete scope not caught.
 
-**Fix — 15 new test cases:**
-
-| ID | Description | Mechanism | Expected |
-|----|-------------|-----------|----------|
-| F25 | Exit 0 + truly empty stdout | Custom JS: `process.exit(0)` | Parsed=false, error matches "empty stdout" |
-| F26 | Exit 0 + non-empty stderr | Custom JS: `console.error("warning")` + `process.stdout.write("[]")` | Parsed=false, error matches "unexpected stderr" |
-| F27 | Oversized stdout (>2MB) | Custom JS: 100K-entry JSON array | Parsed=false, error matches "exceeds" |
-| F28 | Oversized stderr on non-zero exit | Custom JS: 100K-line stderr + `process.exit(1)` | Parsed=false, error diagnostic < 2000 chars |
-| F29 | Oversized input | `-TestMaxInputBytes 100` with normal lockfile | Parsed=false, error matches "exceeds" |
-| F30 | Non-string Path in intermediate entry | Custom JS: `{Path: 123, Data: {...}}` | Parsed=false, error matches "not a string" |
-| F31 | Boolean Data in intermediate entry | Custom JS: `{Path: "node_modules/pkg", Data: true}` | Parsed=false, error matches "scalar" |
-| F32 | Cleanup failure | `-TestCleanupFail` switch | Parsed=false, error matches "cleanup" |
-| F33 | Resolve-NodeExecutable validity | Direct call | Returns valid path, no error |
-| F34 | Trailing slash | `ConvertFrom-LockfilePathPolicy("node_modules/pkg/")` | Returns `$null` |
-| F35 | Repeated slash | `ConvertFrom-LockfilePathPolicy("node_modules//pkg")` | Returns `$null` |
-| F36 | Backslash | `ConvertFrom-LockfilePathPolicy("node_modules\pkg")` | Returns `$null` |
-| F37 | Dot segment | `ConvertFrom-LockfilePathPolicy("node_modules/./pkg")` | Returns `$null` |
-| F38 | Dot-dot segment | `ConvertFrom-LockfilePathPolicy("node_modules/pkg/../other")` | Returns `$null` |
-| F39 | Absolute path | `ConvertFrom-LockfilePathPolicy("/node_modules/pkg")` | Returns `$null` |
-
-**Runtime count assertion added:** After the finally block, a check verifies `$tests.Count -eq 40` to catch future drift.
+**Fix:** Added to both PS and Node `canonicalize()`:
+- Reject terminal `/.` and `/..`
+- Reject incomplete scoped packages (`node_modules/@scope` without package)
+- Added test cases F40–F44 for these plus control characters
 
 ---
 
-## 3. REV-03: Lockfile Reader Test Injection Points
+## 9. R11-REV-09: Cleanup-failure test artifact recovered
 
-**Finding:** F25–F31 require injecting custom Node scripts or parameters to trigger edge-case code paths that are unreachable via normal lockfile fixtures alone.
+**Finding:** F32 with `-TestCleanupFail` leaked a helper directory; harness only cleaned `$fixtureDir`.
+
+**Fix:** F32 now:
+1. Records pre-existing `lockfile-reader-*` directories before the test
+2. After the assertion, scans for new `lockfile-reader-*` directories
+3. Removes any leaked directories
+4. Asserts no helper directories remain
+
+---
+
+## 10. R11-REV-10: Test evidence strengthened
+
+**Fixes:**
+- F28: Asserts Parsed=false, error non-empty, error bounded (< 2000 chars)
+- F33: Added F33b (Error empty on success) and F33c (Warning field exists)
+- Added F45–F48: ConvertFrom-TransitiveMapping tests (0/1/N judgment, IsNative=false)
+- Added runtime declared-vs-actual count assertions to ALL 5 suites
+- Fixed Gate Summary heading from "7 cases" to "15 cases"
+- Updated SelfTestOnly output with accurate counts
+
+---
+
+## 11. R11-REV-12: Test injection boundary guarded
+
+**Finding:** Test injection parameters (`-TestCustomNodeScriptPath`, `-TestMaxInputBytes`, `-TestCleanupFail`) were exposed on the production reader without guards.
 
 **Fix:**
-- `ConvertFrom-LockfileSafe` now accepts three test-only parameters:
-  - `-TestCustomNodeScriptPath [string]`: Replaces the standard Node helper script (copied to helper dir)
-  - `-TestMaxInputBytes [long]`: Overrides the 50MB input size limit
-  - `-TestCleanupFail [switch]`: Triggers cleanup failure in the `finally` block
-- These parameters do not affect production behavior (defaults preserve original limits)
+- Added `$script:SelfTestMode = $false` script-level variable
+- Set to `$true` before self-test execution, `$false` after
+- `ConvertFrom-LockfileSafe` rejects test injection parameters when `$script:SelfTestMode` is `$false`
+- Production calls (Test 4, Test 6) use default hardened path
 
 ---
 
-## 4. REV-04: Strict Type Validation in ConvertFrom-LockfileSafe
+## 12. Test Execution Evidence
 
-**Finding:** `$entry.Path` could be a non-string type (integer, boolean) after `ConvertFrom-Json`. `$entry.Data` could be a scalar (string, number, boolean).
-
-**Fix:**
-- `$entry.Path -isnot [string]` check added → reject with "not a string" error
-- `$data -is [string] -or $data -is [int] -or $data -is [long] -or $data -is [double] -or $data -is [bool] -or $data -is [System.ValueType]` check added → reject with "scalar type" error
-
----
-
-## 5. REV-05: ConvertFrom-LockfilePathPolicy Hardened to REJECT
-
-**Finding:** R10 path policy normalized (trimmed trailing `/`, collapsed `//`). This silently accepted non-canonical inputs that could bypass collision detection.
-
-**Fix:**
-- All non-canonical inputs now return `$null` (reject, not normalize):
-  - Backslashes → reject
-  - Trailing slash → reject
-  - Repeated slash (`//`) → reject
-  - Dot segments (`/./`, `/../`) → reject
-  - Absolute paths (`/...`) → reject
-  - Drive letter paths (`C:...`) → reject
-  - Control characters (char < 0x20) → reject
-- Node helper `canonicalize()` aligned with PS policy (same reject rules)
-
----
-
-## 6. REV-06: Exclusive Helper Directory Creation
-
-**Finding:** Helper directory creation did not verify the directory didn't already exist (GUID collision, though astronomically unlikely).
-
-**Fix:**
-- `Test-Path $helperDir` check before `New-Item` → fail with "collision" error if exists
-- Post-creation verification: `-not $dirItem -or -not (Test-Path $helperDir)` → fail if creation silent failure
-
----
-
-## 7. REV-07: Resolve-NodeExecutable Function
-
-**Finding:** Node executable was resolved inline as bare `Get-Command node` with no type validation. Multiple results, non-Application types, and missing Node were not handled.
-
-**Fix:**
-- New `Resolve-NodeExecutable` function:
-  - Filters `CommandType -eq 'Application'` from results
-  - Handles 0 results → error
-  - Handles multiple results → warning + use first
-  - Returns `@{ Path; Error }` hashtable
-- `ConvertFrom-LockfileSafe` uses `$nodeResolution.Path` instead of bare `'node'`
-
----
-
-## 8. REV-08: Read-BoundedFile Function
-
-**Finding:** Stdout and stderr were read without size limits. Large outputs could exhaust memory.
-
-**Fix:**
-- New `Read-BoundedFile` function with `$MaxBytes` parameter
-- Default 2MB for stdout, 1MB for stderr
-- Returns `@{ Content; Truncated; Error; SizeBytes }`
-- Used for both stdout and stderr reads in `ConvertFrom-LockfileSafe`
-- Node helper also checks input size before reading (`fs.statSync`)
-
----
-
-## 9. REV-09: Cleanup Failure Fail-Closed
-
-**Finding:** Cleanup (`Remove-Item $helperDir`) in the `finally` block caught errors but only logged a warning. The result remained `Parsed=$true` even if temp files were left behind.
-
-**Fix:**
-- Cleanup failure now sets `$result.Parsed = $false` and `$result.Error = "Cleanup failed: ..."`
-- `-TestCleanupFail` switch forces cleanup failure for testing
-- Result: any cleanup failure → fail-closed (Parsed=false)
-
----
-
-## 10. REV-10: Test 6 Judgment Validation
-
-**Finding:** `$judgments[0]` was accessed without PS5.1 scalar-safety wrapping. No validation of `ResolutionStatus`, `BlockReason`, or `IsNative` fields.
-
-**Fix:**
-- `$judgments = @($judgments)` — ensures array shape on PS5.1
-- `$judgments.Count -ne 1` check → set `$resolutionStatus = "Blocked"` if wrong count
-- `$judgment.ResolutionStatus -notin $validStatuses` check → reject invalid status
-- Blocked judgment missing `BlockReason` → reject
-- `$null -eq $judgment.IsNative` → reject
-- Only valid judgments populate `$transitiveNativeExpected`
-
----
-
-## 11. REV-11: ConvertFrom-TransitiveMapping Function
-
-**Finding:** The transitive native mapping logic (lockfile packages → parent resolver → native judgment → gate summary) was duplicated inline in Test 6.
-
-**Fix:**
-- New `ConvertFrom-TransitiveMapping` function encapsulates the full pipeline
-- Uses `@()` wrapping for PS5.1 scalar safety on judgment results
-- Validates `ResolutionStatus` before adding to map (REV-10 logic included)
-- Available for reuse in both Test 6 and any future integration tests
-
----
-
-## 12. REV-12: Self-Test Ordering
-
-**Finding:** `Test-LockfileReader` (which requires Node.js) ran in the same sequence as pure-function tests. If Node was missing, it would fail with ERROR/exit 3 instead of the more appropriate BLOCKED/exit 2.
-
-**Fix — New ordering:**
-1. **Pure-function tests** (no external dependencies):
-   - Aggregation (Test-GetOverallResult) → failure = ERROR/exit 3
-   - Native Judgment (Test-NativeAddonJudgment) → failure = ERROR/exit 3
-   - Parent Path (Test-ResolveLockfileParentPath) → failure = ERROR/exit 3
-   - Gate Summary (Test-NativeGateSummary) → failure = ERROR/exit 3
-2. **Node executable resolution** (`Resolve-NodeExecutable`):
-   - If Node not found → EvidenceDependent/BLOCKED/exit 2
-   - If Node found → continue
-3. **Node-backed tests** (only run after Node confirmed):
-   - Lockfile Reader (Test-LockfileReader) → failure = ERROR/exit 3
-
-**Key behavior change:** Missing Node now produces `EvidenceDependent/BLOCKED` (exit 2) instead of `ScriptInternal/ERROR` (exit 3). This correctly classifies the failure as a missing external dependency, not a script bug.
-
----
-
-## 13. REV-13: Preflight Documentation Corrected
-
-**Finding:** R10 preflight listed several cases as "Cannot reproduce" (unexpected stderr, oversized I/O, cleanup failure) when they were testable. Test counts were inconsistent.
-
-**Fix:**
-- All 13 R11 findings documented with evidence
-- Coverage matrix includes all 40 lockfile reader test cases by exact name
-- Non-reproducible cases now listed as BLOCKED with specific reproduction method
-- SHA-256 hashes for R10 blobs preserved for audit trail
-
----
-
-## Test Execution Summary
+### Self-Test Command
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\projects\HawkAIAgent\research\g0-s1-harness-integration\windows-poc-test-r2.ps1" -SelfTestOnly
+```
 
 ### Parser Check
-| Check | Result |
-|-------|--------|
-| PowerShell parser | PASS (0 errors) |
+```
+powershell.exe -Command '[System.Management.Automation.Language.Parser]::ParseFile("path", [ref]$null, [ref]$errors); "Errors: $($errors.Count)"'
+```
+**Result:** 0 errors
 
-### Isolated AST Harness (R10 Baseline)
-| Suite | Cases | Result | Exit Code |
-|-------|-------|--------|-----------|
-| Aggregation (Get-OverallResult) | 11 | 11/11 PASS | 0 |
-| Parent Resolver (Resolve-LockfileParentPath) | 4 | 4/4 PASS | 0 |
-| Native Judgment (Get-NativeAddonJudgment) | 24 | 24/24 PASS | 0 |
-| Gate Summary (Get-NativeGateSummary) | 15 | 15/15 PASS | 0 |
-| Lockfile Reader (Test-LockfileReader) | 25 | 25/25 PASS | 0 |
-| **R10 Overall** | **79** | **79/79 PASS** | **0** |
+### PSScriptAnalyzer
+```
+Invoke-ScriptAnalyzer -Path "path" -Severity Error
+```
+**Result:** 0 errors
 
-### R11 New Tests (added to Test-LockfileReader)
-| Test | Description | Status |
-|------|-------------|--------|
-| F25 | Exit 0 + empty stdout | PENDING (requires Node runtime) |
-| F26 | Exit 0 + stderr | PENDING (requires Node runtime) |
-| F27 | Oversized stdout | PENDING (requires Node runtime) |
-| F28 | Oversized stderr bounded | PENDING (requires Node runtime) |
-| F29 | Oversized input | PENDING (requires Node runtime) |
-| F30 | Non-string Path | PENDING (requires Node runtime) |
-| F31 | Boolean Data | PENDING (requires Node runtime) |
-| F32 | Cleanup failure | PENDING (requires Node runtime) |
-| F33 | Resolve-NodeExecutable | PENDING (requires Node on PATH) |
-| F34 | Trailing slash rejection | PENDING (pure function) |
-| F35 | Repeated slash rejection | PENDING (pure function) |
-| F36 | Backslash rejection | PENDING (pure function) |
-| F37 | Dot segment rejection | PENDING (pure function) |
-| F38 | Dot-dot segment rejection | PENDING (pure function) |
-| F39 | Absolute path rejection | PENDING (pure function) |
+### Self-Test Results (exit 0)
 
-**R11 Total: 40 lockfile reader tests** (25 from R10 + 15 new)
-**R11 Total across all suites: 94** (79 from R10 + 15 new)
+| Suite | Declared | Actual | Result |
+|-------|----------|--------|--------|
+| Aggregation (Get-OverallResult) | 11 | 11 | 11/11 PASS |
+| Native Judgment (Get-NativeAddonJudgment) | 24 | 24 | 24/24 PASS |
+| Parent Resolver (Resolve-LockfileParentPath) | 4 | 4 | 4/4 PASS |
+| Gate Summary (Get-NativeGateSummary) | 15 | 15 | 15/15 PASS |
+| Lockfile Reader (Test-LockfileReader) | 51 | 51 | 51/51 PASS |
+| **Overall** | **105** | **105** | **105/105 PASS (exit 0)** |
 
-### Allowlist Functions (18)
+### Lockfile Reader Per-Case Results
+
+| Test | Expected | Actual | Result |
+|------|----------|--------|--------|
+| F1: root key + optdep + required | Parsed=true, 3 entries | Parsed=true, 3 entries | ✅ PASS |
+| F2: nested dependency | Parsed=true | Parsed=true | ✅ PASS |
+| F3: scoped parent | Parsed=true | Parsed=true | ✅ PASS |
+| F4: same-name different paths | Parsed=true, 5 entries | Parsed=true, 5 entries | ✅ PASS |
+| F5: malformed JSON | Parsed=false | Parsed=false | ✅ PASS |
+| F6: missing packages | Parsed=false | Parsed=false | ✅ PASS |
+| F7: missing file | Parsed=false | Parsed=false | ✅ PASS |
+| F8: root optDep via reader | ParentOptional=true | ParentOptional=true | ✅ PASS |
+| F9: nested optDep via reader | ParentOptional=true | ParentOptional=true | ✅ PASS |
+| F10: canonical collision | Parsed=false | Parsed=false | ✅ PASS |
+| F11: non-obj packages | Parsed=false | Parsed=false | ✅ PASS |
+| F12: empty packages | Parsed=true, 0 entries | Parsed=true, 0 entries | ✅ PASS |
+| F12b: packages=null | Parsed=false | Parsed=false | ✅ PASS |
+| F13: packages=array | Parsed=false | Parsed=false | ✅ PASS |
+| F14: packages=string | Parsed=false | Parsed=false | ✅ PASS |
+| F15: packages=number | Parsed=false | Parsed=false | ✅ PASS |
+| F16: Data=null | Parsed=false | Parsed=false | ✅ PASS |
+| F17: Data=array | Parsed=false | Parsed=false | ✅ PASS |
+| F18: Data=string | Parsed=false | Parsed=false | ✅ PASS |
+| F19: Data=number | Parsed=false | Parsed=false | ✅ PASS |
+| F20: diverse paths (8 entries) | Parsed=true, Count=8 | Parsed=true, Count=8 | ✅ PASS |
+| F21: one-entry scalar-safe | Parsed=true, Count=2 | Parsed=true, Count=2 | ✅ PASS |
+| F22: root-only scalar-safe | Parsed=true, Count=1 | Parsed=true, Count=1 | ✅ PASS |
+| F23: real shared path not FAIL | gate != FAIL | gate != FAIL | ✅ PASS |
+| F24: parser fail → overall BLOCKED | BLOCKED | BLOCKED | ✅ PASS |
+| F25: exit 0 + empty stdout | Parsed=false | Parsed=false | ✅ PASS |
+| F26: exit 0 + stderr | Parsed=false | Parsed=false | ✅ PASS |
+| F27: oversized stdout | Parsed=false | Parsed=false | ✅ PASS |
+| F28: oversized stderr bounded | Parsed=false, error < 2000 | Parsed=false, error < 2000 | ✅ PASS |
+| F29: oversized input (100B) | Parsed=false | Parsed=false | ✅ PASS |
+| F30: non-string Path | Parsed=false | Parsed=false | ✅ PASS |
+| F31: boolean Data | Parsed=false | Parsed=false | ✅ PASS |
+| F32: cleanup failure | Parsed=false, artifact recovered | Parsed=false, artifact recovered | ✅ PASS |
+| F33: NodeExecutable valid path | Path non-null, exists | Path non-null, exists | ✅ PASS |
+| F33b: Error empty on success | Error="" | Error="" | ✅ PASS |
+| F33c: Warning field exists | Warning field present | Warning field present | ✅ PASS |
+| F34: trailing slash | $null | $null | ✅ PASS |
+| F35: repeated slash | $null | $null | ✅ PASS |
+| F36: backslash | $null | $null | ✅ PASS |
+| F37: dot segment | $null | $null | ✅ PASS |
+| F38: dot-dot segment | $null | $null | ✅ PASS |
+| F39: absolute path | $null | $null | ✅ PASS |
+| F40: terminal dot (/. ) | $null | $null | ✅ PASS |
+| F41: terminal dot-dot (/..) | $null | $null | ✅ PASS |
+| F42: incomplete scope (@scope) | $null | $null | ✅ PASS |
+| F43: drive letter (C:/...) | $null | $null | ✅ PASS |
+| F44: control char (0x01) | $null | $null | ✅ PASS |
+| F45: 0 matching deps | empty mapping | empty mapping | ✅ PASS |
+| F46: 1 matching dep | 1-entry mapping | 1-entry mapping | ✅ PASS |
+| F47: N matching deps | multi-entry mapping | multi-entry mapping | ✅ PASS |
+| F48: IsNative=false | blocked or absent | blocked or absent | ✅ PASS |
+
+### Node Resolution Evidence
+- `Get-Command node -All`: Found 1 Application
+- Resolved path: `C:\nvm4w\nodejs\node.exe`
+- Path exists: yes
+- Is file: yes
+- Error: (empty)
+- Warning: (empty)
+
+### Temp Artifact Inventory
+- Before self-test: 0 `lockfile-reader-*` directories in $env:TEMP
+- After F32 (cleanup failure): leaked directory created, then recovered by harness
+- After self-test: 0 `lockfile-reader-*` directories remaining
+- All `$fixtureDir` contents removed in `finally` blocks
+
+### Self-Test Gate Results
+| TestId | Category | Status | Description |
+|--------|----------|--------|-------------|
+| SELFTEST-PURE | MandatoryFunctional | PASS | Pure-function self-tests (54/54) |
+| SELFTEST-NODEBACKED | MandatoryFunctional | PASS | Node-backed self-tests (51/51) |
+| SELFTEST-NODECHECK | EvidenceDependent | PASS | Node executable resolution |
+
+---
+
+## 13. Allowlist Functions (22)
+
 1. PrerequisiteBlocked
 2. AssertionFailure
 3. Add-TestResult
@@ -244,86 +267,45 @@
 8. ConvertFrom-LockfilePathPolicy
 9. ConvertFrom-LockfileSafe
 10. Get-NativeAddonJudgment
-11. Test-NativeAddonJudgment
-12. Test-LockfileReader
-13. Test-ResolveLockfileParentPath
-14. Test-NativeGateSummary
-15. Test-GetOverallResult
-16. Resolve-NodeExecutable (new, REV-07)
-17. Read-BoundedFile (new, REV-08)
-18. ConvertFrom-TransitiveMapping (new, REV-11)
+11. ConvertFrom-TransitiveMapping
+12. Resolve-NodeExecutable
+13. Read-BoundedFile
+14. Test-NativeAddonJudgment
+15. Test-LockfileReader
+16. Test-ResolveLockfileParentPath
+17. Test-NativeGateSummary
+18. Test-GetOverallResult
+19. Save-ProcessSnapshot
+20. Update-OwnedProcessRecords
+21. Stop-OwnedProcesses
+22. Invoke-Cleanup
 
 ---
 
-## R11-REV Case Coverage Matrix
+## 14. Side-Effect Proof
 
-| Required Case | Test ID | Expected | Covered By |
-|---------------|---------|----------|------------|
-| Exit 0 + empty stdout | F25 | Parsed=false, "empty stdout" | Test-LockfileReader (custom JS) |
-| Exit 0 + unexpected stderr | F26 | Parsed=false, "unexpected stderr" | Test-LockfileReader (custom JS) |
-| Oversized stdout (>2MB) | F27 | Parsed=false, "exceeds" | Test-LockfileReader (custom JS) |
-| Oversized stderr bounded | F28 | Parsed=false, error < 2000 chars | Test-LockfileReader (custom JS) |
-| Oversized input (>limit) | F29 | Parsed=false, "exceeds" | Test-LockfileReader (-TestMaxInputBytes) |
-| Non-string Path | F30 | Parsed=false, "not a string" | Test-LockfileReader (custom JS) |
-| Non-object Data (boolean) | F31 | Parsed=false, "scalar" | Test-LockfileReader (custom JS) |
-| Cleanup failure | F32 | Parsed=false, "cleanup" | Test-LockfileReader (-TestCleanupFail) |
-| Node executable resolution | F33 | Valid path returned | Test-LockfileReader (direct call) |
-| Trailing slash rejected | F34 | $null | Test-LockfileReader (direct call) |
-| Repeated slash rejected | F35 | $null | Test-LockfileReader (direct call) |
-| Backslash rejected | F36 | $null | Test-LockfileReader (direct call) |
-| Dot segment rejected | F37 | $null | Test-LockfileReader (direct call) |
-| Dot-dot segment rejected | F38 | $null | Test-LockfileReader (direct call) |
-| Absolute path rejected | F39 | $null | Test-LockfileReader (direct call) |
-| Judgment PS5.1 scalar safety | REV-10 | @() wrapping + count check | Code review (Test 6 path) |
-| Judgment field validation | REV-10 | Invalid status/blockreason/null → Blocked | Code review (Test 6 path) |
-| Transitive mapping extracted | REV-11 | ConvertFrom-TransitiveMapping | Code review |
-| Node-backed tests gated on Node | REV-12 | Missing Node → exit 2 not exit 3 | Code review (self-test sequence) |
-| Canonical collision → BLOCKED | F10 | Parsed=false, collision error | Test-LockfileReader (R10) |
-| Node non-zero exit → BLOCKED | F11 | Parsed=false, exit evidence | Test-LockfileReader (R10) |
-| Empty packages → valid | F12 | Parsed=true, 0 entries | Test-LockfileReader (R10) |
-| packages=null → reject | F12b | Parsed=false | Test-LockfileReader (R10) |
-| packages=array/string/number | F13-F15 | Parsed=false | Test-LockfileReader (R10) |
-| Data=null/array/string/number | F16-F19 | Parsed=false | Test-LockfileReader (R10) |
-| Diverse paths pass | F20 | Parsed=true, 8 entries | Test-LockfileReader (R10) |
-| Scalar-safe 1-entry | F21 | Parsed=true, Count=2 | Test-LockfileReader (R10) |
-| Scalar-safe 0-entry | F22 | Parsed=true, Count=1 | Test-LockfileReader (R10) |
-| Blocked judgment → gate BLOCKED | F23 | gate BLOCKED | Test-LockfileReader (R10) |
-| Parser fail → overall BLOCKED | F24 | overall BLOCKED | Test-LockfileReader (R10) |
+- No npm install during self-tests
+- No Harness launch (no `$TEST_PORT`, no `Start-Process`)
+- No HTTP/WS traffic
+- No process kill
+- No port/registry/credential/API-key access
+- All temp artifacts created in `$fixtureDir` and removed in `finally` blocks
+- F32 leaked helper directory recovered by harness
+- Actual process exit code captured externally (exit 0)
 
 ---
 
-## Full PoC/Harness Not Run
+## 15. Full PoC/Harness Not Run
 
-**Explicit statement:** The complete PoC/Harness was NOT run in this remediation round. Only parser checks and static analysis were executed. No npm install, Harness launch, HTTP requests, WebSocket connections, process management, port operations, or external API calls occurred.
-
-The R11 new tests (F25–F39) are PENDING execution because they require:
-- A Node.js runtime on PATH (for F25–F32)
-- PowerShell execution of the full self-test sequence (for F33–F39)
-
-These tests will be validated when the full PoC is next executed.
+**Explicit statement:** The complete PoC/Harness was NOT run in R12. Only the `-SelfTestOnly` mode was executed, which runs parser checks, pure-function self-tests, Node resolution, and Node-backed integration tests, then exits before any main-flow operations. No npm install, Harness launch, HTTP requests, WebSocket connections, process management, port operations, or external API calls occurred.
 
 ---
 
-## Side-Effect Proof
+## 16. Non-Actions
 
-- No main-flow statements executed (no param block processing, no `$TEST_DIR`, no npm install)
-- No Harness launch (no `$TEST_PORT`, no Start-Process)
-- No process-kill (no Stop-OwnedProcesses invocation)
-- No port operations (no Get-NetTCPConnection)
-- No registry operations
-- No credential/API-key access
-- Only parser validation was performed
-- No files were created, modified, or deleted outside the two target files:
-  - `research/g0-s1-harness-integration/windows-poc-test-r2.ps1`
-  - `docs/verification/G0-S1-R2-preflight.md`
-
----
-
-## R10 SHA-256 Audit Trail
-
-| Artifact | SHA-256 |
-|----------|---------|
-| windows-poc-test-r2.ps1 (R10) | `c9523143b78784eef4a867f2f7904c5206d5180165b6560ea099dd147d3b2871` |
-| G0-S1-R2-preflight.md (R10) | `4d11d153cded6cfa872b8270fd5461f8e4619e1aabe0fcc2e8cc1b72bfe78d89` |
-
-These hashes document the R10 state before R11 modifications. The R11-modified artifacts will have different hashes.
+- ❌ Not merged PR #1
+- ❌ Not marked Ready for review
+- ❌ Not modified master
+- ❌ Not accessed real API keys
+- ❌ Not entered Phase B
+- ❌ Not entered G0-S2
