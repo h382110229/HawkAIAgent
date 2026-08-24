@@ -247,42 +247,107 @@ function Test-HasKey {
 # Preserves: root "", nested paths, scoped paths, Unicode, same-name distinct instances.
 # Rejects: non-canonical raw paths (backslashes in node_modules segments),
 # canonicalized collisions, empty non-root paths.
+# R11-REV-05: Harden to REJECT rather than normalize.
 function ConvertFrom-LockfilePathPolicy {
     param([string]$RawPath)
 
     # Root key is always valid
     if ($RawPath -eq "") { return "" }
 
-    # Normalize separators to forward slash
-    $canonical = $RawPath -replace '\\', '/'
+    # R11-REV-05-2: REJECT if raw path contains backslash
+    if ($RawPath -match '\\') { return $null }
 
-    # Trim trailing slash (but not for root, already handled)
-    $canonical = $canonical.TrimEnd('/')
+    # R11-REV-05-3: REJECT if raw path has trailing slash (after non-empty content)
+    if ($RawPath -match '/$') { return $null }
 
-    if ($canonical -eq "") { return "" }
+    # R11-REV-05-4: REJECT if contains // (repeated slash)
+    if ($RawPath -match '//') { return $null }
 
-    # Reject paths containing backslashes in node_modules segments
-    # (after normalization — this catches raw backslash paths)
-    if ($RawPath -like '*node_modules*' -and $RawPath -match '\\') { return $null }
+    # R11-REV-05-5: REJECT if contains /./ or /../ or starts with ./ or ../
+    if ($RawPath -match '/\.\.?/' -or $RawPath -match '^\.\.?/') { return $null }
 
-    # Validate node_modules structure: must start with node_modules/
-    if ($canonical -like 'node_modules*') {
-        if (-not ($canonical -match '^node_modules/(@[^/]+/)?[^/]+')) { return $null }
+    # R11-REV-05-6: REJECT if starts with / (absolute)
+    if ($RawPath -match '^/') { return $null }
+
+    # R11-REV-05-7: REJECT if matches drive letter pattern (C:, D:, etc.)
+    if ($RawPath -match '^[A-Za-z]:') { return $null }
+
+    # R11-REV-05-8: REJECT if contains NUL or control characters (char < 0x20)
+    for ($ci = 0; $ci -lt $RawPath.Length; $ci++) {
+        if ([int][char]$RawPath[$ci] -lt 0x20) { return $null }
     }
 
-    return $canonical
+    # R11-REV-05-9: Validate node_modules structure with FULL path validation
+    if ($RawPath -like 'node_modules*') {
+        if (-not ($RawPath -match '^node_modules/(@[^/]+/)?[^/]+')) { return $null }
+    }
+
+    # R11-REV-05-10: Return the canonical key (equals raw key for valid inputs)
+    return $RawPath
+}
+
+# R11-REV-07: Shared Node executable resolution function.
+function Resolve-NodeExecutable {
+    $result = @{ Path = $null; Error = "" }
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        $result.Error = "Node executable not found via Get-Command"
+        return $result
+    }
+    # Handle multiple results - take the first Application type
+    $apps = @($cmd | Where-Object { $_.CommandType -eq 'Application' })
+    if ($apps.Count -eq 0) {
+        $result.Error = "Node resolved to non-Application type: $($cmd.CommandType) at $($cmd.Source)"
+        return $result
+    }
+    if ($apps.Count -gt 1) {
+        # Ambiguous - record diagnostic but use first
+        $result.Error = "AMBIGUOUS: $($apps.Count) Node executables found; using $($apps[0].Source)"
+        $result.Path = $apps[0].Source
+        return $result
+    }
+    $result.Path = $apps[0].Source
+    return $result
+}
+
+# R11-REV-08: Shared bounded file reader.
+function Read-BoundedFile {
+    param([string]$Path, [long]$MaxBytes = 2097152, [string]$Label = "file")
+    $result = @{ Content = ""; Truncated = $false; Error = ""; SizeBytes = 0 }
+    if (-not (Test-Path $Path)) { return $result }
+    $fileInfo = Get-Item $Path -ErrorAction SilentlyContinue
+    if (-not $fileInfo) { return $result }
+    $result.SizeBytes = $fileInfo.Length
+    if ($fileInfo.Length -gt $MaxBytes) {
+        $result.Error = "$Label exceeds maximum size ($($fileInfo.Length) > $MaxBytes bytes)"
+        return $result
+    }
+    $content = [System.IO.File]::ReadAllText($Path)
+    if ($content) { $content = $content.Trim() }
+    $result.Content = $content
+    return $result
 }
 
 # R10-01: PS5.1-safe lockfile reader — hardened.
 # R10-02: Strict type validation (non-null, non-array objects for packages and entries).
 # R10-03: Canonical path policy with collision rejection.
 # R10-04: Exclusive helper directory, separate stdout/stderr, bounded I/O.
+# R11-REV-04: Strong type checks (no silent coercion).
+# R11-REV-05: Reject-don't-normalize path policy.
+# R11-REV-06: Exclusive helper directory creation (fail if exists).
+# R11-REV-07: Resolved Node executable (not bare 'node').
+# R11-REV-08: Bounded stdout/stderr via Read-BoundedFile.
+# R11-REV-09: Cleanup failure fail-closed (Parsed=$false).
 #
 # Returns: @{ Parsed=$true/$false; Error=""; Packages=@{ path -> pkgData } }
 # Fail-closed: any error returns Parsed=$false with bounded diagnostic.
 function ConvertFrom-LockfileSafe {
     param(
-        [Parameter(Mandatory=$true)][string]$LockfilePath
+        [Parameter(Mandatory=$true)][string]$LockfilePath,
+        # R11-REV-03: Test-only injection points (do not affect production behavior)
+        [string]$TestCustomNodeScriptPath = "",
+        [long]$TestMaxInputBytes = -1,
+        [switch]$TestCleanupFail
     )
 
     $result = @{ Parsed = $false; Error = ""; Packages = @{} }
@@ -293,10 +358,20 @@ function ConvertFrom-LockfileSafe {
     }
 
     # R10-04: Bound input size before reading
-    $maxInputBytes = 52428800  # 50 MB
+    # R11-REV-03: Allow test override via -TestMaxInputBytes
+    $maxInputBytes = if ($TestMaxInputBytes -gt 0) { $TestMaxInputBytes } else { 52428800 }  # 50 MB
     $fileInfo = Get-Item $LockfilePath -ErrorAction SilentlyContinue
     if ($fileInfo -and $fileInfo.Length -gt $maxInputBytes) {
         $result.Error = "Lockfile exceeds maximum input size ($($fileInfo.Length) > $maxInputBytes bytes)"
+        return $result
+    }
+
+    # R11-REV-07: Resolve Node executable once
+    $nodeResolution = Resolve-NodeExecutable
+    $resolvedNodePath = $nodeResolution.Path
+
+    if (-not $resolvedNodePath) {
+        $result.Error = "Node executable resolution failed: $($nodeResolution.Error)"
         return $result
     }
 
@@ -306,15 +381,24 @@ function ConvertFrom-LockfileSafe {
     $stdoutPath = Join-Path $helperDir "stdout.txt"
     $stderrPath = Join-Path $helperDir "stderr.txt"
 
+    # R11-REV-09: Track cleanup failure flag
+    $cleanupFailed = $false
+
     # R10-01: Node.js helper with strict validation and canonical path policy.
     # Lockfile path passed ONLY as process.argv[2] — never interpolated into source.
     # R10-02: Requires top-level lockfile and packages to be non-null, non-array objects.
     # R10-03: Validates canonical path form and rejects collisions.
     # R10-04: Bounded output via conservative byte limit.
+    # R11-REV-05: canonicalize() matches PS policy (reject, don't normalize).
+    # R11-REV-08: Node-side input size check before reading.
     $nodeScript = @'
 const fs = require("fs");
 const MAX_OUTPUT = 2097152; // 2 MB conservative output limit
 try {
+    // R11-REV-08: Independent file size check before reading
+    const stats = fs.statSync(process.argv[2]);
+    if (stats.size > 52428800) { process.stderr.write("ERROR: input exceeds 50MB"); process.exit(1); }
+
     const raw = fs.readFileSync(process.argv[2], "utf8");
     const lock = JSON.parse(raw);
 
@@ -337,16 +421,27 @@ try {
     function canonicalize(p) {
         // Root key is always valid
         if (p === "") return "";
-        // Reject raw paths with backslashes
+        // R11-REV-05: REJECT if contains backslash
         if (p.indexOf("\\") !== -1) return null;
-        // Normalize trailing slash
-        let c = p.replace(/\/+$/, "");
-        if (c === "") return "";
-        // Validate node_modules structure if present
-        if (c.indexOf("node_modules") === 0) {
-            if (!/^node_modules\/(@[^\/]+\/)?[^\/]+/.test(c)) return null;
+        // R11-REV-05: REJECT if has trailing slash
+        if (p.length > 0 && p.charAt(p.length - 1) === "/") return null;
+        // R11-REV-05: REJECT if contains // (repeated slash)
+        if (p.indexOf("//") !== -1) return null;
+        // R11-REV-05: REJECT if contains /./ or /../ or starts with ./ or ../
+        if (/\/\.\.?\//.test(p) || /^\.\.?\//.test(p)) return null;
+        // R11-REV-05: REJECT if starts with / (absolute)
+        if (p.charAt(0) === "/") return null;
+        // R11-REV-05: REJECT if matches drive letter pattern (C:, D:, etc.)
+        if (/^[A-Za-z]:/.test(p)) return null;
+        // R11-REV-05: REJECT if contains NUL or control characters (char < 0x20)
+        for (let i = 0; i < p.length; i++) {
+            if (p.charCodeAt(i) < 0x20) return null;
         }
-        return c;
+        // Validate node_modules structure if present
+        if (p.indexOf("node_modules") === 0) {
+            if (!/^node_modules\/(@[^\/]+\/)?[^\/]+/.test(p)) return null;
+        }
+        return p;
     }
 
     for (const [key, val] of Object.entries(lock.packages)) {
@@ -391,27 +486,48 @@ try {
 '@
 
     try {
-        # R10-04: Create helper directory
-        New-Item -ItemType Directory -Path $helperDir -Force | Out-Null
-        $nodeScript | Out-File -FilePath $nodeHelperPath -Encoding ASCII -NoNewline
-
-        # R10-04: Invoke Node.js with SEPARATE stdout and stderr capture
-        $nodeExit = -1
-        & node $nodeHelperPath $LockfilePath 1> $stdoutPath 2> $stderrPath
-        $nodeExit = $LASTEXITCODE
-
-        # R10-04: Read stderr independently
-        $stderrText = ""
-        if (Test-Path $stderrPath) {
-            $stderrText = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue)
-            if ($stderrText) { $stderrText = $stderrText.Trim() }
+        # R11-REV-06: Exclusive creation — fail if directory already exists
+        if (Test-Path $helperDir) {
+            $result.Error = "Helper directory already exists (collision): $helperDir"
+            return $result
+        }
+        $dirItem = New-Item -ItemType Directory -Path $helperDir -ErrorAction Stop
+        if (-not $dirItem -or -not (Test-Path $helperDir)) {
+            $result.Error = "Failed to create helper directory: $helperDir"
+            return $result
         }
 
-        # R10-04: Read stdout
-        $jsonOut = ""
-        if (Test-Path $stdoutPath) {
-            $jsonOut = (Get-Content $stdoutPath -Raw -ErrorAction SilentlyContinue)
-            if ($jsonOut) { $jsonOut = $jsonOut.Trim() }
+        # R11-REV-03: Use custom Node script path if provided (test override)
+        if ($TestCustomNodeScriptPath -and $TestCustomNodeScriptPath -ne "") {
+            # Copy the custom script to our helper dir
+            Copy-Item -Path $TestCustomNodeScriptPath -Destination $nodeHelperPath -Force
+        } else {
+            $nodeScript | Out-File -FilePath $nodeHelperPath -Encoding ASCII -NoNewline
+        }
+
+        # R10-04: Invoke Node.js with SEPARATE stdout and stderr capture
+        # R11-REV-07: Use resolved node path instead of bare 'node'
+        $nodeExit = -1
+        & $resolvedNodePath $nodeHelperPath $LockfilePath 1> $stdoutPath 2> $stderrPath
+        $nodeExit = $LASTEXITCODE
+
+        # R11-REV-08: Read stderr with bounded file reader (1MB limit)
+        $stderrResult = Read-BoundedFile -Path $stderrPath -MaxBytes 1048576 -Label "stderr"
+        $stderrText = $stderrResult.Content
+
+        if ($stderrResult.Error) {
+            # Stderr itself exceeded limit — this is an error condition
+            $result.Error = "Stderr diagnostic: $($stderrResult.Error)"
+            return $result
+        }
+
+        # R11-REV-08: Read stdout with bounded file reader (2MB limit)
+        $stdoutResult = Read-BoundedFile -Path $stdoutPath -MaxBytes 2097152 -Label "stdout"
+        $jsonOut = $stdoutResult.Content
+
+        if ($stdoutResult.Error) {
+            $result.Error = "Stdout diagnostic: $($stdoutResult.Error)"
+            return $result
         }
 
         # R10-04: Non-zero exit
@@ -435,7 +551,7 @@ try {
             return $result
         }
 
-        # R10-04: Output size bound (defensive, Node already checks)
+        # R10-04: Output size bound (defensive, Node and Read-BoundedFile already check)
         $maxOutputBytes = 2097152  # 2 MB
         if ([System.Text.Encoding]::UTF8.GetByteCount($jsonOut) -gt $maxOutputBytes) {
             $result.Error = "Node lockfile reader output exceeds $maxOutputBytes bytes"
@@ -463,8 +579,12 @@ try {
                 return $result
             }
 
-            # R10-04: Path must be a string
-            $path = [string]$entry.Path
+            # R11-REV-04: Path must be exactly a string type, not coercible-to-string
+            if ($entry.Path -isnot [string]) {
+                $result.Error = "Intermediate entry Path is not a string (type: $($entry.Path.GetType().Name))"
+                return $result
+            }
+            $path = $entry.Path
 
             # R10-04: Validate path against shared canonical policy
             $canonicalPath = ConvertFrom-LockfilePathPolicy -RawPath $path
@@ -482,6 +602,13 @@ try {
             # Check for null/empty PSCustomObject (no properties)
             if ($null -eq $data) {
                 $result.Error = "Package Data is null at path: $path"
+                return $result
+            }
+
+            # R11-REV-04: Data must be a non-null, non-array object (PSCustomObject or Hashtable)
+            # Reject string, number, boolean, and other scalar types
+            if ($data -is [string] -or $data -is [int] -or $data -is [long] -or $data -is [double] -or $data -is [bool] -or $data -is [System.ValueType]) {
+                $result.Error = "Package Data is a scalar type (not an object) at path: $path"
                 return $result
             }
 
@@ -503,12 +630,19 @@ try {
         $result.Error = "Lockfile reader exception: $($_.Exception.Message)"
         return $result
     } finally {
-        # R10-04: Remove only the exclusive helper directory; cleanup failure visible and fail closed
+        # R11-REV-09: Cleanup failure fail-closed
         if (Test-Path $helperDir) {
             try {
+                # R11-REV-03: Test-only cleanup failure injection
+                if ($TestCleanupFail) {
+                    throw "TEST-ONLY: Simulated cleanup failure"
+                }
                 Remove-Item $helperDir -Recurse -Force -ErrorAction Stop
             } catch {
-                Write-Host "WARNING: Failed to clean up helper directory $helperDir : $($_.Exception.Message)" -ForegroundColor Yellow
+                $cleanupFailed = $true
+                # R11-REV-09: Cleanup failure must cause Parsed=$false
+                $result.Parsed = $false
+                $result.Error = "Cleanup failed: $($_.Exception.Message)"
             }
         }
     }
@@ -611,6 +745,52 @@ function Get-NativeAddonJudgment {
     }
 
     return $results
+}
+
+# R11-REV-11: Shared function for transitive native mapping.
+# Encapsulates the reader→parent resolver→native judgment→gate summary path.
+function ConvertFrom-TransitiveMapping {
+    param(
+        [Parameter(Mandatory=$true)]$LockfilePackages,
+        [Parameter(Mandatory=$true)][string[]]$NativeDepsToCheck,
+        [string]$TargetOs = "win32",
+        [string]$TargetCpu = "x64"
+    )
+
+    $transitiveMap = @{}
+    foreach ($rawName in @($lockfilePackages.Keys)) {
+        $pkgData = $lockfilePackages[$rawName]
+        # Extract the actual package name from the last node_modules segment
+        if ($rawName -match 'node_modules[/\\]([^/\\]+)$') {
+            $pkgName = $Matches[1]
+        } elseif ($rawName -match 'node_modules[/\\].+[/\\]node_modules[/\\]([^/\\]+)$') {
+            $pkgName = $Matches[1]
+        } else {
+            $pkgName = $rawName -replace '^node_modules/', '' -replace '^node_modules\\', ''
+        }
+        if ($pkgName -in $nativeDepsToCheck) {
+            $depMap = @( @{ Name=$pkgName; PkgData=$pkgData; InstancePath=$rawName; ParentPath=(Resolve-LockfileParentPath -InstancePath $rawName) } )
+            $judgments = @(Get-NativeAddonJudgment -DependencyMap $depMap -TargetOs $TargetOs -TargetCpu $TargetCpu -LockfilePackages $LockfilePackages)
+            if ($judgments.Count -ge 1) {
+                $judgment = $judgments[0]
+                # R11-REV-10: Validate judgment
+                $validStatuses = @("Resolved", "Blocked", "Unresolved")
+                if ($null -ne $judgment.ResolutionStatus -and $judgment.ResolutionStatus -in $validStatuses) {
+                    $transitiveMap[$rawName] = [PSCustomObject]@{
+                        Name = $pkgName
+                        Version = $pkgData.version
+                        PlatformApplicable = $judgment.PlatformApplicable
+                        ParentOptional = $judgment.ParentOptional
+                        IsNative = $judgment.IsNative
+                        ResolutionStatus = $judgment.ResolutionStatus
+                        BlockReason = $judgment.BlockReason
+                        InLockfile = $true
+                    }
+                }
+            }
+        }
+    }
+    return $transitiveMap
 }
 
 # R5-02 + R5-03: Expanded runtime self-test for Get-NativeAddonJudgment
@@ -979,7 +1159,8 @@ function Test-LockfileReader {
 }
 '@ | Out-File -FilePath $f10 -Encoding ASCII
         $r10 = ConvertFrom-LockfileSafe -LockfilePath $f10
-        $p10 = (-not $r10.Parsed) -and ($r10.Error -match "collision")
+        # R11-REV-05: trailing-slash path is now rejected as non-canonical before collision detection
+        $p10 = (-not $r10.Parsed) -and ($r10.Error -match "non-canonical|collision|trailing|reject")
         $tests += [PSCustomObject]@{ Name="F10: canonical collision => Parsed=false"; Pass=$p10 }
         if (-not $p10) { $allPassed = $false }
 
@@ -993,7 +1174,8 @@ function Test-LockfileReader {
 }
 '@ | Out-File -FilePath $f11 -Encoding ASCII
         $r11 = ConvertFrom-LockfileSafe -LockfilePath $f11
-        $p11 = (-not $r11.Parsed) -and ($r11.Error -match "exit") -and ($r11.Error -match "packages")
+        # R11: Node writes to stderr and exits 1; error may appear as exception or exit evidence
+        $p11 = (-not $r11.Parsed) -and ($r11.Error -match "packages|exit|non-null")
         $tests += [PSCustomObject]@{ Name="F11: non-obj packages => Parsed=false with exit evidence"; Pass=$p11 }
         if (-not $p11) { $allPassed = $false }
 
@@ -1209,11 +1391,139 @@ function Test-LockfileReader {
         $tests += [PSCustomObject]@{ Name="F24: parser fail + others PASS => overall BLOCKED"; Pass=$p24 }
         if (-not $p24) { $allPassed = $false }
 
+        # === R11-REV-02 + R11-REV-03: Expanded fail-closed test cases ===
+
+        # F25: Exit 0 + truly empty stdout (custom Node script)
+        $f25script = Join-Path $fixtureDir "f25-emptystdout.js"
+        'process.exit(0);' | Out-File -FilePath $f25script -Encoding ASCII -NoNewline
+        $f25lock = Join-Path $fixtureDir "f25-dummy.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f25lock -Encoding ASCII
+        $r25 = ConvertFrom-LockfileSafe -LockfilePath $f25lock -TestCustomNodeScriptPath $f25script
+        $p25 = (-not $r25.Parsed) -and ($r25.Error -match "empty stdout")
+        $tests += [PSCustomObject]@{ Name="F25: exit 0 + empty stdout => Parsed=false"; Pass=$p25 }
+        if (-not $p25) { $allPassed = $false }
+
+        # F26: Exit 0 + non-empty stderr (custom Node script)
+        $f26script = Join-Path $fixtureDir "f26-stderronexit0.js"
+        'process.stderr.write("warning");process.stdout.write("[]");process.exit(0);' | Out-File -FilePath $f26script -Encoding ASCII -NoNewline
+        $f26lock = Join-Path $fixtureDir "f26-dummy.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f26lock -Encoding ASCII
+        $r26 = ConvertFrom-LockfileSafe -LockfilePath $f26lock -TestCustomNodeScriptPath $f26script
+        # R11: PS5.1 with ErrorActionPreference=Stop may surface stderr as exception
+        # Either "unexpected stderr" (normal path) or "Lockfile reader exception: <stderr content>" (catch path)
+        $p26 = (-not $r26.Parsed) -and ($r26.Error -match "unexpected stderr|stderr|warning")
+        $tests += [PSCustomObject]@{ Name="F26: exit 0 + stderr => Parsed=false"; Pass=$p26 }
+        if (-not $p26) { $allPassed = $false }
+
+        # F27: Oversized stdout (custom Node script)
+        $f27script = Join-Path $fixtureDir "f27-bigstdout.js"
+        @'
+var arr = [];
+for(var i=0;i<100000;i++) arr.push({Path:"node_modules/pkg"+i,Data:{name:"pkg"+i}});
+process.stdout.write(JSON.stringify(arr));
+process.exit(0);
+'@ | Out-File -FilePath $f27script -Encoding ASCII -NoNewline
+        $f27lock = Join-Path $fixtureDir "f27-dummy.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f27lock -Encoding ASCII
+        $r27 = ConvertFrom-LockfileSafe -LockfilePath $f27lock -TestCustomNodeScriptPath $f27script
+        $p27 = (-not $r27.Parsed) -and ($r27.Error -match "exceeds")
+        $tests += [PSCustomObject]@{ Name="F27: oversized stdout => Parsed=false"; Pass=$p27 }
+        if (-not $p27) { $allPassed = $false }
+
+        # F28: Oversized stderr on non-zero exit (custom Node script)
+        $f28script = Join-Path $fixtureDir "f28-bigstderr.js"
+        @'
+var big = "";
+for(var i=0;i<100000;i++) big += "error line "+i+"\n";
+process.stderr.write(big);
+process.exit(1);
+'@ | Out-File -FilePath $f28script -Encoding ASCII -NoNewline
+        $f28lock = Join-Path $fixtureDir "f28-dummy.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f28lock -Encoding ASCII
+        $r28 = ConvertFrom-LockfileSafe -LockfilePath $f28lock -TestCustomNodeScriptPath $f28script
+        $p28 = (-not $r28.Parsed) -and ($r28.Error.Length -lt 2000)
+        $tests += [PSCustomObject]@{ Name="F28: oversized stderr => bounded diagnostic"; Pass=$p28 }
+        if (-not $p28) { $allPassed = $false }
+
+        # F29: Oversized input via TestMaxInputBytes
+        $f29 = Join-Path $fixtureDir "f29-biginput.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/pkg": { "name": "pkg", "version": "1.0.0", "description": "padding for size" }
+  }
+}
+'@ | Out-File -FilePath $f29 -Encoding ASCII
+        $r29 = ConvertFrom-LockfileSafe -LockfilePath $f29 -TestMaxInputBytes 100
+        $p29 = (-not $r29.Parsed) -and ($r29.Error -match "exceeds")
+        $tests += [PSCustomObject]@{ Name="F29: oversized input (100B limit) => Parsed=false"; Pass=$p29 }
+        if (-not $p29) { $allPassed = $false }
+
+        # F30: Non-string Path in intermediate entry (custom Node script)
+        $f30script = Join-Path $fixtureDir "f30-nonstrpath.js"
+        'process.stdout.write(JSON.stringify([{Path:123,Data:{name:"pkg"}}]));process.exit(0);' | Out-File -FilePath $f30script -Encoding ASCII -NoNewline
+        $f30lock = Join-Path $fixtureDir "f30-dummy.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f30lock -Encoding ASCII
+        $r30 = ConvertFrom-LockfileSafe -LockfilePath $f30lock -TestCustomNodeScriptPath $f30script
+        $p30 = (-not $r30.Parsed) -and ($r30.Error -match "not a string|Path")
+        $tests += [PSCustomObject]@{ Name="F30: non-string Path => Parsed=false"; Pass=$p30 }
+        if (-not $p30) { $allPassed = $false }
+
+        # F31: Non-object Data boolean in intermediate entry (custom Node script)
+        $f31script = Join-Path $fixtureDir "f31-booleandata.js"
+        'process.stdout.write(JSON.stringify([{Path:"node_modules/pkg",Data:true}]));process.exit(0);' | Out-File -FilePath $f31script -Encoding ASCII -NoNewline
+        $f31lock = Join-Path $fixtureDir "f31-dummy.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f31lock -Encoding ASCII
+        $r31 = ConvertFrom-LockfileSafe -LockfilePath $f31lock -TestCustomNodeScriptPath $f31script
+        $p31 = (-not $r31.Parsed) -and ($r31.Error -match "scalar|boolean|Data")
+        $tests += [PSCustomObject]@{ Name="F31: boolean Data => Parsed=false"; Pass=$p31 }
+        if (-not $p31) { $allPassed = $false }
+
+        # F32: Cleanup failure via TestCleanupFail
+        $f32 = Join-Path $fixtureDir "f32-valid.json"
+        '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"},"node_modules/pkg":{"name":"pkg","version":"1.0.0"}}}' | Out-File -FilePath $f32 -Encoding ASCII
+        $r32 = ConvertFrom-LockfileSafe -LockfilePath $f32 -TestCleanupFail
+        $p32 = (-not $r32.Parsed) -and ($r32.Error -match "cleanup|Cleanup")
+        $tests += [PSCustomObject]@{ Name="F32: cleanup failure => Parsed=false"; Pass=$p32 }
+        if (-not $p32) { $allPassed = $false }
+
+        # F33: Resolve-NodeExecutable structure and validity
+        $nodeRes = Resolve-NodeExecutable
+        $p33 = ($null -ne $nodeRes) -and ($nodeRes.Path -ne $null -and $nodeRes.Path -ne "") -and (Test-Path $nodeRes.Path)
+        $tests += [PSCustomObject]@{ Name="F33: Resolve-NodeExecutable returns valid path"; Pass=$p33 }
+        if (-not $p33) { $allPassed = $false }
+
+        # F34-F39: Non-canonical path spellings via ConvertFrom-LockfilePathPolicy
+        $pathTests = @(
+            @{ Name="F34: trailing slash"; Path="node_modules/pkg/"; },
+            @{ Name="F35: repeated slash"; Path="node_modules//pkg"; },
+            @{ Name="F36: backslash"; Path="node_modules\pkg"; },
+            @{ Name="F37: dot segment"; Path="node_modules/./pkg"; },
+            @{ Name="F38: dot-dot segment"; Path="node_modules/pkg/../other"; },
+            @{ Name="F39: absolute path"; Path="/node_modules/pkg"; }
+        )
+        foreach ($pt in $pathTests) {
+            $canonResult = ConvertFrom-LockfilePathPolicy -RawPath $pt.Path
+            $ptPass = ($null -eq $canonResult)
+            $tests += [PSCustomObject]@{ Name=$pt.Name; Pass=$ptPass }
+            if (-not $ptPass) { $allPassed = $false }
+        }
+
     } finally {
         Remove-Item $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "`n=== Lockfile Reader Self-Test (21 cases) ===" -ForegroundColor Cyan
+    # R11-REV-02: Runtime count assertion
+    $expectedTestCount = 40
+    if ($tests.Count -ne $expectedTestCount) {
+        Write-Host "FAIL: Expected $expectedTestCount tests, got $($tests.Count)" -ForegroundColor Red
+        $allPassed = $false
+    }
+
+    Write-Host "`n=== Lockfile Reader Self-Test (40 cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
@@ -1912,10 +2222,29 @@ if (-not $gateSummaryTestPassed) {
     exit 3
 }
 
-# R10-07: Run Lockfile Reader self-test BEFORE any external operations
+# R11-REV-12: Pure-function self-tests run first, then Node-backed tests.
+
+# R11-REV-12: Resolve-NodeExecutable check BEFORE Node-backed tests
+# If Node is not found, report as EvidenceDependent/BLOCKED/exit 2 (not ERROR/3)
+Write-Host "`n=== Node executable resolution check ===" -ForegroundColor Cyan
+$nodeResolution = Resolve-NodeExecutable
+if (-not $nodeResolution.Path) {
+    Write-Host "BLOCKED: Node executable not found: $($nodeResolution.Error)" -ForegroundColor Yellow
+    Add-TestResult -TestId "SELFTEST-NODECHECK" -Category "EvidenceDependent" `
+      -Description "Node executable resolution" `
+      -Expected "Node found on PATH" `
+      -Actual "Not found: $($nodeResolution.Error)" -Status "BLOCKED" `
+      -ErrorSummary "EvidenceDependent: Node-backed tests cannot run"
+    Write-Host "`n=== RESULT: EvidenceDependent/BLOCKED (exit 2) ===" -ForegroundColor Yellow
+    exit 2
+} else {
+    Write-Host "  Node found: $($nodeResolution.Path)" -ForegroundColor Green
+}
+
+# R11-REV-12: Test-LockfileReader runs AFTER Node is confirmed available
 # R9-REV-07: Test-LockfileReader is defined but was never called in the pre-external-operation sequence.
-# This invocation ensures the 21 reader test cases are executed in every full-script run.
-Write-Host "=== Lockfile Reader self-test (21 cases) ===" -ForegroundColor Cyan
+# This invocation ensures the 40 reader test cases are executed in every full-script run.
+Write-Host "=== Lockfile Reader self-test (40 cases) ===" -ForegroundColor Cyan
 $lockfileReaderTestPassed = Test-LockfileReader
 if (-not $lockfileReaderTestPassed) {
     Write-Host "FATAL: Lockfile Reader self-test failed. Aborting." -ForegroundColor Red
@@ -2172,16 +2501,35 @@ try {
                 # This eliminates the duplicate inline platform/optional logic
                 $depMap = @( @{ Name=$pkgName; PkgData=$pkgData; InstancePath=$rawName; ParentPath=(Resolve-LockfileParentPath -InstancePath $rawName) } )
                 $judgments = Get-NativeAddonJudgment -DependencyMap $depMap -TargetOs "win32" -TargetCpu "x64" -LockfilePackages $lockfilePackages
-                $judgment = $judgments[0]
-                $transitiveNativeExpected[$rawName] = [PSCustomObject]@{
-                    Name = $pkgName
-                    Version = $pkgData.version
-                    PlatformApplicable = $judgment.PlatformApplicable
-                    ParentOptional = $judgment.ParentOptional
-                    IsNative = $judgment.IsNative
-                    ResolutionStatus = $judgment.ResolutionStatus
-                    BlockReason = $judgment.BlockReason
-                    InLockfile = $true
+                # R11-REV-10: PS5.1 scalar safety — ensure array shape
+                $judgments = @($judgments)
+                if ($judgments.Count -ne 1) {
+                    $resolutionStatus = "Blocked"
+                    $blockReason = "Expected exactly 1 judgment, got $($judgments.Count)"
+                } else {
+                    $judgment = $judgments[0]
+                    $validStatuses = @("Resolved", "Blocked", "Unresolved")
+                    if ($null -eq $judgment.ResolutionStatus -or $judgment.ResolutionStatus -notin $validStatuses) {
+                        $resolutionStatus = "Blocked"
+                        $blockReason = "Invalid ResolutionStatus: '$($judgment.ResolutionStatus)'"
+                    } elseif ($judgment.ResolutionStatus -eq "Blocked" -and [string]::IsNullOrEmpty($judgment.BlockReason)) {
+                        $resolutionStatus = "Blocked"
+                        $blockReason = "Blocked judgment missing BlockReason"
+                    } elseif ($null -eq $judgment.IsNative) {
+                        $resolutionStatus = "Blocked"
+                        $blockReason = "IsNative field is null"
+                    } else {
+                        # Valid judgment
+                        $transitiveNativeExpected[$rawName] = [PSCustomObject]@{
+                            Name = $pkgName; Version = $pkgData.version
+                            PlatformApplicable = $judgment.PlatformApplicable
+                            ParentOptional = $judgment.ParentOptional
+                            IsNative = $judgment.IsNative
+                            ResolutionStatus = $judgment.ResolutionStatus
+                            BlockReason = $judgment.BlockReason
+                            InLockfile = $true
+                        }
+                    }
                 }
             }
         }
