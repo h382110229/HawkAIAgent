@@ -252,11 +252,11 @@ This section and the static analysis table updated to reflect R6 changes.
 | IdentityBlocked as MandatoryFunctional | PASS |
 | Kill failure as MandatoryFunctional FAIL | PASS |
 | Has Get-NativeAddonJudgment pure function | PASS |
-| Has Test-NativeAddonJudgment self-test (18 cases) | PASS |
+| Has Test-NativeAddonJudgment self-test (22 cases) | PASS |
 | Has Resolve-LockfileParentPath pure function (R6-03) | PASS |
 | Has Test-ResolveLockfileParentPath self-test (4 cases) | PASS |
 | Has Get-NativeGateSummary pure function (R6-04) | PASS |
-| Has Test-NativeGateSummary self-test (7 cases) | PASS |
+| Has Test-NativeGateSummary self-test (15 cases) | PASS |
 | Resolve-LockfileParentPath self-test called before main | PASS |
 | NativeGateSummary self-test called before main | PASS |
 | Per-instance PlatformApplicable init | PASS |
@@ -274,9 +274,69 @@ This section and the static analysis table updated to reflect R6 changes.
 | ResolutionStatus/BlockReason in results | PASS |
 | Lowercase `$pid` | 0 occurrences |
 | Empty catch in lockfile parsing | 0 (removed) |
-| PowerShell parser | PENDING WINDOWS PHASE A |
-| PSScriptAnalyzer | PENDING WINDOWS PHASE A |
-| Aggregation runtime | PENDING WINDOWS PHASE A |
-| Native judgment runtime | PENDING WINDOWS PHASE A |
-| Resolve-LockfileParentPath runtime | PENDING WINDOWS PHASE A |
-| NativeGateSummary runtime | PENDING WINDOWS PHASE A |
+| PowerShell parser | PASS (0 errors, PS 5.1.26100.9168) |
+| PSScriptAnalyzer | PASS (0 Error, 94 Warning, module 1.24.0) |
+| Aggregation runtime | PASS (11/11 cases, isolated AST harness) |
+| Native judgment runtime | PASS (22/22 cases, isolated AST harness) |
+| Resolve-LockfileParentPath runtime | PASS (4/4 cases, isolated AST harness) |
+| NativeGateSummary runtime | PASS (15/15 cases, isolated AST harness) |
+
+---
+
+## 11. R7 Remediation: PowerShell 5.1 Scalar Safety
+
+**Date:** 2026-08-24
+**Trigger:** ChatGPT Phase A review identified that PS 5.1 pipeline unwrapping is a runtime risk, not a test-only artifact. When `Where-Object` returns exactly 1 item, the result is a bare `PSCustomObject` (not an array). Calling `.Count` on it returns `$null`, causing `$null -gt 0` → `False`, which can incorrectly skip FAIL/BLOCKED branches.
+
+### R7-01: Pipeline Collection Normalization
+
+All `Where-Object` results in `Get-NativeGateSummary` and `Get-OverallResult` wrapped with `@()`:
+- `$blockedInstances`, `$resolvedInstances`, `$requiredResolved`, `$optionalOrNaResolved`, `$requiredLoadFailures`, `$requiredLoaded`, `$optionalLoadFailures`
+- `$scriptInternalResults`, `$gateBlocking`, `$hasFail`, `$hasBlocked`
+
+### R7-02: Representation-Agnostic Key Lookup
+
+New `Test-HasKey` pure function: accepts `IDictionary/Hashtable` via `ContainsKey()` and `PSCustomObject` via `PSObject.Properties`. Replaces direct `.PSObject.Properties[$key]` lookups in:
+- `Get-NativeAddonJudgment` optional dependency check (line ~320)
+- `Get-NativeAddonJudgment` native indicator check (line ~278)
+
+`$LockfilePackages` parameter changed from `[hashtable]` to untyped `$LockfilePackages` to accept both representations. Indexer `[$key]` replaced with `.$key` for PSCustomObject compatibility.
+
+### R7-03: Test Fixture Dual Representation
+
+C11-C13 (optionalDependencies lookup) now tested with both:
+- **Hashtable** (`@{ ... }`) — original representation
+- **PSCustomObject** (`ConvertFrom-Json`) — runtime representation from lockfile parsing
+
+Root parent case (ParentPath="") uses `$pkgData.optional` by design (empty string is falsy in `if ($parentPath -and ...)`).
+
+### R7-04: PS 5.1 Regression Test Cases
+
+8 new cases added to `Test-NativeGateSummary` (T8–T15):
+- T8: 0 blocked → PASS
+- T9: bare PSCustomObject blocked → BLOCKED
+- T10: 2 blocked → BLOCKED
+- T11: bare 1 load failure → FAIL
+- T12: bare 1 loaded → PASS
+- T13: 1 FAIL + 1 BLOCKED → BLOCKED (priority)
+- T14: bare optional n/a → Informational PASS
+- T15: bare Unresolved → BLOCKED
+
+### R7-05: Self-Test Results
+
+| Suite | Cases | Result | Exit Code |
+|-------|-------|--------|-----------|
+| Aggregation (Get-OverallResult) | 11 | 11/11 PASS | 0 |
+| Parent Resolver (Resolve-LockfileParentPath) | 4 | 4/4 PASS | 0 |
+| Native Judgment (Get-NativeAddonJudgment) | 22 | 22/22 PASS | 0 |
+| Gate Summary (Get-NativeGateSummary) | 15 | 15/15 PASS | 0 |
+| **Overall** | **52** | **52/52 PASS** | **0** |
+
+**PowerShell version:** 5.1.26100.9168
+**Harness method:** AST-extracted allowlist (no dot-source, no full script execution)
+
+### R7-06: Key Risks Documented
+
+- PS 5.1 single-item pipeline unwrapping is a **runtime risk**, not test-only. Any `Where-Object` returning 0/1 items produces a bare object, not an array. `.Count` on bare `PSCustomObject` returns `$null`.
+- `ConvertFrom-Json` produces `PSCustomObject`, not `Hashtable`. Code using `.ContainsKey()` or `[$key]` indexer on JSON output will fail. `Test-HasKey` and `.$key` property access resolve this.
+- No complete PoC or Harness was executed. Only pure-function isolated self-tests were run.
