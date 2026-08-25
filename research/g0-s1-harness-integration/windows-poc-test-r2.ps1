@@ -1,4 +1,4 @@
-# HawkAIAgent G0-S1-R3-R3-R4 Windows PoC Test Script
+﻿# HawkAIAgent G0-S1-R3-R3-R4 Windows PoC Test Script
 # =================================================
 # SAFETY: No admin required. No system modifications.
 # All operations scoped to $TEST_DIR (precise, known path).
@@ -49,10 +49,6 @@ class AssertionFailure : System.Exception {
 # === Result tracking ===
 $script:TestResults = @()
 $script:ResultsGenerated = $false
-# R12-REV-07: Self-test suite results collector for runtime-derived counts
-$script:SelfTestSuiteResults = @{}
-# R12-REV-04: Test-only judgment provider override (PS 5.1 compatible)
-$script:TestJudgmentProviderOverride = $null
 # R12-REV-07: Self-test suite results collector for runtime-derived counts
 $script:SelfTestSuiteResults = @{}
 # R12-REV-04: Test-only judgment provider override (PS 5.1 compatible)
@@ -576,9 +572,17 @@ try {
 
         # R10-04: Invoke Node.js with SEPARATE stdout and stderr capture
         # R11-REV-07: Use resolved node path instead of bare 'node'
+        # R14-REV-03: Save/restore ErrorActionPreference so PS 5.1 does not convert
+        # native stderr into a terminating exception before Read-BoundedFile can check it.
         $nodeExit = -1
-        & $resolvedNodePath $nodeHelperPath $LockfilePath 1> $stdoutPath 2> $stderrPath
-        $nodeExit = $LASTEXITCODE
+        $savedEAP = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $resolvedNodePath $nodeHelperPath $LockfilePath 1> $stdoutPath 2> $stderrPath
+            $nodeExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedEAP
+        }
 
         # R11-REV-08: Read stderr with bounded file reader (1MB limit)
         $stderrResult = Read-BoundedFile -Path $stderrPath -MaxBytes 1048576 -Label "stderr"
@@ -816,25 +820,71 @@ function Get-NativeAddonJudgment {
     return $results
 }
 
-# R12-REV-05: Shared installed-instance resolution/normalization function.
-# Converts a transitive mapping entry into a gate-ready instance result.
-# Deterministic, no process/filesystem side effects. Used by both Test 6 and F23.
+# R14-REV-01: Shared installed-instance resolution/conversion function.
+# Used by both production Test 6 and F23/F23c/F23d self-tests.
+# Accepts: mapping entry (or $null), exact instance path, installed path/version,
+#          package-json error state, and real load exit/output.
+# Preserves exact identity fields. Never hard-codes a successful load.
+# A missing exact mapping returns structured Blocked with nonempty reason.
 function ConvertFrom-MappingToInstanceResult {
     param(
-        [Parameter(Mandatory=$true)]$MappingEntry,
-        [Parameter(Mandatory=$true)][string]$InstancePath
+        $MappingEntry,                                          # $null or mapping object from ConvertFrom-TransitiveMapping
+        [Parameter(Mandatory=$true)][string]$InstancePath,      # normalized lockfile instance path
+        [string]$InstalledPath = "",                            # real filesystem path to installed package
+        [string]$Version = "unknown",                           # version from installed package.json
+        [string]$PackageJsonError = "",                         # nonempty if package.json missing/parse failure
+        [int]$LoadExit = -1,                                    # real require() exit code
+        [string]$LoadOutput = ""                                # real require() output
     )
 
+    # Step 1: Determine mapping-based resolution status
+    $resolutionStatus = "Resolved"
+    $blockReason = ""
+
+    if ($null -eq $MappingEntry) {
+        $resolutionStatus = "Blocked"
+        $blockReason = "No lockfile mapping for $InstancePath"
+    } else {
+        $resolutionStatus = $MappingEntry.ResolutionStatus
+        $blockReason = $MappingEntry.BlockReason
+    }
+
+    # Step 2: Package.json error overrides only when mapping was Resolved
+    if ($PackageJsonError -and $resolutionStatus -eq "Resolved") {
+        $resolutionStatus = "Blocked"
+        $blockReason = $PackageJsonError
+    }
+
+    # Step 3: Extract mapping fields (safe when $MappingEntry is $null)
+    $platformApplicable = $false
+    $parentOptional = $false
+    $isNative = $false
+    if ($null -ne $MappingEntry) {
+        $platformApplicable = $MappingEntry.PlatformApplicable
+        $parentOptional = $MappingEntry.ParentOptional
+        $isNative = $MappingEntry.IsNative
+    }
+
+    # Step 4: Build result with exact identity fields and real load evidence
+    $name = ""
+    if ($null -ne $MappingEntry -and $MappingEntry.Name) {
+        $name = $MappingEntry.Name
+    } elseif ($InstancePath -match "node_modules/(?:@[^/]+/)?([^/]+)$") {
+        $name = $Matches[1]
+    }
+
     return [PSCustomObject]@{
-        Name = $MappingEntry.Name
-        Version = $MappingEntry.Version
-        ResolutionStatus = $MappingEntry.ResolutionStatus
-        BlockReason = $MappingEntry.BlockReason
-        PlatformApplicable = $MappingEntry.PlatformApplicable
-        ParentOptional = $MappingEntry.ParentOptional
-        IsNative = $MappingEntry.IsNative
-        LoadExit = 0
-        LoadOutput = ""
+        Name = $name
+        Version = $Version
+        ResolutionStatus = $resolutionStatus
+        BlockReason = $blockReason
+        PlatformApplicable = $platformApplicable
+        ParentOptional = $parentOptional
+        IsNative = $isNative
+        InstancePath = $InstancePath
+        Path = $InstalledPath
+        LoadExit = $LoadExit
+        LoadOutput = $LoadOutput
     }
 }
 
@@ -867,6 +917,8 @@ function ConvertFrom-TransitiveMapping {
 
     $transitiveMap = @{}
     foreach ($rawName in @($lockfilePackages.Keys)) {
+        # R14-REV-05: Reset provider exception per candidate to prevent cross-candidate contamination
+        $providerException = $null
         $pkgData = $lockfilePackages[$rawName]
         # Extract the actual package name from the last node_modules segment
         if ($rawName -match 'node_modules[/\\]([^/\\]+)$') {
@@ -934,8 +986,12 @@ function ConvertFrom-TransitiveMapping {
                 $blockReason = "IsNative is not true (value: $($judgment.IsNative))"
             } elseif ($null -eq $judgment.PlatformApplicable) {
                 $blockReason = "PlatformApplicable is null"
+            } elseif ($judgment.PlatformApplicable -isnot [bool]) {
+                $blockReason = "PlatformApplicable is not Boolean (type: $($judgment.PlatformApplicable.GetType().Name))"
             } elseif ($null -eq $judgment.ParentOptional) {
                 $blockReason = "ParentOptional is null"
+            } elseif ($judgment.ParentOptional -isnot [bool]) {
+                $blockReason = "ParentOptional is not Boolean (type: $($judgment.ParentOptional.GetType().Name))"
             }
 
             if ($blockReason -ne "") {
@@ -1166,7 +1222,8 @@ function Test-NativeAddonJudgment {
     }
     # R12-REV-07: Record suite counts
     $passedJudgCount = @($tests | Where-Object { $_.Pass }).Count
-    $script:SelfTestSuiteResults['NativeJudgment'] = @{ Declared=$expectedJudgmentCount; Actual=$tests.Count; Passed=$passedJudgCount }
+    $failedJudgCount = @($tests | Where-Object { -not $_.Pass }).Count
+    $script:SelfTestSuiteResults['NativeJudgment'] = @{ Declared=$expectedJudgmentCount; Actual=$tests.Count; Passed=$passedJudgCount; Failed=$failedJudgCount }
 
     Write-Host "`n=== Native Judgment Self-Test (24 cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -1542,9 +1599,8 @@ function Test-LockfileReader {
         $tests += [PSCustomObject]@{ Name="F22: root-only zero-dep scalar-safe"; Pass=$p22 }
         if (-not $p22) { $allPassed = $false }
 
-        # F23: R12-REV-05: Integration — real shared path: reader → mapping → shared function → gate
-        # Fixture: native dep with os=[linux] => not applicable on win32
-        # Uses ConvertFrom-MappingToInstanceResult (shared with Test 6)
+        # F23: R14-REV-01: Integration — real shared path: reader → mapping → shared function → gate
+        # Uses ConvertFrom-MappingToInstanceResult (same function as production Test 6)
         $f23 = Join-Path $fixtureDir "f23-native-linux.json"
         @'
 {
@@ -1559,40 +1615,103 @@ function Test-LockfileReader {
         $r23lock = ConvertFrom-LockfileSafe -LockfilePath $f23
         $p23 = $false
         $p23b = $false
+        $r23mapKey = ""
         if ($r23lock.Parsed) {
-            # Step 2: Call ConvertFrom-TransitiveMapping with the real shared path
             $r23mapping = ConvertFrom-TransitiveMapping -LockfilePackages $r23lock.Packages -NativeDepsToCheck @("native-linux") -TargetOs "win32" -TargetCpu "x64"
-            # Step 3: Use shared ConvertFrom-MappingToInstanceResult (same as Test 6)
             $r23instances = @()
             foreach ($mapKey in @($r23mapping.Keys)) {
-                $r23instances += ConvertFrom-MappingToInstanceResult -MappingEntry $r23mapping[$mapKey] -InstancePath $mapKey
+                $r23mapKey = $mapKey
+                $r23instances += ConvertFrom-MappingToInstanceResult `
+                    -MappingEntry $r23mapping[$mapKey] `
+                    -InstancePath $mapKey `
+                    -InstalledPath "C:\fake\node_modules\native-linux" `
+                    -Version "1.0.0" `
+                    -LoadExit 0 `
+                    -LoadOutput ""
             }
-            # Step 4: Call Get-NativeGateSummary with the real results
             $r23gate = Get-NativeGateSummary -InstanceResults $r23instances -LockfileParsed $true
-            # Step 5: Assert EXACT expected status for platform-not-applicable case
-            # native-linux with os=[linux] on win32 => PlatformApplicable=false, not optional
-            # => all optional/platform-n/a => Informational PASS
             $p23 = ($r23gate.Status -eq "PASS") -and ($r23gate.Category -eq "Informational") -and ($r23instances.Count -eq 1)
-            # Step 6: Verify exact instance fields (no dependency-name fallback)
+            # R14-REV-01: Verify exact InstancePath, Path, resolution fields, and load evidence
             $p23b = ($r23instances[0].Name -eq "native-linux") -and
+                    ($r23instances[0].InstancePath -eq "node_modules/native-linux") -and
+                    ($r23instances[0].Path -eq "C:\fake\node_modules\native-linux") -and
                     ($r23instances[0].ResolutionStatus -eq "Resolved") -and
                     ($r23instances[0].PlatformApplicable -eq $false) -and
-                    ($r23instances[0].IsNative -eq $true)
+                    ($r23instances[0].IsNative -eq $true) -and
+                    ($r23instances[0].LoadExit -eq 0) -and
+                    ($r23instances[0].Version -eq "1.0.0")
         }
         $tests += [PSCustomObject]@{ Name="F23: exact status PASS/Informational for platform-n/a"; Pass=$p23 }
         if (-not $p23) { $allPassed = $false }
-        $tests += [PSCustomObject]@{ Name="F23b: exact instance fields (no fallback)"; Pass=$p23b }
+        $tests += [PSCustomObject]@{ Name="F23b: exact InstancePath+Path+resolution+load evidence"; Pass=$p23b }
         if (-not $p23b) { $allPassed = $false }
 
-        # F23c: R12-REV-05: No-match case — dep not in lockfile => no mapping entry
+        # F23c: R14-REV-01: No-match case — dep not in lockfile => shared function returns BLOCKED
         $f23cLock = ConvertFrom-LockfileSafe -LockfilePath $f23
         $p23c = $false
+        $p23c_gate = $false
         if ($f23cLock.Parsed) {
             $r23cmap = ConvertFrom-TransitiveMapping -LockfilePackages $f23cLock.Packages -NativeDepsToCheck @("nonexistent-dep")
-            $p23c = ($r23cmap.Count -eq 0)
+            # Mapping is empty for nonexistent dep — call shared function with $null MappingEntry
+            $r23cResult = ConvertFrom-MappingToInstanceResult `
+                -MappingEntry $null `
+                -InstancePath "node_modules/nonexistent-dep" `
+                -InstalledPath "" `
+                -Version "unknown" `
+                -LoadExit -1 `
+                -LoadOutput ""
+            $p23c = ($r23cResult.ResolutionStatus -eq "Blocked") -and
+                    ($r23cResult.BlockReason -match "No lockfile mapping") -and
+                    ($r23cResult.InstancePath -eq "node_modules/nonexistent-dep") -and
+                    ($r23cResult.LoadExit -eq -1)
+            # Assert gate outcome via Get-NativeGateSummary
+            $r23cGate = Get-NativeGateSummary -InstanceResults @($r23cResult) -LockfileParsed $true
+            $p23c_gate = ($r23cGate.Status -eq "BLOCKED") -and ($r23cGate.Category -eq "EvidenceDependent")
         }
-        $tests += [PSCustomObject]@{ Name="F23c: no-match dep => empty mapping (no fallback)"; Pass=$p23c }
+        $tests += [PSCustomObject]@{ Name="F23c: no-match => structured BLOCKED via shared function"; Pass=$p23c }
         if (-not $p23c) { $allPassed = $false }
+        $tests += [PSCustomObject]@{ Name="F23c-gate: BLOCKED gate outcome"; Pass=$p23c_gate }
+        if (-not $p23c_gate) { $allPassed = $false }
+
+        # F23d: R14-REV-01: Same-name/different-instance isolation via shared function
+        $f23d = Join-Path $fixtureDir "f23d-samename.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/a/node_modules/shared": { "name": "shared", "version": "1.0.0", "gypfile": true, "os": ["linux"] },
+    "node_modules/b/node_modules/shared": { "name": "shared", "version": "2.0.0", "gypfile": true }
+  }
+}
+'@ | Out-File -FilePath $f23d -Encoding ASCII
+        $r23dlock = ConvertFrom-LockfileSafe -LockfilePath $f23d
+        $p23d = $false
+        if ($r23dlock.Parsed) {
+            $r23dmapping = ConvertFrom-TransitiveMapping -LockfilePackages $r23dlock.Packages -NativeDepsToCheck @("shared") -TargetOs "win32" -TargetCpu "x64"
+            $r23d_a = ConvertFrom-MappingToInstanceResult `
+                -MappingEntry $r23dmapping["node_modules/a/node_modules/shared"] `
+                -InstancePath "node_modules/a/node_modules/shared" `
+                -InstalledPath "C:\fake\a\node_modules\shared" `
+                -Version "1.0.0" -LoadExit 0 -LoadOutput ""
+            $r23d_b = ConvertFrom-MappingToInstanceResult `
+                -MappingEntry $r23dmapping["node_modules/b/node_modules/shared"] `
+                -InstancePath "node_modules/b/node_modules/shared" `
+                -InstalledPath "C:\fake\b\node_modules\shared" `
+                -Version "2.0.0" -LoadExit 0 -LoadOutput ""
+            $p23d = ($r23d_a.Name -eq "shared") -and ($r23d_b.Name -eq "shared") -and
+                    ($r23d_a.InstancePath -eq "node_modules/a/node_modules/shared") -and
+                    ($r23d_b.InstancePath -eq "node_modules/b/node_modules/shared") -and
+                    ($r23d_a.Path -eq "C:\fake\a\node_modules\shared") -and
+                    ($r23d_b.Path -eq "C:\fake\b\node_modules\shared") -and
+                    ($r23d_a.Version -eq "1.0.0") -and ($r23d_b.Version -eq "2.0.0") -and
+                    ($r23d_a.PlatformApplicable -eq $false) -and
+                    ($r23d_b.PlatformApplicable -eq $true) -and
+                    ($r23d_a.ResolutionStatus -eq "Resolved") -and ($r23d_b.ResolutionStatus -eq "Resolved")
+        }
+        $tests += [PSCustomObject]@{ Name="F23d: same-name/different-instance exact-path isolation"; Pass=$p23d }
+        if (-not $p23d) { $allPassed = $false }
 
         # F24: Test 4 parser failure + otherwise-passing => overall BLOCKED/exit 2
         # Simulate: parser failure (EvidenceDependent/BLOCKED), other gate-blocking PASS
@@ -1656,9 +1775,14 @@ process.exit(1);
         $f28lock = Join-Path $fixtureDir "f28-dummy.json"
         '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f28lock -Encoding ASCII
         $r28 = ConvertFrom-LockfileSafe -LockfilePath $f28lock -TestCustomNodeScriptPath $f28script
-        # R12-REV-06: Assert the EXPLICIT bounded-stderr/size-limit branch
-        # The error must indicate size exceeded or stderr diagnostic, be bounded, and Parsed=false
-        $p28 = (-not $r28.Parsed) -and ($r28.Error.Length -lt 2000) -and ($r28.Error -ne "") -and ($r28.Error -match "exceeds|Stderr diagnostic|cleanup|exception")
+        # R14-REV-03: Assert the explicit Read-BoundedFile stderr size-limit branch
+        # With ErrorActionPreference saved/restored around Node invocation,
+        # Read-BoundedFile is deterministically reached for oversized stderr.
+        $r28_error = $r28.Error
+        $p28 = (-not $r28.Parsed) -and ($r28_error.Length -lt 2000) -and ($r28_error -ne "") -and
+               ($r28_error -match "^Stderr diagnostic:.*exceeds maximum size") -and
+               ($r28_error -notmatch "cleanup|Cleanup") -and
+               ($r28_error -notmatch "^Lockfile reader exception:")
         $tests += [PSCustomObject]@{ Name="F28: oversized stderr => bounded size-limit diagnostic"; Pass=$p28 }
         if (-not $p28) { $allPassed = $false }
 
@@ -1679,21 +1803,24 @@ process.exit(1);
         $tests += [PSCustomObject]@{ Name="F29: oversized input (100B limit) => Parsed=false"; Pass=$p29 }
         if (-not $p29) { $allPassed = $false }
 
-        # F29b: R12-REV-06: Exercise Node's independent 50 MiB input-size rejection
-        # Create a sparse file >50 MiB (minimal disk impact) to test Node's statSync check
+        # F29b: R14-REV-02: Exercise Node's independent 50 MiB input-size rejection
+        # In self-test mode, raise PS-side limit above fixture size so Node's check fires first
         $f29b = Join-Path $fixtureDir "f29b-sparse-big.json"
         try {
             # Create sparse file with reported size >50 MiB
             $fs = [System.IO.File]::Create($f29b)
             $fs.SetLength(52428801)  # 50 MiB + 1 byte
             $fs.Close()
-            $f29block = Join-Path $fixtureDir "f29b-dummy.json"
-            '{"name":"test","lockfileVersion":3,"packages":{"":{"name":"test","version":"1.0.0"}}}' | Out-File -FilePath $f29block -Encoding ASCII
-            # Node's statSync check fires BEFORE reading, so this should fail with size error
-            $r29b = ConvertFrom-LockfileSafe -LockfilePath $f29b
-            $p29b = (-not $r29b.Parsed) -and ($r29b.Error -match "exceeds|size|50MB")
+            # R14-REV-02: Use TestMaxInputBytes to raise PS limit above fixture; Node stays at 50 MiB
+            $r29b = ConvertFrom-LockfileSafe -LockfilePath $f29b -TestMaxInputBytes 62914560
+            # Must be the Node-side diagnostic, not the PS pre-check
+            $p29b_node = (-not $r29b.Parsed) -and ($r29b.Error -match "input exceeds 50MB")
+            $p29b_notPS = ($r29b.Error -notmatch "exceeds maximum input size")
+            $p29b = $p29b_node -and $p29b_notPS
         } catch {
             $p29b = $false
+            $p29b_node = $false
+            $p29b_notPS = $false
         } finally {
             Remove-Item $f29b -Force -ErrorAction SilentlyContinue
         }
@@ -1949,6 +2076,97 @@ process.exit(1);
             if (-not $ipPass) { $allPassed = $false }
         }
 
+        # === R14-REV-04: Paired Node/PS grammar tests via ConvertFrom-LockfileSafe ===
+        # These exercise the real Node helper (not TestCustomNodeScriptPath) for path grammar.
+
+        # F-IG1: Valid grammar fixture — root, unscoped, scoped, nested, scoped-nested, deeply nested, same-name
+        $fIG1 = Join-Path $fixtureDir "fIG1-valid-grammar.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/pkg": { "name": "pkg", "version": "1.0.0" },
+    "node_modules/@scope/pkg": { "name": "pkg", "version": "2.0.0" },
+    "node_modules/a/node_modules/b": { "name": "b", "version": "1.0.0" },
+    "node_modules/@scope/a/node_modules/@scope2/b": { "name": "b", "version": "1.0.0" },
+    "node_modules/a/node_modules/b/node_modules/c": { "name": "c", "version": "1.0.0" },
+    "node_modules/x/node_modules/shared": { "name": "shared", "version": "1.0.0" },
+    "node_modules/y/node_modules/shared": { "name": "shared", "version": "2.0.0" }
+  }
+}
+'@ | Out-File -FilePath $fIG1 -Encoding ASCII
+        $rIG1 = ConvertFrom-LockfileSafe -LockfilePath $fIG1
+        $pIG1 = $rIG1.Parsed -and ($rIG1.Packages.Count -eq 8) -and
+                $rIG1.Packages.ContainsKey("") -and
+                $rIG1.Packages.ContainsKey("node_modules/pkg") -and
+                $rIG1.Packages.ContainsKey("node_modules/@scope/pkg") -and
+                $rIG1.Packages.ContainsKey("node_modules/a/node_modules/b") -and
+                $rIG1.Packages.ContainsKey("node_modules/@scope/a/node_modules/@scope2/b") -and
+                $rIG1.Packages.ContainsKey("node_modules/a/node_modules/b/node_modules/c") -and
+                $rIG1.Packages.ContainsKey("node_modules/x/node_modules/shared") -and
+                $rIG1.Packages.ContainsKey("node_modules/y/node_modules/shared")
+        $tests += [PSCustomObject]@{ Name="F-IG1: valid grammar (root+unscoped+scoped+nested+deep+same-name)"; Pass=$pIG1 }
+        if (-not $pIG1) { $allPassed = $false }
+
+        # F-IG2: Arbitrary suffix at depth (node_modules/a/node_modules/b/trailing)
+        $fIG2 = Join-Path $fixtureDir "fIG2-arbitrary-suffix-depth.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/a/node_modules/b/trailing": { "name": "b", "version": "1.0.0" }
+  }
+}
+'@ | Out-File -FilePath $fIG2 -Encoding ASCII
+        $rIG2 = ConvertFrom-LockfileSafe -LockfilePath $fIG2
+        $pIG2 = (-not $rIG2.Parsed) -and ($rIG2.Error -match "non-canonical|reject|policy")
+        $tests += [PSCustomObject]@{ Name="F-IG2: arbitrary suffix at depth => rejected"; Pass=$pIG2 }
+        if (-not $pIG2) { $allPassed = $false }
+
+        # F-IG3: Incomplete scope at depth (node_modules/a/node_modules/@scope)
+        $fIG3 = Join-Path $fixtureDir "fIG3-incomplete-scope-depth.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/a/node_modules/@scope": { "name": "scope", "version": "1.0.0" }
+  }
+}
+'@ | Out-File -FilePath $fIG3 -Encoding ASCII
+        $rIG3 = ConvertFrom-LockfileSafe -LockfilePath $fIG3
+        $pIG3 = (-not $rIG3.Parsed) -and ($rIG3.Error -match "non-canonical|reject|policy")
+        $tests += [PSCustomObject]@{ Name="F-IG3: incomplete scope at depth => rejected"; Pass=$pIG3 }
+        if (-not $pIG3) { $allPassed = $false }
+
+        # F-IG4: Trailing after deeply nested (node_modules/a/node_modules/b/trailing)
+        # Same as F-IG2 but verifies PS and Node agree
+        $pIG4 = ($null -eq (ConvertFrom-LockfilePathPolicy -RawPath "node_modules/a/node_modules/b/trailing"))
+        $tests += [PSCustomObject]@{ Name="F-IG4: PS grammar matches Node for trailing at depth"; Pass=$pIG4 }
+        if (-not $pIG4) { $allPassed = $false }
+
+        # F-IG5: Double scope (node_modules/@scope/@scope2/pkg)
+        $fIG5 = Join-Path $fixtureDir "fIG5-double-scope.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/@scope/@scope2/pkg": { "name": "pkg", "version": "1.0.0" }
+  }
+}
+'@ | Out-File -FilePath $fIG5 -Encoding ASCII
+        $rIG5 = ConvertFrom-LockfileSafe -LockfilePath $fIG5
+        $pIG5 = (-not $rIG5.Parsed) -and ($rIG5.Error -match "non-canonical|reject|policy")
+        $tests += [PSCustomObject]@{ Name="F-IG5: double scope => rejected by Node"; Pass=$pIG5 }
+        if (-not $pIG5) { $allPassed = $false }
+
         # === R12-REV-10: ConvertFrom-TransitiveMapping judgment count tests ===
 
         # F45: 0 matching deps — mapping should be empty
@@ -2181,16 +2399,220 @@ process.exit(1);
         $tests += [PSCustomObject]@{ Name="F-JC7: null ParentOptional => blocked entry"; Pass=$pJC7 }
         if (-not $pJC7) { $allPassed = $false }
 
+        # === R14-REV-05: Expanded judgment validation and cross-candidate isolation ===
+
+        # F-JC8: Provider exception => exact-path structured Blocked entry
+        $fJC8map = $null
+        if ($r46lock.Parsed) {
+            try {
+                $script:TestJudgmentProviderOverride = { param($dm, $os, $cpu, $lp) throw "TEST: simulated provider crash" }
+                $fJC8map = ConvertFrom-TransitiveMapping -LockfilePackages $r46lock.Packages -NativeDepsToCheck @("native-pkg")
+            } finally { $script:TestJudgmentProviderOverride = $null }
+        }
+        $pJC8 = $false
+        if ($fJC8map -and $fJC8map.ContainsKey("node_modules/native-pkg")) {
+            $entry = $fJC8map["node_modules/native-pkg"]
+            $pJC8 = ($entry.ResolutionStatus -eq "Blocked") -and
+                    ($entry.BlockReason -match "Judgment provider exception") -and
+                    ($entry.BlockReason -match "simulated provider crash")
+        }
+        $tests += [PSCustomObject]@{ Name="F-JC8: provider exception => exact-path Blocked entry"; Pass=$pJC8 }
+        if (-not $pJC8) { $allPassed = $false }
+
+        # F-JC9: Cross-candidate isolation — first throws, second succeeds
+        $fJC9 = Join-Path $fixtureDir "fJC9-two-deps.json"
+        @'
+{
+  "name": "test",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "test", "version": "1.0.0" },
+    "node_modules/native-a": { "name": "native-a", "version": "1.0.0", "gypfile": true },
+    "node_modules/native-b": { "name": "native-b", "version": "2.0.0", "gypfile": true }
+  }
+}
+'@ | Out-File -FilePath $fJC9 -Encoding ASCII
+        $rJC9lock = ConvertFrom-LockfileSafe -LockfilePath $fJC9
+        $pJC9 = $false
+        if ($rJC9lock.Parsed) {
+            try {
+                $script:TestJudgmentProviderOverride = {
+                    param($dm, $os, $cpu, $lp)
+                    $name = $dm[0].Name
+                    if ($name -eq "native-a") { throw "TEST: native-a crashes" }
+                    # native-b succeeds
+                    return @([PSCustomObject]@{ Name=$name; IsNative=$true; PlatformApplicable=$true; ParentOptional=$false; ResolutionStatus="Resolved"; BlockReason="" })
+                }
+                $fJC9map = ConvertFrom-TransitiveMapping -LockfilePackages $rJC9lock.Packages -NativeDepsToCheck @("native-a", "native-b")
+            } finally { $script:TestJudgmentProviderOverride = $null }
+            if ($fJC9map) {
+                $aEntry = $fJC9map["node_modules/native-a"]
+                $bEntry = $fJC9map["node_modules/native-b"]
+                $pJC9 = ($null -ne $aEntry) -and ($null -ne $bEntry) -and
+                        ($aEntry.ResolutionStatus -eq "Blocked") -and
+                        ($aEntry.BlockReason -match "native-a crashes") -and
+                        ($bEntry.ResolutionStatus -eq "Resolved") -and
+                        ($bEntry.IsNative -eq $true)
+            }
+        }
+        $tests += [PSCustomObject]@{ Name="F-JC9: cross-candidate isolation (1st throws, 2nd succeeds)"; Pass=$pJC9 }
+        if (-not $pJC9) { $allPassed = $false }
+
+        # F-JC10: Blocked with missing/empty BlockReason
+        $fJC10map = $null
+        if ($r46lock.Parsed) {
+            try {
+                $script:TestJudgmentProviderOverride = { param($dm, $os, $cpu, $lp)
+                    return @([PSCustomObject]@{ Name="native-pkg"; IsNative=$true; PlatformApplicable=$true; ParentOptional=$false; ResolutionStatus="Blocked"; BlockReason="" })
+                }
+                $fJC10map = ConvertFrom-TransitiveMapping -LockfilePackages $r46lock.Packages -NativeDepsToCheck @("native-pkg")
+            } finally { $script:TestJudgmentProviderOverride = $null }
+        }
+        $pJC10 = $false
+        if ($fJC10map -and $fJC10map.ContainsKey("node_modules/native-pkg")) {
+            $pJC10 = ($fJC10map["node_modules/native-pkg"].ResolutionStatus -eq "Blocked") -and
+                     ($fJC10map["node_modules/native-pkg"].BlockReason -match "BlockReason")
+        }
+        $tests += [PSCustomObject]@{ Name="F-JC10: Blocked with empty BlockReason => caught"; Pass=$pJC10 }
+        if (-not $pJC10) { $allPassed = $false }
+
+        # F-JC11: null/missing ResolutionStatus
+        $fJC11map = $null
+        if ($r46lock.Parsed) {
+            try {
+                $script:TestJudgmentProviderOverride = { param($dm, $os, $cpu, $lp)
+                    return @([PSCustomObject]@{ Name="native-pkg"; IsNative=$true; PlatformApplicable=$true; ParentOptional=$false; ResolutionStatus=$null; BlockReason="" })
+                }
+                $fJC11map = ConvertFrom-TransitiveMapping -LockfilePackages $r46lock.Packages -NativeDepsToCheck @("native-pkg")
+            } finally { $script:TestJudgmentProviderOverride = $null }
+        }
+        $pJC11 = $false
+        if ($fJC11map -and $fJC11map.ContainsKey("node_modules/native-pkg")) {
+            $pJC11 = ($fJC11map["node_modules/native-pkg"].ResolutionStatus -eq "Blocked") -and
+                     ($fJC11map["node_modules/native-pkg"].BlockReason -match "ResolutionStatus")
+        }
+        $tests += [PSCustomObject]@{ Name="F-JC11: null ResolutionStatus => blocked"; Pass=$pJC11 }
+        if (-not $pJC11) { $allPassed = $false }
+
+        # F-JC12: Non-Boolean PlatformApplicable
+        $fJC12map = $null
+        if ($r46lock.Parsed) {
+            try {
+                $script:TestJudgmentProviderOverride = { param($dm, $os, $cpu, $lp)
+                    return @([PSCustomObject]@{ Name="native-pkg"; IsNative=$true; PlatformApplicable="yes"; ParentOptional=$false; ResolutionStatus="Resolved"; BlockReason="" })
+                }
+                $fJC12map = ConvertFrom-TransitiveMapping -LockfilePackages $r46lock.Packages -NativeDepsToCheck @("native-pkg")
+            } finally { $script:TestJudgmentProviderOverride = $null }
+        }
+        $pJC12 = $false
+        if ($fJC12map -and $fJC12map.ContainsKey("node_modules/native-pkg")) {
+            $pJC12 = ($fJC12map["node_modules/native-pkg"].ResolutionStatus -eq "Blocked") -and
+                     ($fJC12map["node_modules/native-pkg"].BlockReason -match "PlatformApplicable.*not Boolean|Boolean")
+        }
+        $tests += [PSCustomObject]@{ Name="F-JC12: non-Boolean PlatformApplicable => blocked"; Pass=$pJC12 }
+        if (-not $pJC12) { $allPassed = $false }
+
+        # F-JC13: Non-Boolean ParentOptional
+        $fJC13map = $null
+        if ($r46lock.Parsed) {
+            try {
+                $script:TestJudgmentProviderOverride = { param($dm, $os, $cpu, $lp)
+                    return @([PSCustomObject]@{ Name="native-pkg"; IsNative=$true; PlatformApplicable=$true; ParentOptional=1; ResolutionStatus="Resolved"; BlockReason="" })
+                }
+                $fJC13map = ConvertFrom-TransitiveMapping -LockfilePackages $r46lock.Packages -NativeDepsToCheck @("native-pkg")
+            } finally { $script:TestJudgmentProviderOverride = $null }
+        }
+        $pJC13 = $false
+        if ($fJC13map -and $fJC13map.ContainsKey("node_modules/native-pkg")) {
+            $pJC13 = ($fJC13map["node_modules/native-pkg"].ResolutionStatus -eq "Blocked") -and
+                     ($fJC13map["node_modules/native-pkg"].BlockReason -match "ParentOptional.*not Boolean|Boolean")
+        }
+        $tests += [PSCustomObject]@{ Name="F-JC13: non-Boolean ParentOptional => blocked"; Pass=$pJC13 }
+        if (-not $pJC13) { $allPassed = $false }
+
     } finally {
         Remove-Item $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # R11-REV-02: Runtime count assertion
-    # R12-REV-07: Runtime-derived count (not hardcoded)
-    $expectedTestCount = $tests.Count
-    # R12-REV-07: Record suite counts
+    # R14-REV-06: Independent declared manifest — compare actual test names to expected list
+    # This catches accidentally removed or duplicated test cases
+    $testNames = @($tests | ForEach-Object { $_.Name })
+    $uniqueNames = @($testNames | Select-Object -Unique)
+    $hasDuplicates = ($uniqueNames.Count -ne $testNames.Count)
+
+    # R14-REV-06: Manifest of all expected test names for LockfileReader suite
+    $manifest = @(
+        "F1: root key + optdep + required", "F2: nested dependency", "F3: scoped parent",
+        "F4: same-name different paths", "F5: malformed JSON => Parsed=false",
+        "F6: missing packages => Parsed=false", "F7: missing file => Parsed=false",
+        "F8: root optDep via reader => ParentOptional", "F9: nested optDep via reader => ParentOptional",
+        "F10: canonical collision => Parsed=false", "F11: non-obj packages => Parsed=false with exit evidence",
+        "F12: empty packages => Parsed=true, 0 entries", "F12b: packages=null => Parsed=false",
+        "F13: packages=array => Parsed=false", "F14: packages=string => Parsed=false",
+        "F15: packages=number => Parsed=false", "F16: package Data=null => Parsed=false",
+        "F17: package Data=array => Parsed=false", "F18: package Data=string => Parsed=false",
+        "F19: package Data=number => Parsed=false", "F20: diverse paths all pass (8 entries)",
+        "F21: one-entry collection scalar-safe", "F22: root-only zero-dep scalar-safe",
+        "F23: exact status PASS/Informational for platform-n/a",
+        "F23b: exact InstancePath+Path+resolution+load evidence",
+        "F23c: no-match => structured BLOCKED via shared function", "F23c-gate: BLOCKED gate outcome",
+        "F23d: same-name/different-instance exact-path isolation",
+        "F24: parser fail + others PASS => overall BLOCKED",
+        "F25: exit 0 + empty stdout => Parsed=false", "F26: exit 0 + stderr => Parsed=false",
+        "F27: oversized stdout => Parsed=false", "F28: oversized stderr => bounded size-limit diagnostic",
+        "F29: oversized input (100B limit) => Parsed=false", "F29b: Node-side 50MiB sparse file => rejected",
+        "F29c: malformed intermediate JSON => Parsed=false",
+        "F30: non-string Path => Parsed=false", "F31: boolean Data => Parsed=false",
+        "F32: cleanup failure => Parsed=false", "F32b: owned helper dir recovered",
+        "F32c: sentinel dir preserved (no wildcard delete)",
+        "F33: Resolve-NodeExecutable returns valid path", "F33b: Resolve-NodeExecutable Error empty on success",
+        "F-NC1: no candidates => blocked", "F-NC2: nonexistent path => blocked",
+        "F-NC3: directory path => blocked", "F-NC4: multiple Applications => blocked",
+        "F-NC5: alias+app => blocked (alias shadows)", "F-NC6: function only => blocked",
+        "F-NC7: cmdlet only => blocked", "F-NC8: script+app => blocked (script shadows)",
+        "F-NC9: single valid Application => accepted",
+        "F34: trailing slash", "F35: repeated slash", "F36: backslash",
+        "F37: dot segment", "F38: dot-dot segment", "F39: absolute path",
+        "F40: terminal dot (/.", "F41: terminal dot-dot (/..)",
+        "F42: incomplete scope (@scope no pkg)", "F43: drive letter path (C:/...)",
+        "F44: control char in path (0x01)",
+        "F-GV1: root (empty string)", "F-GV2: unscoped pkg", "F-GV3: scoped pkg",
+        "F-GV4: nested pkg", "F-GV5: scoped-nested", "F-GV6: deeply nested",
+        "F-GV7: same-name instances", "F-GV8: space in name",
+        "F-GI1: arbitrary suffix", "F-GI2: arbitrary suffix after scoped",
+        "F-GI3: incomplete scope at depth", "F-GI4: bare node_modules/",
+        "F-GI5: nested bare node_modules/", "F-GI6: trailing after deep nested",
+        "F-GI7: scoped without pkg at root", "F-GI8: double scope",
+        "F-IG1: valid grammar (root+unscoped+scoped+nested+deep+same-name)",
+        "F-IG2: arbitrary suffix at depth => rejected", "F-IG3: incomplete scope at depth => rejected",
+        "F-IG4: PS grammar matches Node for trailing at depth", "F-IG5: double scope => rejected by Node",
+        "F45: 0 matching deps => empty mapping", "F46: 1 matching dep => 1-entry mapping",
+        "F47: N matching deps => multi-entry mapping", "F48: IsNative=false => blocked or absent",
+        "F48b: IsNative=false => blocked entry with reason (fail-closed)",
+        "F-JC1: 0 judgments => blocked entry", "F-JC2: N judgments (2) => blocked entry",
+        "F-JC3: null Name => blocked entry", "F-JC4: invalid ResolutionStatus => blocked entry",
+        "F-JC5: null IsNative => blocked entry", "F-JC6: null PlatformApplicable => blocked entry",
+        "F-JC7: null ParentOptional => blocked entry",
+        "F-JC8: provider exception => exact-path Blocked entry",
+        "F-JC9: cross-candidate isolation (1st throws, 2nd succeeds)",
+        "F-JC10: Blocked with empty BlockReason => caught",
+        "F-JC11: null ResolutionStatus => blocked",
+        "F-JC12: non-Boolean PlatformApplicable => blocked",
+        "F-JC13: non-Boolean ParentOptional => blocked"
+    )
+    $manifestCount = $manifest.Count
+
+    $manifestMatch = ($manifestCount -eq $tests.Count) -and (-not $hasDuplicates)
+    if (-not $manifestMatch) {
+        $allPassed = $false
+        Write-Host "  FAIL: LockfileReader manifest mismatch: declared=$manifestCount actual=$($tests.Count) duplicates=$hasDuplicates" -ForegroundColor Red
+    }
+
+    # R14-REV-06: Record suite counts with Declared from manifest, add Failed
+    $expectedTestCount = $manifestCount
     $passedReaderCount = @($tests | Where-Object { $_.Pass }).Count
-    $script:SelfTestSuiteResults['LockfileReader'] = @{ Declared=$expectedTestCount; Actual=$tests.Count; Passed=$passedReaderCount }
+    $failedReaderCount = @($tests | Where-Object { -not $_.Pass }).Count
+    $script:SelfTestSuiteResults['LockfileReader'] = @{ Declared=$manifestCount; Actual=$tests.Count; Passed=$passedReaderCount; Failed=$failedReaderCount }
 
     Write-Host "`n=== Lockfile Reader Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -2234,7 +2656,8 @@ function Test-ResolveLockfileParentPath {
     }
     # R12-REV-07: Record suite counts
     $passedParentCount = @($tests | Where-Object { $_.Pass }).Count
-    $script:SelfTestSuiteResults['ParentPath'] = @{ Declared=$expectedParentPathCount; Actual=$tests.Count; Passed=$passedParentCount }
+    $failedParentCount = @($tests | Where-Object { -not $_.Pass }).Count
+    $script:SelfTestSuiteResults['ParentPath'] = @{ Declared=$expectedParentPathCount; Actual=$tests.Count; Passed=$passedParentCount; Failed=$failedParentCount }
 
     Write-Host "\n=== Resolve-LockfileParentPath Self-Test (4 cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -2360,7 +2783,8 @@ function Test-NativeGateSummary {
     }
     # R12-REV-07: Record suite counts
     $passedGateCount = @($tests | Where-Object { $_.Pass }).Count
-    $script:SelfTestSuiteResults['GateSummary'] = @{ Declared=$expectedGateCount; Actual=$tests.Count; Passed=$passedGateCount }
+    $failedGateCount = @($tests | Where-Object { -not $_.Pass }).Count
+    $script:SelfTestSuiteResults['GateSummary'] = @{ Declared=$expectedGateCount; Actual=$tests.Count; Passed=$passedGateCount; Failed=$failedGateCount }
 
     Write-Host "\n=== Native Gate Summary Self-Test (15 cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -2477,7 +2901,8 @@ function Test-GetOverallResult {
     }
     # R12-REV-07: Record suite counts
     $passedAggCount = @($tests | Where-Object { $_.Pass }).Count
-    $script:SelfTestSuiteResults['Aggregation'] = @{ Declared=$expectedAggCount; Actual=$tests.Count; Passed=$passedAggCount }
+    $failedAggCount = @($tests | Where-Object { -not $_.Pass }).Count
+    $script:SelfTestSuiteResults['Aggregation'] = @{ Declared=$expectedAggCount; Actual=$tests.Count; Passed=$passedAggCount; Failed=$failedAggCount }
 
     Write-Host "`n=== Aggregation Self-Test ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -2975,10 +3400,31 @@ if ($SelfTestOnly) {
     if ($srLR) { $nodeTotal = $srLR.Actual; $nodePassed = $srLR.Passed }
     $overallTotal = $pureTotal + $nodeTotal
     $overallPassed = $purePassed + $nodePassed
+    # R14-REV-06: Validate suite counts — declared=actual, passed=actual, failed=0
+    $suiteValid = $true
+    foreach ($sn in @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader')) {
+        $sr = $script:SelfTestSuiteResults[$sn]
+        if (-not $sr) { Write-Host "  FAIL: Suite $sn not recorded" -ForegroundColor Red; $suiteValid = $false; continue }
+        if ($sr.Declared -ne $sr.Actual) { Write-Host "  FAIL: $sn declared=$($sr.Declared) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
+        if ($sr.Passed -ne $sr.Actual) { Write-Host "  FAIL: $sn passed=$($sr.Passed) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
+        if ($sr.Failed -gt 0) { Write-Host "  FAIL: $sn failed=$($sr.Failed)" -ForegroundColor Red; $suiteValid = $false }
+    }
+    if (-not $suiteValid) {
+        Write-Host "  FAIL: Suite count validation failed" -ForegroundColor Red
+    }
+
+    # Compute displayed totals from the validated suite objects; do not hard-code
+    $overallTotal = 0; $overallPassed = 0; $overallFailed = 0
+    foreach ($sn in @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader')) {
+        $sr = $script:SelfTestSuiteResults[$sn]
+        if ($sr) { $overallTotal += $sr.Actual; $overallPassed += $sr.Passed; $overallFailed += $sr.Failed }
+    }
+
     Write-Host "Pure-function tests: Aggregation($($script:SelfTestSuiteResults['Aggregation'].Actual)) + NativeJudgment($($script:SelfTestSuiteResults['NativeJudgment'].Actual)) + ParentPath($($script:SelfTestSuiteResults['ParentPath'].Actual)) + GateSummary($($script:SelfTestSuiteResults['GateSummary'].Actual)) = $pureTotal"
     Write-Host "Node-backed tests: LockfileReader($nodeTotal)"
     Write-Host "Node resolution: $($nodeResolution.Path)"
-    Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS"
+    Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS, $overallFailed FAILED"
+    Write-Host "Suite validation: $(if ($suiteValid) { 'PASS' } else { 'FAIL' })"
 
     # R12-REV-07: Record self-test success using runtime-derived counts
     Add-TestResult -TestId "SELFTEST-PURE" -Category "MandatoryFunctional" `
@@ -3255,51 +3701,33 @@ try {
     foreach ($depName in $nativeDepsToCheck) {
         $found = Get-ChildItem -Path (Join-Path $TEST_DIR "node_modules") -Filter $depName -Recurse -Directory -ErrorAction SilentlyContinue
         foreach ($foundDir in $found) {
-            # R5-04 + R6-01: Per-instance initialization — fail-closed defaults
-            $resolutionStatus = "Unresolved"
-            $platformApplicable = $true
-            $parentOptional = $false
-            $isNative = $false
-            $ver = "unknown"
-            $blockReason = ""
-
+            # R14-REV-01: Extract package.json info, then use shared function
             $pkgJsonPath = Join-Path $foundDir.FullName "package.json"
-            $pkgContent = $null
+            $ver = "unknown"
+            $pkgJsonError = ""
+
             if (Test-Path $pkgJsonPath) {
                 try {
                     $pkgContent = Get-Content $pkgJsonPath -Raw | ConvertFrom-Json
-                    $ver = $pkgContent.version
+                    if ($pkgContent.version) { $ver = $pkgContent.version }
                 } catch {
-                    # R5-04: parse failure → BLOCKED
-                    $blockReason = "package.json parse failure: $($_.Exception.Message)"
+                    $pkgJsonError = "package.json parse failure: $($_.Exception.Message)"
                 }
             } else {
-                $blockReason = "package.json not found"
+                $pkgJsonError = "package.json not found"
             }
 
-            # R5-04: Match by normalized lockfile instance path (no depName fallback)
+            # R5-04: Normalize lockfile instance path (no depName fallback)
             $normalizedPath = $foundDir.FullName -replace [regex]::Escape((Join-Path $TEST_DIR "node_modules") + [System.IO.Path]::DirectorySeparatorChar), ""
             $normalizedPath = "node_modules/$($normalizedPath -replace [regex]::Escape([System.IO.Path]::DirectorySeparatorChar), '/')"
 
-            # R6-01: Resolution status must be determined BEFORE load test
-            if ($blockReason) {
-                $resolutionStatus = "Blocked"
-            } elseif (-not $lockfileParsed) {
-                # R6-02: Lockfile not parsed → all instances BLOCKED
-                $resolutionStatus = "Blocked"
-                $blockReason = "Lockfile not parsed: $lockfileParseError"
-            } elseif ($transitiveNativeExpected.ContainsKey($normalizedPath)) {
-                $platformApplicable = $transitiveNativeExpected[$normalizedPath].PlatformApplicable
-                $parentOptional = $transitiveNativeExpected[$normalizedPath].ParentOptional
-                $isNative = $transitiveNativeExpected[$normalizedPath].IsNative
-                # R10-05: Propagate ResolutionStatus and BlockReason from judgment
-                $resolutionStatus = $transitiveNativeExpected[$normalizedPath].ResolutionStatus
-                $blockReason = $transitiveNativeExpected[$normalizedPath].BlockReason
-            } else {
-                $resolutionStatus = "Blocked"
-                $blockReason = "No lockfile mapping for $normalizedPath"
+            # R14-REV-01: Look up mapping entry (null if lockfile unavailable or dep not in mapping)
+            $mappingEntry = $null
+            if ($lockfileParsed -and $transitiveNativeExpected.ContainsKey($normalizedPath)) {
+                $mappingEntry = $transitiveNativeExpected[$normalizedPath]
             }
 
+            # Real load evidence — never synthetic
             $loadExit = -1; $loadOutput = ""
             Push-Location $TEST_DIR
             try {
@@ -3309,18 +3737,15 @@ try {
             } catch { $loadOutput = $_.Exception.Message }
             finally { Pop-Location }
 
-            # R6-01: Include ResolutionStatus and BlockReason in result
-            # R10-05: Include IsNative from judgment
-            $foundNative += [PSCustomObject]@{
-                Name = $depName; Path = $foundDir.FullName; Version = $ver
-                IsNative = $isNative
-                LoadExit = $loadExit
-                LoadOutput = if ($loadOutput) { $loadOutput.Trim() } else { "" }
-                PlatformApplicable = $platformApplicable
-                ParentOptional = $parentOptional
-                ResolutionStatus = $resolutionStatus
-                BlockReason = $blockReason
-            }
+            # R14-REV-01: Use shared conversion function (same as F23/F23c/F23d)
+            $foundNative += ConvertFrom-MappingToInstanceResult `
+                -MappingEntry $mappingEntry `
+                -InstancePath $normalizedPath `
+                -InstalledPath $foundDir.FullName `
+                -Version $ver `
+                -PackageJsonError $pkgJsonError `
+                -LoadExit $loadExit `
+                -LoadOutput $(if ($loadOutput) { $loadOutput.Trim() } else { "" })
         }
     }
 
