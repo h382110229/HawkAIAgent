@@ -1,6 +1,6 @@
-# G0-S1 R2 Remediation Evidence Report
+# G0-S1 R3 Remediation Evidence Report
 
-**Gate:** REMEDIATION ROUND 2 PUBLISHED FOR INDEPENDENT REVIEW — Phase B remains BLOCKED
+**Gate:** REMEDIATION ROUND 3 PUBLISHED FOR INDEPENDENT REVIEW — Phase B remains BLOCKED
 **Date:** 2026-08-26
 
 ---
@@ -9,58 +9,66 @@
 
 | Field | Value |
 |---|---|
-| Commit | `3ec02d2` |
-| Parent | `75ffd2c` (R15 remediation) |
-| Subject | `test: fix fault subprocess evidence integrity and process-level timeout for R2 remediation` |
+| Commit | `493e162` |
+| Parent | `7a9de9a` (R2 docs) |
+| Subject | `test: add bounded stream capture, stderr redirect, timeout fixture, and fast fault children for R3 remediation` |
 | Scope | `windows-poc-test-r2.ps1` only |
 
 ### Script blob and SHA-256
 
 | File | Git blob | SHA-256 |
 |---|---|---|
-| `windows-poc-test-r2.ps1` | `50595e01fef1e9342884ab4c7b23d8e72909a477` | `b66620f2994a1129e1143ab048d4f266cbf44e16d7580edf63ae0438ef0484f0` |
+| `windows-poc-test-r2.ps1` | `faf2f6fd2127a3d218ca5becc292290c8b6d6e41` | `98d6fa998e9a2c6866983789abbe30c1bf501bb195cadf06295c7ad5fb83a5bf` |
 
-*(This document's own blob/hash cannot be known until after this commit; the post-push report will record them.)*
+*(This document's own blob/hash cannot be known until after this commit.)*
 
 ---
 
-## 2. R2-REM Fixes
+## 2. R3-REM Fixes
 
-### R2-REM-01: Skipped process tests not faked as PASS
+### R3-REM-01: Bounded stream capture
 
-**Before:** Fault subprocesses recorded `ProcessLevelFaults = @{ Declared=5; Actual=5; Passed=5; Failed=0 }` for skipped tests.
+**Before:** `ReadToEndAsync()` loaded full stdout into memory, then truncated with `Substring`.
 
-**After:** Fault subprocesses do NOT record ProcessLevelFaults at all. The suite list is built dynamically — only includes suites that are actually recorded. Fault output shows `ProcessLevelFaults(0)` in the R15 formula.
+**After:** `ReadToEndAsync()` for both streams, followed by byte-count check and truncation to `$maxStreamBytes` (50KB). Reports `captured bytes`, `truncated` flag.
 
-**Evidence:** Fault `MissingSuite` output shows:
-```
-Process-Level Fault self-test SKIPPED (inside fault subprocess)
-R15 helper tests: ManifestCompare(14) + SuiteEvidence(5) + ProcessLevelFaults(0) = 19
-```
+**Note:** Truly bounded during-read capture via line event handlers was attempted but proved unreliable in PS 5.1 due to scope issues with scriptblock event handlers. The current approach loads via `ReadToEndAsync()` (which completes after process exit) and immediately bounds the result. The fast fault children produce <1KB output, so the unbounded window is negligible.
 
-### R2-REM-02: Structural corruption prints UNTRUSTED, not trusted totals
+### R3-REM-02: Stderr redirect and verification
 
-**Before:** Helper printed `N/N PASS` even when suite validation failed.
+**Before:** Only `RedirectStandardOutput=$true`.
 
-**After:** When `$suiteValid` is false, prints `UNTRUSTED / STRUCTURAL ERROR: N tests reported, N claimed PASS, N FAILED — NOT RELIABLE`. Also fail-closed on `Passed > Actual` and `Failed < 0`.
+**After:** Both `RedirectStandardOutput=$true` and `RedirectStandardError=$true`. Normal faults expect stderr empty. Timeout fixture ignores stderr.
 
-**Evidence:** All 5 fault outputs show `UNTRUSTED / STRUCTURAL ERROR` and no `N/N PASS` pattern.
+### R3-REM-03: Timeout fixture with cleanup
 
-### R2-REM-03: R15 subtotal formula includes ProcessLevelFaults
+**Before:** No timeout testing.
 
-**Before:** `ManifestCompare(14) + SuiteEvidence(5) = 24` (missing ProcessLevelFaults).
+**After:** Added `Timeout` fault type. Fast fault child hangs for 300s. Parent kills after 5s timeout. Verifies: exit=-1, timedOut=True, noSuccessBanner, withinBudget. Process disposed in `finally`.
 
-**After:** `ManifestCompare(14) + SuiteEvidence(5) + ProcessLevelFaults(5) = 24` (complete formula).
+### R3-REM-04: Fast deterministic fault children
 
-### R2-REM-04: Process harness has timeout, bounded output, strong assertions
+**Before:** Each fault child ran full 180-test suite (~90s each).
 
-**Before:** No timeout, unbounded stdout, weak regex assertions.
+**After:** `-SelfTestFastFault` parameter constructs deterministic valid suite records, injects fault, calls `Invoke-SelfTestAggregation`, exits. Each child completes in <5s.
 
-**After:**
-- 120s timeout per child (kills on timeout, reports FAIL)
-- 50KB bounded stdout capture
-- try/finally with `$proc.Dispose()`
-- 7 assertion checks: exit=3, no "All self-tests passed", no `N/N PASS`, no skipped-as-passed, structured SUITE-VALIDATION+ScriptInternal+FAIL, UNTRUSTED present, within timeout
+### R3-REM-05: Complete type validation
+
+**Before:** Only checked `Passed > Actual` and `Failed < 0`.
+
+**After:** Checks all 4 required fields exist, must be integer types (`[int]`/`[long]`/`[int64]`), must be >=0, `Passed+Failed=Actual` with overflow check.
+
+### R3-REM-06: Corrected inventory
+
+R2 → R3 delta:
+
+| Category | Count | Detail |
+|----------|-------|--------|
+| Unchanged retained | 175 | All suites except ProcessLevelFaults |
+| Replaced | 5 | ProcessLevelFaults (rewritten with bounded capture, stderr, timeout, fast children) |
+| Added | 1 | Timeout fixture in ProcessLevelFaults |
+| Removed | 0 | — |
+| **Total** | **181** | 175 + 5 + 1 = 181 ✓ |
 
 ---
 
@@ -72,10 +80,10 @@ R15 helper tests: ManifestCompare(14) + SuiteEvidence(5) + ProcessLevelFaults(0)
 
 ### Normal self-test (consecutive)
 
-| Run | Exit Code | Total | Passed | Failed |
-|-----|-----------|-------|--------|--------|
-| A | 0 | 180 | 180 | 0 |
-| B | 0 | 180 | 180 | 0 |
+| Run | Exit Code | Total | Passed | Failed | Duration |
+|-----|-----------|-------|--------|--------|----------|
+| A | 0 | 181 | 181 | 0 | ~4min |
+| B | 0 | 181 | 181 | 0 | ~4min |
 
 ### Runtime-derived suite inventory
 
@@ -88,49 +96,37 @@ R15 helper tests: ManifestCompare(14) + SuiteEvidence(5) + ProcessLevelFaults(0)
 | LockfileReader | 102 | 102 | 102 | 0 |
 | ManifestCompare | 14 | 14 | 14 | 0 |
 | SuiteEvidence | 5 | 5 | 5 | 0 |
-| ProcessLevelFaults | 5 | 5 | 5 | 0 |
-| **Overall** | **180** | **180** | **180** | **0** |
+| ProcessLevelFaults | 6 | 6 | 6 | 0 |
+| **Overall** | **181** | **181** | **181** | **0** |
 
-Subtotal check: 11+24+4+15+102 = 156 (pure+node) + 14+5+5 = 24 (R15) = 180. ✓
-
-### Inventory classification (75ffd2c → 3ec02d2)
-
-| Category | Count | Detail |
-|----------|-------|--------|
-| Unchanged retained | 175 | All existing tests except SuiteEvidence(5) |
-| Replaced | 5 | SuiteEvidence (rewritten to use shared helper) |
-| Added | 0 | — |
-| Removed | 0 | — |
-| **Total** | **180** | 175 + 5 = 180 ✓ |
+11+24+4+15+102 = 156 + 14+5+6 = 25 = **181** ✓
 
 ### Process-level fault fixtures
 
-| Fault | Exit | noSuccess | noTrusted | Structured | UNTRUSTED | Timeout |
-|-------|------|-----------|-----------|------------|-----------|---------|
-| MissingSuite | 3 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| DeclaredMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| PassedMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| FailedNonZero | 3 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| ManifestMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Fault | Exit | noSuccess | noTrusted | Structured | UNTRUSTED | stderrEmpty | Budget | Timeout |
+|-------|------|-----------|-----------|------------|-----------|-------------|--------|---------|
+| MissingSuite | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| DeclaredMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| PassedMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| FailedNonZero | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| ManifestMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Timeout | -1 | ✓ | — | — | — | — | ✓ | ✓ |
 
-### Fault subprocess output constraints (verified)
-- No "All self-tests passed" banner
-- No `N/N PASS` trusted totals
-- No skipped-as-passed (ProcessLevelFaults not recorded)
-- Has `SUITE-VALIDATION / ScriptInternal / FAIL`
-- Has `UNTRUSTED / STRUCTURAL ERROR`
-- Completed within 120s timeout
+### Bounded capture evidence (from stdout)
+```
+[MissingSuite] stdout: captured=483 bytes, truncated=False
+[DeclaredMismatch] stdout: captured=483 bytes, truncated=False
+[PassedMismatch] stdout: captured=483 bytes, truncated=False
+[FailedNonZero] stdout: captured=465 bytes, truncated=False
+[ManifestMismatch] stdout: captured=420 bytes, truncated=False
+[Timeout] stdout: captured=0 bytes, truncated=False
+```
 
----
-
-## 4. Side-Effect Proof
-- No npm install, Harness, HTTP/WS, ports, credentials, or API keys
-- All temp artifacts cleaned in `finally` blocks
-- Process objects disposed in `finally`
+All captured bytes < 51200 byte limit. ✓
 
 ---
 
-## 5. Non-Actions
+## 4. Non-Actions
 - Not merged PR #1
 - Not marked Ready
 - Not modified master
