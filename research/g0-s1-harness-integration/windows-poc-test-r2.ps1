@@ -26,10 +26,20 @@ param(
     [switch]$KeepArtifacts,
     # R12-REV-11: Self-test-only mode — runs parser/pure/Node-backed tests, then exits
     # before any main-flow operations (npm install, ports, process management, Harness).
-    [switch]$SelfTestOnly
+    [switch]$SelfTestOnly,
+    # R15-REM-01: Fault injection for process-level exit 3 verification.
+    # Only valid with -SelfTestOnly. Corrupts suite data before aggregation.
+    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch')]
+    [string]$SelfTestFault = 'None'
 )
 
 $ErrorActionPreference = "Stop"
+
+# R15-REM-01: Guard — SelfTestFault only valid with SelfTestOnly
+if ($SelfTestFault -ne 'None' -and -not $SelfTestOnly) {
+    Write-Host "ERROR: -SelfTestFault requires -SelfTestOnly" -ForegroundColor Red
+    exit 3
+}
 
 # === Control flow exceptions ===
 class PrerequisiteBlocked : System.Exception {
@@ -1234,16 +1244,24 @@ function Test-NativeAddonJudgment {
     return $allPassed
 }
 
-# R15-REV-02: Pure manifest comparison helper.
+# R15-REM-02: Pure manifest comparison helper.
 # Compares exact expected and actual name sets using ordinal/case-sensitive semantics.
-# Returns [PSCustomObject]@{ Match=[bool]; Missing=[string[]]; Extra=[string[]];
-#   DuplicateExpected=[string[]]; DuplicateActual=[string[]] }
-# Used by production self-test aggregation and its own tests.
+# Uses System.StringComparer.Ordinal for all duplicate detection and membership tests.
+# R15-REM-03: Bounded diagnostics — max $MaxSamples items per category, 100-char name cap.
+# Returns [PSCustomObject]@{ Match; Missing; Extra; DuplicateExpected; DuplicateActual;
+#   MissingTotal; ExtraTotal; DuplicateExpectedTotal; DuplicateActualTotal; Truncated }
 function Compare-TestManifest {
     param(
         [Parameter(Mandatory=$true)][string[]]$ExpectedNames,
-        [Parameter(Mandatory=$true)][string[]]$ActualNames
+        [Parameter(Mandatory=$true)][string[]]$ActualNames,
+        [int]$MaxSamples = 20
     )
+
+    $nameCap = 100
+    function Cap-Name([string]$n) {
+        if ($n.Length -gt $nameCap) { return $n.Substring(0, $nameCap) + "..." }
+        return $n
+    }
 
     $result = [PSCustomObject]@{
         Match = $false
@@ -1251,113 +1269,170 @@ function Compare-TestManifest {
         Extra = @()
         DuplicateExpected = @()
         DuplicateActual = @()
+        MissingTotal = 0
+        ExtraTotal = 0
+        DuplicateExpectedTotal = 0
+        DuplicateActualTotal = 0
+        Truncated = $false
     }
 
-    # Check for duplicates in expected names (case-sensitive ordinal)
-    $expectedSeen = @{}
-    $dupExpected = @()
+    # REM-02: Use Ordinal-comparing Dictionary for duplicate detection (case-sensitive)
+    $expectedSeen = New-Object 'System.Collections.Generic.Dictionary[string,bool]' ([System.StringComparer]::Ordinal)
+    $dupExpectedFull = New-Object 'System.Collections.Generic.List[string]'
     foreach ($name in $ExpectedNames) {
         if ($expectedSeen.ContainsKey($name)) {
-            if ($name -notin $dupExpected) { $dupExpected += $name }
+            if (-not $dupExpectedFull.Contains($name)) { $dupExpectedFull.Add($name) }
         } else {
             $expectedSeen[$name] = $true
         }
     }
-    $result.DuplicateExpected = @($dupExpected)
+    $result.DuplicateExpectedTotal = $dupExpectedFull.Count
+    $result.DuplicateExpected = @($dupExpectedFull | Select-Object -First $MaxSamples | ForEach-Object { Cap-Name $_ })
 
-    # Check for duplicates in actual names (case-sensitive ordinal)
-    $actualSeen = @{}
-    $dupActual = @()
+    # REM-02: Use Ordinal-comparing Dictionary for actual duplicate detection
+    $actualSeen = New-Object 'System.Collections.Generic.Dictionary[string,bool]' ([System.StringComparer]::Ordinal)
+    $dupActualFull = New-Object 'System.Collections.Generic.List[string]'
     foreach ($name in $ActualNames) {
         if ($actualSeen.ContainsKey($name)) {
-            if ($name -notin $dupActual) { $dupActual += $name }
+            if (-not $dupActualFull.Contains($name)) { $dupActualFull.Add($name) }
         } else {
             $actualSeen[$name] = $true
         }
     }
-    $result.DuplicateActual = @($dupActual)
+    $result.DuplicateActualTotal = $dupActualFull.Count
+    $result.DuplicateActual = @($dupActualFull | Select-Object -First $MaxSamples | ForEach-Object { Cap-Name $_ })
 
-    # Compute unique sets for comparison
-    $expectedUnique = @($ExpectedNames | Select-Object -Unique)
-    $actualUnique = @($ActualNames | Select-Object -Unique)
+    # Build unique sets using Ordinal-comparing HashSets for membership testing
+    $expectedUnique = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($name in $ExpectedNames) { [void]$expectedUnique.Add($name) }
+    $actualUnique = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($name in $ActualNames) { [void]$actualUnique.Add($name) }
 
-    # Compute Missing (in expected but not in actual) and Extra (in actual but not in expected)
-    # Using ordinal case-sensitive comparison via -cnotin
-    $missing = @()
+    # Compute Missing (in expected but not in actual)
+    $missingFull = New-Object 'System.Collections.Generic.List[string]'
     foreach ($name in $expectedUnique) {
-        if ($name -cnotin $actualUnique) { $missing += $name }
+        if (-not $actualUnique.Contains($name)) { $missingFull.Add($name) | Out-Null }
     }
-    $result.Missing = @($missing)
+    $result.MissingTotal = $missingFull.Count
+    $result.Missing = @($missingFull | Select-Object -First $MaxSamples | ForEach-Object { Cap-Name $_ })
 
-    $extra = @()
+    # Compute Extra (in actual but not in expected)
+    $extraFull = New-Object 'System.Collections.Generic.List[string]'
     foreach ($name in $actualUnique) {
-        if ($name -cnotin $expectedUnique) { $extra += $name }
+        if (-not $expectedUnique.Contains($name)) { $extraFull.Add($name) | Out-Null }
     }
-    $result.Extra = @($extra)
+    $result.ExtraTotal = $extraFull.Count
+    $result.Extra = @($extraFull | Select-Object -First $MaxSamples | ForEach-Object { Cap-Name $_ })
+
+    # Check if any category was truncated
+    $result.Truncated = ($result.MissingTotal -gt $MaxSamples) -or
+                        ($result.ExtraTotal -gt $MaxSamples) -or
+                        ($result.DuplicateExpectedTotal -gt $MaxSamples) -or
+                        ($result.DuplicateActualTotal -gt $MaxSamples)
 
     # Match requires: no missing, no extra, no duplicates in either
-    $result.Match = ($result.Missing.Count -eq 0) -and
-                    ($result.Extra.Count -eq 0) -and
-                    ($result.DuplicateExpected.Count -eq 0) -and
-                    ($result.DuplicateActual.Count -eq 0)
+    $result.Match = ($result.MissingTotal -eq 0) -and
+                    ($result.ExtraTotal -eq 0) -and
+                    ($result.DuplicateExpectedTotal -eq 0) -and
+                    ($result.DuplicateActualTotal -eq 0)
 
     return $result
 }
 
-# R15-REV-02: Self-test for Compare-TestManifest pure helper (7 cases)
+# R15-REM-02: Self-test for Compare-TestManifest pure helper (14 cases)
 function Test-CompareTestManifest {
     $allPassed = $true
     $tests = @()
 
     # T1: Exact match — same names, same order
     $c1 = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","C")
-    $tests += [PSCustomObject]@{ Name="T1: exact match (same order)"; Expected="Match=True"; Actual="Match=$($c1.Match) Missing=$($c1.Missing.Count) Extra=$($c1.Extra.Count)"; Pass=$c1.Match }
+    $tests += [PSCustomObject]@{ Name="T1: exact match (same order)"; Expected="Match=True"; Actual="Match=$($c1.Match) Missing=$($c1.MissingTotal) Extra=$($c1.ExtraTotal)"; Pass=$c1.Match }
     if (-not $c1.Match) { $allPassed = $false }
 
     # T2: Exact match — same names, different order
     $c2 = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("C","A","B")
-    $tests += [PSCustomObject]@{ Name="T2: exact match (different order)"; Expected="Match=True"; Actual="Match=$($c2.Match) Missing=$($c2.Missing.Count) Extra=$($c2.Extra.Count)"; Pass=$c2.Match }
+    $tests += [PSCustomObject]@{ Name="T2: exact match (different order)"; Expected="Match=True"; Actual="Match=$($c2.Match) Missing=$($c2.MissingTotal) Extra=$($c2.ExtraTotal)"; Pass=$c2.Match }
     if (-not $c2.Match) { $allPassed = $false }
 
     # T3: Same count but one expected name replaced by another
     $c3 = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z")
-    $p3 = (-not $c3.Match) -and ($c3.Missing.Count -eq 1) -and ($c3.Missing[0] -eq "C") -and ($c3.Extra.Count -eq 1) -and ($c3.Extra[0] -eq "Z")
-    $tests += [PSCustomObject]@{ Name="T3: same count, one name replaced"; Expected="Match=False Missing=C Extra=Z"; Actual="Match=$($c3.Match) Missing=$($c3.Missing -join ',') Extra=$($c3.Extra -join ',')"; Pass=$p3 }
+    $p3 = (-not $c3.Match) -and ($c3.MissingTotal -eq 1) -and ($c3.Missing[0] -eq "C") -and ($c3.ExtraTotal -eq 1) -and ($c3.Extra[0] -eq "Z")
+    $tests += [PSCustomObject]@{ Name="T3: same count, one name replaced"; Expected="Match=False Missing=1(C) Extra=1(Z)"; Actual="Match=$($c3.Match) Missing=$($c3.MissingTotal)($($c3.Missing -join ',')) Extra=$($c3.ExtraTotal)($($c3.Extra -join ','))"; Pass=$p3 }
     if (-not $p3) { $allPassed = $false }
 
     # T4: Missing name (actual is subset)
     $c4 = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B")
-    $p4 = (-not $c4.Match) -and ($c4.Missing.Count -eq 1) -and ($c4.Missing[0] -eq "C") -and ($c4.Extra.Count -eq 0)
-    $tests += [PSCustomObject]@{ Name="T4: missing name"; Expected="Match=False Missing=C Extra=0"; Actual="Match=$($c4.Match) Missing=$($c4.Missing -join ',') Extra=$($c4.Extra.Count)"; Pass=$p4 }
+    $p4 = (-not $c4.Match) -and ($c4.MissingTotal -eq 1) -and ($c4.Missing[0] -eq "C") -and ($c4.ExtraTotal -eq 0)
+    $tests += [PSCustomObject]@{ Name="T4: missing name"; Expected="Match=False Missing=1(C) Extra=0"; Actual="Match=$($c4.Match) Missing=$($c4.MissingTotal)($($c4.Missing -join ',')) Extra=$($c4.ExtraTotal)"; Pass=$p4 }
     if (-not $p4) { $allPassed = $false }
 
     # T5: Extra name (actual has superset)
     $c5 = Compare-TestManifest -ExpectedNames @("A","B") -ActualNames @("A","B","C")
-    $p5 = (-not $c5.Match) -and ($c5.Missing.Count -eq 0) -and ($c5.Extra.Count -eq 1) -and ($c5.Extra[0] -eq "C")
-    $tests += [PSCustomObject]@{ Name="T5: extra name"; Expected="Match=False Missing=0 Extra=C"; Actual="Match=$($c5.Match) Missing=$($c5.Missing.Count) Extra=$($c5.Extra -join ',')"; Pass=$p5 }
+    $p5 = (-not $c5.Match) -and ($c5.MissingTotal -eq 0) -and ($c5.ExtraTotal -eq 1) -and ($c5.Extra[0] -eq "C")
+    $tests += [PSCustomObject]@{ Name="T5: extra name"; Expected="Match=False Missing=0 Extra=1(C)"; Actual="Match=$($c5.Match) Missing=$($c5.MissingTotal) Extra=$($c5.ExtraTotal)($($c5.Extra -join ','))"; Pass=$p5 }
     if (-not $p5) { $allPassed = $false }
 
-    # T6: Duplicate expected name
+    # T6: Duplicate expected name (exact case)
     $c6 = Compare-TestManifest -ExpectedNames @("A","A","B") -ActualNames @("A","B")
-    $p6 = (-not $c6.Match) -and ($c6.DuplicateExpected.Count -eq 1) -and ($c6.DuplicateExpected[0] -eq "A")
-    $tests += [PSCustomObject]@{ Name="T6: duplicate expected name"; Expected="Match=False DuplicateExpected=A"; Actual="Match=$($c6.Match) DupExpected=$($c6.DuplicateExpected -join ',')"; Pass=$p6 }
+    $p6 = (-not $c6.Match) -and ($c6.DuplicateExpectedTotal -eq 1) -and ($c6.DuplicateExpected[0] -eq "A")
+    $tests += [PSCustomObject]@{ Name="T6: duplicate expected (A,A)"; Expected="Match=False DupExpected=1(A)"; Actual="Match=$($c6.Match) DupExpected=$($c6.DuplicateExpectedTotal)($($c6.DuplicateExpected -join ','))"; Pass=$p6 }
     if (-not $p6) { $allPassed = $false }
 
-    # T7: Duplicate actual name
+    # T7: Duplicate actual name (exact case)
     $c7 = Compare-TestManifest -ExpectedNames @("A","B") -ActualNames @("A","A","B")
-    $p7 = (-not $c7.Match) -and ($c7.DuplicateActual.Count -eq 1) -and ($c7.DuplicateActual[0] -eq "A")
-    $tests += [PSCustomObject]@{ Name="T7: duplicate actual name"; Expected="Match=False DuplicateActual=A"; Actual="Match=$($c7.Match) DupActual=$($c7.DuplicateActual -join ',')"; Pass=$p7 }
+    $p7 = (-not $c7.Match) -and ($c7.DuplicateActualTotal -eq 1) -and ($c7.DuplicateActual[0] -eq "A")
+    $tests += [PSCustomObject]@{ Name="T7: duplicate actual (A,A)"; Expected="Match=False DupActual=1(A)"; Actual="Match=$($c7.Match) DupActual=$($c7.DuplicateActualTotal)($($c7.DuplicateActual -join ','))"; Pass=$p7 }
     if (-not $p7) { $allPassed = $false }
 
     # T8: Case-only mismatch
     $c8 = Compare-TestManifest -ExpectedNames @("A","B","c") -ActualNames @("A","B","C")
-    $p8 = (-not $c8.Match) -and ($c8.Missing.Count -eq 1) -and ($c8.Missing[0] -eq "c") -and ($c8.Extra.Count -eq 1) -and ($c8.Extra[0] -eq "C")
-    $tests += [PSCustomObject]@{ Name="T8: case-only mismatch"; Expected="Match=False Missing=c Extra=C"; Actual="Match=$($c8.Match) Missing=$($c8.Missing -join ',') Extra=$($c8.Extra -join ',')"; Pass=$p8 }
+    $p8 = (-not $c8.Match) -and ($c8.MissingTotal -eq 1) -and ($c8.Missing[0] -eq "c") -and ($c8.ExtraTotal -eq 1) -and ($c8.Extra[0] -eq "C")
+    $tests += [PSCustomObject]@{ Name="T8: case-only mismatch (c vs C)"; Expected="Match=False Missing=1(c) Extra=1(C)"; Actual="Match=$($c8.Match) Missing=$($c8.MissingTotal)($($c8.Missing -join ',')) Extra=$($c8.ExtraTotal)($($c8.Extra -join ','))"; Pass=$p8 }
     if (-not $p8) { $allPassed = $false }
 
-    $script:SelfTestSuiteResults['ManifestCompare'] = @{ Declared=8; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
+    # T9: A,a NOT duplicate — ordinal case-sensitive (REM-02 requirement)
+    $c9 = Compare-TestManifest -ExpectedNames @("A","a") -ActualNames @("A","a")
+    $p9 = $c9.Match -and ($c9.DuplicateExpectedTotal -eq 0) -and ($c9.DuplicateActualTotal -eq 0)
+    $tests += [PSCustomObject]@{ Name="T9: A,a NOT duplicate, exact match"; Expected="Match=True DupExpected=0 DupActual=0"; Actual="Match=$($c9.Match) DupExpected=$($c9.DuplicateExpectedTotal) DupActual=$($c9.DuplicateActualTotal)"; Pass=$p9 }
+    if (-not $p9) { $allPassed = $false }
 
-    Write-Host "`n=== Compare-TestManifest Self-Test (8 cases) ===" -ForegroundColor Cyan
+    # T10: Duplicate expected A,A (exact case, not a,a)
+    $c10 = Compare-TestManifest -ExpectedNames @("A","A","B") -ActualNames @("A","B")
+    $p10 = (-not $c10.Match) -and ($c10.DuplicateExpectedTotal -eq 1) -and ($c10.DuplicateExpected[0] -eq "A") -and ($c10.MissingTotal -eq 0)
+    $tests += [PSCustomObject]@{ Name="T10: dup expected A,A exact"; Expected="Match=False DupExpected=1(A) Missing=0"; Actual="Match=$($c10.Match) DupExpected=$($c10.DuplicateExpectedTotal) Missing=$($c10.MissingTotal)"; Pass=$p10 }
+    if (-not $p10) { $allPassed = $false }
+
+    # T11: Duplicate expected a,a (lowercase)
+    $c11 = Compare-TestManifest -ExpectedNames @("a","a") -ActualNames @("a")
+    $p11 = (-not $c11.Match) -and ($c11.DuplicateExpectedTotal -eq 1) -and ($c11.DuplicateExpected[0] -eq "a")
+    $tests += [PSCustomObject]@{ Name="T11: dup expected a,a lowercase"; Expected="Match=False DupExpected=1(a)"; Actual="Match=$($c11.Match) DupExpected=$($c11.DuplicateExpectedTotal)($($c11.DuplicateExpected -join ','))"; Pass=$p11 }
+    if (-not $p11) { $allPassed = $false }
+
+    # T12: expected=a, actual=A → case-only mismatch
+    $c12 = Compare-TestManifest -ExpectedNames @("a") -ActualNames @("A")
+    $p12 = (-not $c12.Match) -and ($c12.MissingTotal -eq 1) -and ($c12.Missing[0] -eq "a") -and ($c12.ExtraTotal -eq 1) -and ($c12.Extra[0] -eq "A")
+    $tests += [PSCustomObject]@{ Name="T12: expected=a actual=A case mismatch"; Expected="Match=False Missing=1(a) Extra=1(A)"; Actual="Match=$($c12.Match) Missing=$($c12.MissingTotal)($($c12.Missing -join ',')) Extra=$($c12.ExtraTotal)($($c12.Extra -join ','))"; Pass=$p12 }
+    if (-not $p12) { $allPassed = $false }
+
+    # T13: 25 missing items → bounded to 15, Truncated=true (REM-03)
+    $expected13 = @(); for ($i = 1; $i -le 25; $i++) { $expected13 += "item$i" }
+    $actual13 = @("item1","item2","item3","item4","item5")
+    $c13 = Compare-TestManifest -ExpectedNames $expected13 -ActualNames $actual13 -MaxSamples 15
+    $p13 = (-not $c13.Match) -and ($c13.MissingTotal -eq 20) -and ($c13.Missing.Count -eq 15) -and ($c13.Truncated -eq $true)
+    $tests += [PSCustomObject]@{ Name="T13: 25 missing, bounded to 15, truncated"; Expected="MissingTotal=20 Missing.Count=15 Truncated=True"; Actual="MissingTotal=$($c13.MissingTotal) Missing.Count=$($c13.Missing.Count) Truncated=$($c13.Truncated)"; Pass=$p13 }
+    if (-not $p13) { $allPassed = $false }
+
+    # T14: 100-char name truncated in display (REM-03)
+    $longName = "A" * 150
+    $cappedName = "A" * 100 + "..."
+    $c14 = Compare-TestManifest -ExpectedNames @($longName,"B") -ActualNames @("B")
+    $p14 = (-not $c14.Match) -and ($c14.MissingTotal -eq 1) -and ($c14.Missing[0] -eq $cappedName)
+    $tests += [PSCustomObject]@{ Name="T14: 150-char name capped to 100+..."; Expected="Missing[0]=$($cappedName.Substring(0,20))..."; Actual="Missing[0]=$($c14.Missing[0].Substring(0,[Math]::Min(20,$c14.Missing[0].Length)))... len=$($c14.Missing[0].Length)"; Pass=$p14 }
+    if (-not $p14) { $allPassed = $false }
+
+    $script:SelfTestSuiteResults['ManifestCompare'] = @{ Declared=14; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
+
+    Write-Host "`n=== Compare-TestManifest Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
@@ -1366,96 +1441,222 @@ function Test-CompareTestManifest {
     return $allPassed
 }
 
-# R15-REV-01: Self-test for suite validation fault injection (5 cases)
-# Proves each structural mismatch cannot exit 0 via the real entry point.
+# R15-REM-01: Shared production helper for self-test aggregation.
+# Single implementation used by both normal -SelfTestOnly path and fault tests.
+# Validates suite structural integrity, writes result objects, computes overall gate.
+# Parameters:
+#   $SuiteResults — hashtable of suite name -> @{Declared; Actual; Passed; Failed}
+#   $AllSuites — ordered string[] of expected suite names
+#   $ManifestComparison — PSCustomObject from Compare-TestManifest, or $null if no manifest
+#   $NodeResolution — object with .Path property, or $null
+#   $PureTotal/$PurePassed/$NodeTotal/$NodePassed — display totals
+# Returns: [PSCustomObject]@{ Overall=[string]; ExitCode=[int]; SuiteValid=[bool] }
+function Invoke-SelfTestAggregation {
+    param(
+        [Parameter(Mandatory=$true)]$SuiteResults,
+        [Parameter(Mandatory=$true)][string[]]$AllSuites,
+        $ManifestComparison = $null,
+        $NodeResolution = $null,
+        [int]$PureTotal = 0,
+        [int]$PurePassed = 0,
+        [int]$NodeTotal = 0,
+        [int]$NodePassed = 0,
+        [int]$R15Total = 0,
+        [int]$R15Passed = 0
+    )
+
+    # Validate suite counts — declared=actual, passed=actual, failed=0
+    $suiteValid = $true
+    foreach ($sn in $AllSuites) {
+        $sr = $SuiteResults[$sn]
+        if (-not $sr) { Write-Host "  FAIL: Suite $sn not recorded" -ForegroundColor Red; $suiteValid = $false; continue }
+        if ($sr.Declared -ne $sr.Actual) { Write-Host "  FAIL: $sn declared=$($sr.Declared) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
+        if ($sr.Passed -ne $sr.Actual) { Write-Host "  FAIL: $sn passed=$($sr.Passed) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
+        if ($sr.Failed -gt 0) { Write-Host "  FAIL: $sn failed=$($sr.Failed)" -ForegroundColor Red; $suiteValid = $false }
+    }
+
+    # Validate manifest comparison if provided
+    if ($null -ne $ManifestComparison -and -not $ManifestComparison.Match) {
+        $suiteValid = $false
+        $detailParts = @()
+        if ($ManifestComparison.MissingTotal -gt 0) { $detailParts += "Missing=$($ManifestComparison.MissingTotal)" }
+        if ($ManifestComparison.ExtraTotal -gt 0) { $detailParts += "Extra=$($ManifestComparison.ExtraTotal)" }
+        if ($ManifestComparison.DuplicateExpectedTotal -gt 0) { $detailParts += "DupExpected=$($ManifestComparison.DuplicateExpectedTotal)" }
+        if ($ManifestComparison.DuplicateActualTotal -gt 0) { $detailParts += "DupActual=$($ManifestComparison.DuplicateActualTotal)" }
+        Write-Host "  FAIL: Manifest mismatch: $($detailParts -join '; ')" -ForegroundColor Red
+    }
+
+    # Compute displayed totals from the validated suite objects
+    $overallTotal = 0; $overallPassed = 0; $overallFailed = 0
+    foreach ($sn in $AllSuites) {
+        $sr = $SuiteResults[$sn]
+        if ($sr) { $overallTotal += $sr.Actual; $overallPassed += $sr.Passed; $overallFailed += $sr.Failed }
+    }
+
+    Write-Host "Pure-function tests: Aggregation($($SuiteResults['Aggregation'].Actual)) + NativeJudgment($($SuiteResults['NativeJudgment'].Actual)) + ParentPath($($SuiteResults['ParentPath'].Actual)) + GateSummary($($SuiteResults['GateSummary'].Actual)) = $PureTotal"
+    Write-Host "Node-backed tests: LockfileReader($NodeTotal)"
+    if ($R15Total -gt 0) {
+        Write-Host "R15 helper tests: ManifestCompare($($SuiteResults['ManifestCompare'].Actual)) + SuiteEvidence($($SuiteResults['SuiteEvidence'].Actual)) = $R15Total"
+    }
+    if ($NodeResolution -and $NodeResolution.Path) {
+        Write-Host "Node resolution: $($NodeResolution.Path)"
+    }
+    Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS, $overallFailed FAILED"
+    Write-Host "Suite validation: $(if ($suiteValid) { 'PASS' } else { 'FAIL' })"
+
+    # Suite validation is a REAL GATE — feed into Get-OverallResult
+    if (-not $suiteValid) {
+        # Structural suite/manifest/count inconsistency => ScriptInternal ERROR => exit 3
+        Add-TestResult -TestId "SUITE-VALIDATION" -Category "ScriptInternal" `
+          -Description "Self-test suite structural validation" `
+          -Expected "All suites: declared=actual, passed=actual, failed=0" `
+          -Actual "Suite validation failed (see above diagnostics)" -Status "FAIL" `
+          -ErrorSummary "ScriptInternal: suite structural validation failure => ERROR"
+    }
+
+    # Only record PASS results when suite validation succeeded
+    if ($suiteValid) {
+        Write-Host "`n=== SELF-TEST-ONLY MODE: All self-tests passed ===" -ForegroundColor Green
+
+        Add-TestResult -TestId "SELFTEST-PURE" -Category "MandatoryFunctional" `
+          -Description "Pure-function self-tests (Aggregation+NativeJudgment+ParentPath+GateSummary)" `
+          -Expected "$PureTotal/$PureTotal PASS" -Actual "$PurePassed/$PureTotal PASS" -Status "PASS"
+        Add-TestResult -TestId "SELFTEST-NODEBACKED" -Category "MandatoryFunctional" `
+          -Description "Node-backed self-tests (LockfileReader)" `
+          -Expected "$NodeTotal/$NodeTotal PASS" -Actual "$NodePassed/$NodeTotal PASS" -Status "PASS"
+        if ($NodeResolution -and $NodeResolution.Path) {
+            Add-TestResult -TestId "SELFTEST-NODECHECK" -Category "EvidenceDependent" `
+              -Description "Node executable resolution" `
+              -Expected "Exactly one Node Application found" `
+              -Actual "Resolved: $($NodeResolution.Path)" -Status "PASS"
+        }
+    }
+
+    # Compute overall result from self-test results
+    $selfTestOverall = Get-OverallResult -Results $script:TestResults `
+      -HasFatalInternalError $false `
+      -CleanupErrorList @()
+
+    $selfTestExitCode = switch ($selfTestOverall) {
+        "PASS"    { 0 }
+        "FAIL"    { 1 }
+        "BLOCKED" { 2 }
+        "ERROR"   { 3 }
+        default   { 3 }
+    }
+
+    return [PSCustomObject]@{
+        Overall = $selfTestOverall
+        ExitCode = $selfTestExitCode
+        SuiteValid = $suiteValid
+    }
+}
+
+# R15-REM-01: Self-test for suite validation via shared production helper (5 cases).
+# Calls Invoke-SelfTestAggregation with injected fault data — same path as production.
 function Test-SuiteEvidence {
     $allPassed = $true
     $tests = @()
+    $savedResults = $script:TestResults
 
     # T1: Missing suite record => ScriptInternal FAIL => ERROR
-    $testResults1 = @(
-        [PSCustomObject]@{ TestId="SELFTEST-PURE"; Category="MandatoryFunctional"; Status="PASS"; Description="Pure"; Expected=""; Actual=""; ErrorSummary="" }
-    )
-    $missingSuiteSuites = @{ 'Aggregation'=@{ Declared=1; Actual=1; Passed=1; Failed=0 } }
-    # 'NativeJudgment' is missing from suites
-    $missingValid = $true
-    foreach ($sn in @('Aggregation','NativeJudgment')) {
-        $sr = $missingSuiteSuites[$sn]
-        if (-not $sr) { $missingValid = $false }
-    }
-    if (-not $missingValid) {
-        $testResults1 += [PSCustomObject]@{ TestId="SUITE-VALIDATION"; Category="ScriptInternal"; Status="FAIL"; Description="Suite structural validation"; Expected="All suites present"; Actual="Missing suite record"; ErrorSummary="ScriptInternal: suite validation failure" }
-    }
-    $g1 = Get-OverallResult -Results $testResults1 -HasFatalInternalError $false -CleanupErrorList @()
-    $p1 = ($g1 -eq "ERROR")
-    $tests += [PSCustomObject]@{ Name="T1: missing suite record => ERROR"; Expected="ERROR"; Actual=$g1; Pass=$p1 }
+    $script:TestResults = @()
+    $suites1 = @{ 'Aggregation'=@{ Declared=1; Actual=1; Passed=1; Failed=0 } }
+    $r1 = Invoke-SelfTestAggregation -SuiteResults $suites1 -AllSuites @('Aggregation','NativeJudgment')
+    $p1 = ($r1.Overall -eq "ERROR") -and ($r1.ExitCode -eq 3) -and (-not $r1.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T1: missing suite => ERROR/3"; Expected="ERROR/3"; Actual="$($r1.Overall)/$($r1.ExitCode)"; Pass=$p1 }
     if (-not $p1) { $allPassed = $false }
 
     # T2: Declared/actual mismatch => ScriptInternal FAIL => ERROR
-    $testResults2 = @(
-        [PSCustomObject]@{ TestId="SELFTEST-PURE"; Category="MandatoryFunctional"; Status="PASS"; Description="Pure"; Expected=""; Actual=""; ErrorSummary="" }
-    )
-    $mismatchSuites = @{ 'Aggregation'=@{ Declared=10; Actual=11; Passed=11; Failed=0 } }
-    $mismatchValid = $true
-    $sr = $mismatchSuites['Aggregation']
-    if ($sr.Declared -ne $sr.Actual) { $mismatchValid = $false }
-    if (-not $mismatchValid) {
-        $testResults2 += [PSCustomObject]@{ TestId="SUITE-VALIDATION"; Category="ScriptInternal"; Status="FAIL"; Description="Suite structural validation"; Expected="Declared=Actual"; Actual="Declared=10 Actual=11"; ErrorSummary="ScriptInternal: suite validation failure" }
-    }
-    $g2 = Get-OverallResult -Results $testResults2 -HasFatalInternalError $false -CleanupErrorList @()
-    $p2 = ($g2 -eq "ERROR")
-    $tests += [PSCustomObject]@{ Name="T2: declared/actual mismatch => ERROR"; Expected="ERROR"; Actual=$g2; Pass=$p2 }
+    $script:TestResults = @()
+    $suites2 = @{ 'Aggregation'=@{ Declared=10; Actual=11; Passed=11; Failed=0 } }
+    $r2 = Invoke-SelfTestAggregation -SuiteResults $suites2 -AllSuites @('Aggregation')
+    $p2 = ($r2.Overall -eq "ERROR") -and ($r2.ExitCode -eq 3) -and (-not $r2.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T2: declared!=actual => ERROR/3"; Expected="ERROR/3"; Actual="$($r2.Overall)/$($r2.ExitCode)"; Pass=$p2 }
     if (-not $p2) { $allPassed = $false }
 
     # T3: Passed/actual mismatch => ScriptInternal FAIL => ERROR
-    $testResults3 = @(
-        [PSCustomObject]@{ TestId="SELFTEST-PURE"; Category="MandatoryFunctional"; Status="PASS"; Description="Pure"; Expected=""; Actual=""; ErrorSummary="" }
-    )
-    $passedMismatchSuites = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=1 } }
-    $passedValid = $true
-    $sr = $passedMismatchSuites['Aggregation']
-    if ($sr.Passed -ne $sr.Actual) { $passedValid = $false }
-    if (-not $passedValid) {
-        $testResults3 += [PSCustomObject]@{ TestId="SUITE-VALIDATION"; Category="ScriptInternal"; Status="FAIL"; Description="Suite structural validation"; Expected="Passed=Actual"; Actual="Passed=10 Actual=11"; ErrorSummary="ScriptInternal: suite validation failure" }
-    }
-    $g3 = Get-OverallResult -Results $testResults3 -HasFatalInternalError $false -CleanupErrorList @()
-    $p3 = ($g3 -eq "ERROR")
-    $tests += [PSCustomObject]@{ Name="T3: passed/actual mismatch => ERROR"; Expected="ERROR"; Actual=$g3; Pass=$p3 }
+    $script:TestResults = @()
+    $suites3 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=1 } }
+    $r3 = Invoke-SelfTestAggregation -SuiteResults $suites3 -AllSuites @('Aggregation')
+    $p3 = ($r3.Overall -eq "ERROR") -and ($r3.ExitCode -eq 3) -and (-not $r3.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T3: passed!=actual => ERROR/3"; Expected="ERROR/3"; Actual="$($r3.Overall)/$($r3.ExitCode)"; Pass=$p3 }
     if (-not $p3) { $allPassed = $false }
 
     # T4: Failed count > 0 => ScriptInternal FAIL => ERROR
-    $testResults4 = @(
-        [PSCustomObject]@{ TestId="SELFTEST-PURE"; Category="MandatoryFunctional"; Status="PASS"; Description="Pure"; Expected=""; Actual=""; ErrorSummary="" }
-    )
-    $failedSuites = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=1 } }
-    $failedValid = $true
-    $sr = $failedSuites['Aggregation']
-    if ($sr.Failed -gt 0) { $failedValid = $false }
-    if (-not $failedValid) {
-        $testResults4 += [PSCustomObject]@{ TestId="SUITE-VALIDATION"; Category="ScriptInternal"; Status="FAIL"; Description="Suite structural validation"; Expected="Failed=0"; Actual="Failed=1"; ErrorSummary="ScriptInternal: suite validation failure" }
-    }
-    $g4 = Get-OverallResult -Results $testResults4 -HasFatalInternalError $false -CleanupErrorList @()
-    $p4 = ($g4 -eq "ERROR")
-    $tests += [PSCustomObject]@{ Name="T4: failed count > 0 => ERROR"; Expected="ERROR"; Actual=$g4; Pass=$p4 }
+    $script:TestResults = @()
+    $suites4 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=1 } }
+    $r4 = Invoke-SelfTestAggregation -SuiteResults $suites4 -AllSuites @('Aggregation')
+    $p4 = ($r4.Overall -eq "ERROR") -and ($r4.ExitCode -eq 3) -and (-not $r4.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T4: failed>0 => ERROR/3"; Expected="ERROR/3"; Actual="$($r4.Overall)/$($r4.ExitCode)"; Pass=$p4 }
     if (-not $p4) { $allPassed = $false }
 
-    # T5: Manifest missing/extra/duplicate => Compare-TestManifest Match=False => ScriptInternal FAIL => ERROR
-    $testResults5 = @(
-        [PSCustomObject]@{ TestId="SELFTEST-PURE"; Category="MandatoryFunctional"; Status="PASS"; Description="Pure"; Expected=""; Actual=""; ErrorSummary="" }
-    )
-    $manifestResult = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z")
-    if (-not $manifestResult.Match) {
-        $detail = "Missing=$($manifestResult.Missing -join ',') Extra=$($manifestResult.Extra -join ',') DupExpected=$($manifestResult.DuplicateExpected.Count) DupActual=$($manifestResult.DuplicateActual.Count)"
-        $testResults5 += [PSCustomObject]@{ TestId="SUITE-MANIFEST"; Category="ScriptInternal"; Status="FAIL"; Description="Manifest name-set validation"; Expected="Exact name-set match"; Actual=$detail; ErrorSummary="ScriptInternal: manifest mismatch" }
-    }
-    $g5 = Get-OverallResult -Results $testResults5 -HasFatalInternalError $false -CleanupErrorList @()
-    $p5 = ($g5 -eq "ERROR")
-    $tests += [PSCustomObject]@{ Name="T5: manifest name mismatch => ERROR"; Expected="ERROR"; Actual=$g5; Pass=$p5 }
+    # T5: Manifest mismatch => ScriptInternal FAIL => ERROR
+    $script:TestResults = @()
+    $suites5 = @{ 'Aggregation'=@{ Declared=1; Actual=1; Passed=1; Failed=0 } }
+    $manifest5 = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z")
+    $r5 = Invoke-SelfTestAggregation -SuiteResults $suites5 -AllSuites @('Aggregation') -ManifestComparison $manifest5
+    $p5 = ($r5.Overall -eq "ERROR") -and ($r5.ExitCode -eq 3) -and (-not $r5.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T5: manifest mismatch => ERROR/3"; Expected="ERROR/3"; Actual="$($r5.Overall)/$($r5.ExitCode)"; Pass=$p5 }
     if (-not $p5) { $allPassed = $false }
+
+    # Restore original results
+    $script:TestResults = $savedResults
 
     $script:SelfTestSuiteResults['SuiteEvidence'] = @{ Declared=5; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
 
-    Write-Host "`n=== Suite Evidence Fault-Injection Self-Test (5 cases) ===" -ForegroundColor Cyan
+    Write-Host "`n=== Suite Evidence Fault-Injection Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
+    foreach ($t in $tests) {
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
+    }
+
+    return $allPassed
+}
+
+# R15-REM-01: Process-level fault fixture — launches real subprocess, verifies exit 3.
+function Test-ProcessLevelFaults {
+    $allPassed = $true
+    $tests = @()
+    $scriptPath = $PSCommandPath
+
+    $faults = @('MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch')
+    foreach ($fault in $faults) {
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = "powershell.exe"
+        $pinfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault"
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoWindow = $true
+
+        $proc = [System.Diagnostics.Process]::Start($pinfo)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+        $stderr = ""  # stderr not captured to avoid deadlock; stdout contains all diagnostics
+
+        # Verify: exit code is 3
+        $exitOk = ($exitCode -eq 3)
+        # Verify: no premature "All self-tests passed" before SUITE-VALIDATION
+        $allPassedIdx = $stdout.IndexOf("All self-tests passed")
+        $suiteValidIdx = $stdout.IndexOf("SUITE-VALIDATION")
+        $noPremature = ($allPassedIdx -lt 0) -or ($suiteValidIdx -lt 0) -or ($allPassedIdx -gt $suiteValidIdx)
+        # Verify: contains FAIL evidence
+        $hasFailEvidence = ($stdout -match "FAIL.*Suite") -or ($stdout -match "FAIL.*Manifest") -or ($stdout -match "SUITE-VALIDATION") -or ($stdout -match "ScriptInternal")
+
+        $pass = $exitOk -and $noPremature -and $hasFailEvidence
+        $tests += [PSCustomObject]@{
+            Name = "Fault=$fault"
+            Expected = "exit=3 noPremature hasFail"
+            Actual = "exit=$exitCode noPremature=$noPremature hasFail=$hasFailEvidence"
+            Pass = $pass
+        }
+        if (-not $pass) { $allPassed = $false }
+    }
+
+    $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=5; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
+
+    Write-Host "`n=== Process-Level Fault Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
@@ -2830,16 +3031,17 @@ process.exit(1);
     )
     $manifestCount = $manifest.Count
 
-    # R15-REV-02: Use exact name-set comparison instead of count-only check
+    # R15-REM-02: Use exact name-set comparison with ordinal-comparing collections
     $manifestComparison = Compare-TestManifest -ExpectedNames $manifest -ActualNames $testNames
     $manifestMatch = $manifestComparison.Match
     if (-not $manifestMatch) {
         $allPassed = $false
         $detailParts = @()
-        if ($manifestComparison.Missing.Count -gt 0) { $detailParts += "Missing=$($manifestComparison.Missing -join ',')" }
-        if ($manifestComparison.Extra.Count -gt 0) { $detailParts += "Extra=$($manifestComparison.Extra -join ',')" }
-        if ($manifestComparison.DuplicateExpected.Count -gt 0) { $detailParts += "DupExpected=$($manifestComparison.DuplicateExpected -join ',')" }
-        if ($manifestComparison.DuplicateActual.Count -gt 0) { $detailParts += "DupActual=$($manifestComparison.DuplicateActual -join ',')" }
+        if ($manifestComparison.MissingTotal -gt 0) { $detailParts += "Missing=$($manifestComparison.MissingTotal)($($manifestComparison.Missing -join ','))" }
+        if ($manifestComparison.ExtraTotal -gt 0) { $detailParts += "Extra=$($manifestComparison.ExtraTotal)($($manifestComparison.Extra -join ','))" }
+        if ($manifestComparison.DuplicateExpectedTotal -gt 0) { $detailParts += "DupExpected=$($manifestComparison.DuplicateExpectedTotal)($($manifestComparison.DuplicateExpected -join ','))" }
+        if ($manifestComparison.DuplicateActualTotal -gt 0) { $detailParts += "DupActual=$($manifestComparison.DuplicateActualTotal)($($manifestComparison.DuplicateActual -join ','))" }
+        if ($manifestComparison.Truncated) { $detailParts += "(truncated)" }
         Write-Host "  FAIL: LockfileReader manifest mismatch: $($detailParts -join '; ')" -ForegroundColor Red
     }
 
@@ -3648,13 +3850,48 @@ if (-not $suiteEvidenceTestPassed) {
     exit 3
 }
 
+# R15-REM-01: Run process-level fault fixture self-test
+# Skip when running inside a fault subprocess to prevent recursive launching
+if ($SelfTestFault -eq 'None') {
+    Write-Host "=== Process-Level Fault self-test (5 cases) ===" -ForegroundColor Cyan
+    $processLevelTestPassed = Test-ProcessLevelFaults
+    if (-not $processLevelTestPassed) {
+        Write-Host "FATAL: Process-Level Fault self-test failed. Aborting." -ForegroundColor Red
+        Add-TestResult -TestId "SELFTEST-PROCESSFAULTS" -Category "ScriptInternal" `
+          -Description "Process-Level fault self-test" `
+          -Expected "All process-level fault tests return exit 3" `
+          -Actual "One or more process-level fault tests did not return exit 3" -Status "FAIL" `
+          -ErrorSummary "Process-Level fault self-test failed before harness launch"
+        $script:FatalInternalError = $true
+        $script:FatalInternalErrorMessage = "Process-Level fault self-test failed"
+        exit 3
+    }
+} else {
+    Write-Host "=== Process-Level Fault self-test SKIPPED (inside fault subprocess) ===" -ForegroundColor Yellow
+    $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=5; Actual=5; Passed=5; Failed=0 }
+}
+
 $script:SelfTestMode = $false  # R12-REV-12: Disable self-test mode after all self-tests pass
+
+# R15-REM-01: SelfTestFault injection — corrupt suite data before aggregation
+# Only runs when -SelfTestOnly -SelfTestFault <fault> is specified
+$manifestComparisonForAggregation = $null
+if ($SelfTestFault -ne 'None') {
+    switch ($SelfTestFault) {
+        'MissingSuite' { $script:SelfTestSuiteResults.Remove('Aggregation') }
+        'DeclaredMismatch' { $script:SelfTestSuiteResults['Aggregation'].Declared = 999 }
+        'PassedMismatch' { $script:SelfTestSuiteResults['Aggregation'].Passed = 999 }
+        'FailedNonZero' { $script:SelfTestSuiteResults['Aggregation'].Failed = 1 }
+        'ManifestMismatch' {
+            $manifestComparisonForAggregation = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z")
+        }
+    }
+}
 
 # R12-REV-11: Self-test-only mode exit point
 # All self-tests have passed. Report results and exit before main flow.
 if ($SelfTestOnly) {
-    # R15-REV-01: Compute displayed totals BEFORE printing any success messages
-    # R12-REV-07: Compute and display runtime-derived counts from shared collector
+    # R15-REM-01: Compute displayed totals
     $pureTotal = 0; $purePassed = 0
     foreach ($suiteName in @('Aggregation','NativeJudgment','ParentPath','GateSummary')) {
         $sr = $script:SelfTestSuiteResults[$suiteName]
@@ -3663,83 +3900,25 @@ if ($SelfTestOnly) {
     $nodeTotal = 0; $nodePassed = 0
     $srLR = $script:SelfTestSuiteResults['LockfileReader']
     if ($srLR) { $nodeTotal = $srLR.Actual; $nodePassed = $srLR.Passed }
-    # R15-REV-01: Include new suites in totals
     $r15Total = 0; $r15Passed = 0
-    foreach ($suiteName in @('ManifestCompare','SuiteEvidence')) {
+    foreach ($suiteName in @('ManifestCompare','SuiteEvidence','ProcessLevelFaults')) {
         $sr = $script:SelfTestSuiteResults[$suiteName]
         if ($sr) { $r15Total += $sr.Actual; $r15Passed += $sr.Passed }
     }
-    $overallTotal = $pureTotal + $nodeTotal + $r15Total
-    $overallPassed = $purePassed + $nodePassed + $r15Passed
 
-    # R14-REV-06 + R15-REV-01: Validate suite counts — declared=actual, passed=actual, failed=0
-    # This is a REAL GATE: failure feeds into Get-OverallResult as ScriptInternal/ERROR/exit 3
-    $suiteValid = $true
-    $allSuites = @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader','ManifestCompare','SuiteEvidence')
-    foreach ($sn in $allSuites) {
-        $sr = $script:SelfTestSuiteResults[$sn]
-        if (-not $sr) { Write-Host "  FAIL: Suite $sn not recorded" -ForegroundColor Red; $suiteValid = $false; continue }
-        if ($sr.Declared -ne $sr.Actual) { Write-Host "  FAIL: $sn declared=$($sr.Declared) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
-        if ($sr.Passed -ne $sr.Actual) { Write-Host "  FAIL: $sn passed=$($sr.Passed) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
-        if ($sr.Failed -gt 0) { Write-Host "  FAIL: $sn failed=$($sr.Failed)" -ForegroundColor Red; $suiteValid = $false }
-    }
+    # R15-REM-01: Use shared production helper — single code path
+    $allSuites = @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader','ManifestCompare','SuiteEvidence','ProcessLevelFaults')
+    $aggResult = Invoke-SelfTestAggregation `
+      -SuiteResults $script:SelfTestSuiteResults `
+      -AllSuites $allSuites `
+      -ManifestComparison $manifestComparisonForAggregation `
+      -NodeResolution $nodeResolution `
+      -PureTotal $pureTotal -PurePassed $purePassed `
+      -NodeTotal $nodeTotal -NodePassed $nodePassed `
+      -R15Total $r15Total -R15Passed $r15Passed
 
-    # Compute displayed totals from the validated suite objects; do not hard-code
-    $overallTotal = 0; $overallPassed = 0; $overallFailed = 0
-    foreach ($sn in $allSuites) {
-        $sr = $script:SelfTestSuiteResults[$sn]
-        if ($sr) { $overallTotal += $sr.Actual; $overallPassed += $sr.Passed; $overallFailed += $sr.Failed }
-    }
-
-    Write-Host "Pure-function tests: Aggregation($($script:SelfTestSuiteResults['Aggregation'].Actual)) + NativeJudgment($($script:SelfTestSuiteResults['NativeJudgment'].Actual)) + ParentPath($($script:SelfTestSuiteResults['ParentPath'].Actual)) + GateSummary($($script:SelfTestSuiteResults['GateSummary'].Actual)) = $pureTotal"
-    Write-Host "Node-backed tests: LockfileReader($nodeTotal)"
-    Write-Host "R15 helper tests: ManifestCompare($($script:SelfTestSuiteResults['ManifestCompare'].Actual)) + SuiteEvidence($($script:SelfTestSuiteResults['SuiteEvidence'].Actual)) = $r15Total"
-    Write-Host "Node resolution: $($nodeResolution.Path)"
-    Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS, $overallFailed FAILED"
-    Write-Host "Suite validation: $(if ($suiteValid) { 'PASS' } else { 'FAIL' })"
-
-    # R15-REV-01: Suite validation is a REAL GATE — feed into Get-OverallResult
-    if (-not $suiteValid) {
-        # Structural suite/manifest/count inconsistency => ScriptInternal ERROR => exit 3
-        Add-TestResult -TestId "SUITE-VALIDATION" -Category "ScriptInternal" `
-          -Description "Self-test suite structural validation" `
-          -Expected "All suites: declared=actual, passed=actual, failed=0" `
-          -Actual "Suite validation failed (see above diagnostics)" -Status "FAIL" `
-          -ErrorSummary "ScriptInternal: suite structural validation failure => ERROR"
-    }
-
-    # R15-REV-01: Only record PASS results when suite validation succeeded
-    if ($suiteValid) {
-        Write-Host "`n=== SELF-TEST-ONLY MODE: All self-tests passed ===" -ForegroundColor Green
-
-        # R12-REV-07: Record self-test success using runtime-derived counts
-        Add-TestResult -TestId "SELFTEST-PURE" -Category "MandatoryFunctional" `
-          -Description "Pure-function self-tests (Aggregation+NativeJudgment+ParentPath+GateSummary)" `
-          -Expected "$pureTotal/$pureTotal PASS" -Actual "$purePassed/$pureTotal PASS" -Status "PASS"
-        Add-TestResult -TestId "SELFTEST-NODEBACKED" -Category "MandatoryFunctional" `
-          -Description "Node-backed self-tests (LockfileReader)" `
-          -Expected "$nodeTotal/$nodeTotal PASS" -Actual "$nodePassed/$nodeTotal PASS" -Status "PASS"
-        Add-TestResult -TestId "SELFTEST-NODECHECK" -Category "EvidenceDependent" `
-          -Description "Node executable resolution" `
-          -Expected "Exactly one Node Application found" `
-          -Actual "Resolved: $($nodeResolution.Path)" -Status "PASS"
-    }
-
-    # Compute overall result from self-test results
-    $selfTestOverall = Get-OverallResult -Results $script:TestResults `
-      -HasFatalInternalError $false `
-      -CleanupErrorList @()
-
-    $selfTestExitCode = switch ($selfTestOverall) {
-        "PASS"    { 0 }
-        "FAIL"    { 1 }
-        "BLOCKED" { 2 }
-        "ERROR"   { 3 }
-        default   { 3 }
-    }
-
-    Write-Host "`nSELF-TEST OVERALL: $selfTestOverall (exit $selfTestExitCode)" -ForegroundColor $(
-        switch ($selfTestOverall) { "PASS" { "Green" } "FAIL" { "Red" } "BLOCKED" { "Yellow" } "ERROR" { "Magenta" } }
+    Write-Host "`nSELF-TEST OVERALL: $($aggResult.Overall) (exit $($aggResult.ExitCode))" -ForegroundColor $(
+        switch ($aggResult.Overall) { "PASS" { "Green" } "FAIL" { "Red" } "BLOCKED" { "Yellow" } "ERROR" { "Magenta" } }
     )
 
     # Output structured results for harness consumption
@@ -3747,7 +3926,7 @@ if ($SelfTestOnly) {
     $script:TestResults | Format-Table TestId, Category, Status, Description -AutoSize
 
     $script:SelfTestMode = $false  # R12-REV-12: Disable self-test mode before exit
-    exit $selfTestExitCode
+    exit $aggResult.ExitCode
 }
 
 # === Main execution ===
