@@ -1466,6 +1466,7 @@ function Invoke-SelfTestAggregation {
     )
 
     # Validate suite counts — declared=actual, passed=actual, failed=0
+    # Also validate sanity: Passed <= Actual, Failed >= 0, Passed + Failed = Actual
     $suiteValid = $true
     foreach ($sn in $AllSuites) {
         $sr = $SuiteResults[$sn]
@@ -1473,6 +1474,9 @@ function Invoke-SelfTestAggregation {
         if ($sr.Declared -ne $sr.Actual) { Write-Host "  FAIL: $sn declared=$($sr.Declared) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
         if ($sr.Passed -ne $sr.Actual) { Write-Host "  FAIL: $sn passed=$($sr.Passed) != actual=$($sr.Actual)" -ForegroundColor Red; $suiteValid = $false }
         if ($sr.Failed -gt 0) { Write-Host "  FAIL: $sn failed=$($sr.Failed)" -ForegroundColor Red; $suiteValid = $false }
+        # R2-REM-02: Fail-closed on illegal counts
+        if ($sr.Passed -gt $sr.Actual) { Write-Host "  FAIL: $sn passed=$($sr.Passed) > actual=$($sr.Actual) (illegal)" -ForegroundColor Red; $suiteValid = $false }
+        if ($sr.Failed -lt 0) { Write-Host "  FAIL: $sn failed=$($sr.Failed) < 0 (illegal)" -ForegroundColor Red; $suiteValid = $false }
     }
 
     # Validate manifest comparison if provided
@@ -1495,14 +1499,23 @@ function Invoke-SelfTestAggregation {
 
     Write-Host "Pure-function tests: Aggregation($($SuiteResults['Aggregation'].Actual)) + NativeJudgment($($SuiteResults['NativeJudgment'].Actual)) + ParentPath($($SuiteResults['ParentPath'].Actual)) + GateSummary($($SuiteResults['GateSummary'].Actual)) = $PureTotal"
     Write-Host "Node-backed tests: LockfileReader($NodeTotal)"
+    # R2-REM-03: Show complete R15 formula including ProcessLevelFaults
     if ($R15Total -gt 0) {
-        Write-Host "R15 helper tests: ManifestCompare($($SuiteResults['ManifestCompare'].Actual)) + SuiteEvidence($($SuiteResults['SuiteEvidence'].Actual)) = $R15Total"
+        $plfActual = if ($SuiteResults['ProcessLevelFaults']) { $SuiteResults['ProcessLevelFaults'].Actual } else { 0 }
+        Write-Host "R15 helper tests: ManifestCompare($($SuiteResults['ManifestCompare'].Actual)) + SuiteEvidence($($SuiteResults['SuiteEvidence'].Actual)) + ProcessLevelFaults($plfActual) = $R15Total"
     }
     if ($NodeResolution -and $NodeResolution.Path) {
         Write-Host "Node resolution: $($NodeResolution.Path)"
     }
-    Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS, $overallFailed FAILED"
-    Write-Host "Suite validation: $(if ($suiteValid) { 'PASS' } else { 'FAIL' })"
+
+    # R2-REM-02: Only print trusted N/N PASS when suite validation succeeded
+    if ($suiteValid) {
+        Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS, $overallFailed FAILED"
+        Write-Host "Suite validation: PASS"
+    } else {
+        Write-Host "UNTRUSTED / STRUCTURAL ERROR: $overallTotal tests reported, $overallPassed claimed PASS, $overallFailed FAILED — NOT RELIABLE"
+        Write-Host "Suite validation: FAIL"
+    }
 
     # Suite validation is a REAL GATE — feed into Get-OverallResult
     if (-not $suiteValid) {
@@ -1614,41 +1627,89 @@ function Test-SuiteEvidence {
     return $allPassed
 }
 
-# R15-REM-01: Process-level fault fixture — launches real subprocess, verifies exit 3.
+# R2-REM-04: Process-level fault fixture — launches real subprocess with timeout, verifies exit 3.
 function Test-ProcessLevelFaults {
     $allPassed = $true
     $tests = @()
     $scriptPath = $PSCommandPath
+    $childTimeoutMs = 120000  # 120 seconds per child
+    $maxOutputBytes = 51200   # 50KB bounded output
 
     $faults = @('MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch')
     foreach ($fault in $faults) {
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName = "powershell.exe"
-        $pinfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault"
-        $pinfo.RedirectStandardOutput = $true
-        $pinfo.UseShellExecute = $false
-        $pinfo.CreateNoWindow = $true
+        $proc = $null
+        $stdout = ""
+        $exitCode = -1
+        $timedOut = $false
+        try {
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = "powershell.exe"
+            $pinfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault"
+            $pinfo.RedirectStandardOutput = $true
+            $pinfo.UseShellExecute = $false
+            $pinfo.CreateNoWindow = $true
 
-        $proc = [System.Diagnostics.Process]::Start($pinfo)
-        $stdout = $proc.StandardOutput.ReadToEnd()
-        $proc.WaitForExit()
-        $exitCode = $proc.ExitCode
-        $stderr = ""  # stderr not captured to avoid deadlock; stdout contains all diagnostics
+            $proc = [System.Diagnostics.Process]::Start($pinfo)
+            $childPid = $proc.Id
 
-        # Verify: exit code is 3
+            # R2-REM-04: Read with timeout — use async read to avoid deadlock
+            $readTask = $proc.StandardOutput.ReadToEndAsync()
+            $exited = $proc.WaitForExit($childTimeoutMs)
+            if (-not $exited) {
+                $timedOut = $true
+                try { $proc.Kill() } catch {}
+                $stdout = "(timed out after $($childTimeoutMs/1000)s)"
+                $exitCode = -1
+            } else {
+                # Get stdout with bounded read
+                $rawOut = $readTask.Result
+                if ($rawOut.Length -gt $maxOutputBytes) {
+                    $stdout = $rawOut.Substring(0, $maxOutputBytes) + "...(truncated)"
+                } else {
+                    $stdout = $rawOut
+                }
+                $exitCode = $proc.ExitCode
+            }
+        } catch {
+            $stdout = "(exception: $($_.Exception.Message))"
+            $exitCode = -1
+        } finally {
+            if ($proc -and -not $proc.HasExited) {
+                try { $proc.Kill() } catch {}
+            }
+            if ($proc) { $proc.Dispose() }
+        }
+
+        # R2-REM-04: Strong evidence assertions
+        # 1. Exit code is exactly 3
         $exitOk = ($exitCode -eq 3)
-        # Verify: no premature "All self-tests passed" before SUITE-VALIDATION
-        $allPassedIdx = $stdout.IndexOf("All self-tests passed")
-        $suiteValidIdx = $stdout.IndexOf("SUITE-VALIDATION")
-        $noPremature = ($allPassedIdx -lt 0) -or ($suiteValidIdx -lt 0) -or ($allPassedIdx -gt $suiteValidIdx)
-        # Verify: contains FAIL evidence
-        $hasFailEvidence = ($stdout -match "FAIL.*Suite") -or ($stdout -match "FAIL.*Manifest") -or ($stdout -match "SUITE-VALIDATION") -or ($stdout -match "ScriptInternal")
 
-        $pass = $exitOk -and $noPremature -and $hasFailEvidence
+        # 2. No "All self-tests passed" anywhere in output
+        $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
+
+        # 3. No trusted N/N PASS totals (look for pattern like "N/N PASS")
+        $noTrustedTotals = ($stdout -notmatch '\d+/\d+ PASS')
+
+        # 4. No skipped-as-passed (ProcessLevelFaults should not appear as PASS)
+        $noSkippedAsPassed = ($stdout -notmatch 'ProcessLevelFaults.*Passed=5')
+
+        # 5. Has structured FAIL evidence: SUITE-VALIDATION + ScriptInternal + FAIL
+        $hasSuiteValidation = ($stdout -match 'SUITE-VALIDATION')
+        $hasScriptInternal = ($stdout -match 'ScriptInternal')
+        $hasFailStatus = ($stdout -match 'Status.*FAIL') -or ($stdout -match 'FAIL.*Suite') -or ($stdout -match 'FAIL.*Manifest')
+        $hasStructuredEvidence = $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus
+
+        # 6. Shows UNTRUSTED / STRUCTURAL ERROR (not trusted N/N PASS)
+        $hasUntrusted = ($stdout -match 'UNTRUSTED')
+
+        # 7. Completed within timeout
+        $withinTimeout = (-not $timedOut)
+
+        $pass = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasStructuredEvidence -and $hasUntrusted -and $withinTimeout
         $tests += [PSCustomObject]@{
             Name = "Fault=$fault"
-            Expected = "exit=3 noPremature hasFail"
-            Actual = "exit=$exitCode noPremature=$noPremature hasFail=$hasFailEvidence"
+            Expected = "exit=3 noSuccess noTrusted hasStructured untrusted withinTimeout"
+            Actual = "exit=$exitCode noSuccess=$noSuccessBanner noTrusted=$noTrustedTotals struct=$hasStructuredEvidence untrusted=$hasUntrusted timeout=$withinTimeout"
             Pass = $pass
         }
         if (-not $pass) { $allPassed = $false }
@@ -3867,8 +3928,8 @@ if ($SelfTestFault -eq 'None') {
         exit 3
     }
 } else {
+    # R2-REM-01: Do NOT record skipped tests as PASS — exclude from aggregation entirely
     Write-Host "=== Process-Level Fault self-test SKIPPED (inside fault subprocess) ===" -ForegroundColor Yellow
-    $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=5; Actual=5; Passed=5; Failed=0 }
 }
 
 $script:SelfTestMode = $false  # R12-REV-12: Disable self-test mode after all self-tests pass
@@ -3906,8 +3967,12 @@ if ($SelfTestOnly) {
         if ($sr) { $r15Total += $sr.Actual; $r15Passed += $sr.Passed }
     }
 
-    # R15-REM-01: Use shared production helper — single code path
-    $allSuites = @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader','ManifestCompare','SuiteEvidence','ProcessLevelFaults')
+    # R2-REM-01: Build suite list dynamically — only include suites that are actually recorded
+    # In fault mode, ProcessLevelFaults may be skipped and not recorded
+    $allSuites = @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader','ManifestCompare','SuiteEvidence')
+    if ($script:SelfTestSuiteResults.ContainsKey('ProcessLevelFaults')) {
+        $allSuites += 'ProcessLevelFaults'
+    }
     $aggResult = Invoke-SelfTestAggregation `
       -SuiteResults $script:SelfTestSuiteResults `
       -AllSuites $allSuites `
