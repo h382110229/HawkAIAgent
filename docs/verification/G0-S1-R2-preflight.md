@@ -236,4 +236,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "research/g0-s1-harness-
 - Not modified master
 - Not accessed real API keys
 - Not entered Phase B or G0-S2
-- R15 pre-commit evidence prepared; awaiting commit authorization
+- R15 committed and pushed to `origin/research/g0-s1-windows-poc`; published for independent review
