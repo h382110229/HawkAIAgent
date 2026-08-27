@@ -29,7 +29,7 @@ param(
     [switch]$SelfTestOnly,
     # R15-REM-01: Fault injection for process-level exit 3 verification.
     # Only valid with -SelfTestOnly. Corrupts suite data before aggregation.
-    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout')]
+    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver')]
     [string]$SelfTestFault = 'None',
     # R3-REM-04: Fast fault child mode — skips all test execution, constructs deterministic
     # suite records, injects fault, calls Invoke-SelfTestAggregation, exits.
@@ -1645,10 +1645,58 @@ function Test-SuiteEvidence {
     $tests += [PSCustomObject]@{ Name="T5: manifest mismatch => ERROR/3"; Expected="ERROR/3"; Actual="$($r5.Overall)/$($r5.ExitCode)"; Pass=$p5 }
     if (-not $p5) { $allPassed = $false }
 
+    # R4-REM-04: T6: Missing field => ERROR/3
+    $script:TestResults = @()
+    $suites6 = @{ 'Aggregation'=@{ Actual=11; Passed=11; Failed=0 } }  # Missing 'Declared'
+    $r6 = Invoke-SelfTestAggregation -SuiteResults $suites6 -AllSuites @('Aggregation')
+    $p6 = ($r6.Overall -eq "ERROR") -and ($r6.ExitCode -eq 3) -and (-not $r6.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T6: missing field => ERROR/3"; Expected="ERROR/3"; Actual="$($r6.Overall)/$($r6.ExitCode)"; Pass=$p6 }
+    if (-not $p6) { $allPassed = $false }
+
+    # R4-REM-04: T7: String value => ERROR/3
+    $script:TestResults = @()
+    $suites7 = @{ 'Aggregation'=@{ Declared="11"; Actual=11; Passed=11; Failed=0 } }  # String, not int
+    $r7 = Invoke-SelfTestAggregation -SuiteResults $suites7 -AllSuites @('Aggregation')
+    $p7 = ($r7.Overall -eq "ERROR") -and ($r7.ExitCode -eq 3) -and (-not $r7.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T7: string value => ERROR/3"; Expected="ERROR/3"; Actual="$($r7.Overall)/$($r7.ExitCode)"; Pass=$p7 }
+    if (-not $p7) { $allPassed = $false }
+
+    # R4-REM-04: T8: Float value => ERROR/3
+    $script:TestResults = @()
+    $suites8 = @{ 'Aggregation'=@{ Declared=11.5; Actual=11; Passed=11; Failed=0 } }  # Float, not int
+    $r8 = Invoke-SelfTestAggregation -SuiteResults $suites8 -AllSuites @('Aggregation')
+    $p8 = ($r8.Overall -eq "ERROR") -and ($r8.ExitCode -eq 3) -and (-not $r8.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T8: float value => ERROR/3"; Expected="ERROR/3"; Actual="$($r8.Overall)/$($r8.ExitCode)"; Pass=$p8 }
+    if (-not $p8) { $allPassed = $false }
+
+    # R4-REM-04: T9: Negative value => ERROR/3
+    $script:TestResults = @()
+    $suites9 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=11; Failed=-1 } }  # Negative
+    $r9 = Invoke-SelfTestAggregation -SuiteResults $suites9 -AllSuites @('Aggregation')
+    $p9 = ($r9.Overall -eq "ERROR") -and ($r9.ExitCode -eq 3) -and (-not $r9.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T9: negative value => ERROR/3"; Expected="ERROR/3"; Actual="$($r9.Overall)/$($r9.ExitCode)"; Pass=$p9 }
+    if (-not $p9) { $allPassed = $false }
+
+    # R4-REM-04: T10: Overflow/huge value => ERROR/3
+    $script:TestResults = @()
+    $suites10 = @{ 'Aggregation'=@{ Declared=[int]::MaxValue; Actual=[int]::MaxValue; Passed=[int]::MaxValue; Failed=1 } }  # Passed+Failed overflows
+    $r10 = Invoke-SelfTestAggregation -SuiteResults $suites10 -AllSuites @('Aggregation')
+    $p10 = ($r10.Overall -eq "ERROR") -and ($r10.ExitCode -eq 3) -and (-not $r10.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T10: overflow value => ERROR/3"; Expected="ERROR/3"; Actual="$($r10.Overall)/$($r10.ExitCode)"; Pass=$p10 }
+    if (-not $p10) { $allPassed = $false }
+
+    # R4-REM-04: T11: Passed+Failed != Actual => ERROR/3
+    $script:TestResults = @()
+    $suites11 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=0 } }  # Passed(10)+Failed(0)=10 != Actual(11)
+    $r11 = Invoke-SelfTestAggregation -SuiteResults $suites11 -AllSuites @('Aggregation')
+    $p11 = ($r11.Overall -eq "ERROR") -and ($r11.ExitCode -eq 3) -and (-not $r11.SuiteValid)
+    $tests += [PSCustomObject]@{ Name="T11: passed+failed!=actual => ERROR/3"; Expected="ERROR/3"; Actual="$($r11.Overall)/$($r11.ExitCode)"; Pass=$p11 }
+    if (-not $p11) { $allPassed = $false }
+
     # Restore original results
     $script:TestResults = $savedResults
 
-    $script:SelfTestSuiteResults['SuiteEvidence'] = @{ Declared=5; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
+    $script:SelfTestSuiteResults['SuiteEvidence'] = @{ Declared=11; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
 
     Write-Host "`n=== Suite Evidence Fault-Injection Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -1659,7 +1707,7 @@ function Test-SuiteEvidence {
     return $allPassed
 }
 
-# R3-REM-01/02/03/04: Process-level fault fixture with bounded capture, stderr, timeout cleanup, fast children.
+# R4-REM-01/02/03: Process-level fault fixture with temp-file bounded capture, oversize fixtures, timeout tree.
 function Test-ProcessLevelFaults {
     $allPassed = $true
     $tests = @()
@@ -1668,148 +1716,263 @@ function Test-ProcessLevelFaults {
     $hangTimeoutMs = 5000     # 5 seconds for timeout/hang fixture
     $maxStreamBytes = 51200   # 50KB bounded capture per stream
 
-    # R3-REM-04: Use -SelfTestFastFault for fast deterministic fault children
-    # R3-REM-03: Add Timeout fixture
+    # R4-REM-02: Full fixture list including oversize/boundary fixtures
     $faults = @(
-        @{ Name='MissingSuite';     Fault='MissingSuite';     Timeout=$childTimeoutMs; Fast=$true },
-        @{ Name='DeclaredMismatch'; Fault='DeclaredMismatch'; Timeout=$childTimeoutMs; Fast=$true },
-        @{ Name='PassedMismatch';   Fault='PassedMismatch';   Timeout=$childTimeoutMs; Fast=$true },
-        @{ Name='FailedNonZero';    Fault='FailedNonZero';    Timeout=$childTimeoutMs; Fast=$true },
-        @{ Name='ManifestMismatch'; Fault='ManifestMismatch'; Timeout=$childTimeoutMs; Fast=$true },
-        @{ Name='Timeout';          Fault='Timeout';          Timeout=$hangTimeoutMs;  Fast=$true }
+        @{ Name='MissingSuite';      Fault='MissingSuite';      Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
+        @{ Name='DeclaredMismatch';  Fault='DeclaredMismatch';  Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
+        @{ Name='PassedMismatch';    Fault='PassedMismatch';    Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
+        @{ Name='FailedNonZero';     Fault='FailedNonZero';     Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
+        @{ Name='ManifestMismatch';  Fault='ManifestMismatch';  Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
+        @{ Name='Timeout';           Fault='Timeout';           Timeout=$hangTimeoutMs;  Fast=$true; Type='timeout' },
+        @{ Name='StdoutOversize';    Fault='StdoutOversize';    Timeout=$childTimeoutMs; Fast=$true; Type='oversize' },
+        @{ Name='StderrOversize';    Fault='StderrOversize';    Timeout=$childTimeoutMs; Fast=$true; Type='oversize' },
+        @{ Name='DualStreamOversize';Fault='DualStreamOversize';Timeout=$childTimeoutMs; Fast=$true; Type='oversize' },
+        @{ Name='LongLine';          Fault='LongLine';          Timeout=$childTimeoutMs; Fast=$true; Type='oversize' },
+        @{ Name='BoundaryExact';     Fault='BoundaryExact';     Timeout=$childTimeoutMs; Fast=$true; Type='boundary' },
+        @{ Name='BoundaryOver';      Fault='BoundaryOver';      Timeout=$childTimeoutMs; Fast=$true; Type='boundary' }
     )
 
     foreach ($fixture in $faults) {
         $fault = $fixture.Fault
         $timeoutMs = $fixture.Timeout
         $useFast = $fixture.Fast
+        $fixtureType = $fixture.Type
 
         $proc = $null
         $stdout = ""
         $stderr = ""
         $exitCode = -1
         $timedOut = $false
+        $stdoutTotalBytes = 0
         $stdoutCapturedBytes = 0
         $stdoutTruncated = $false
+        $stderrTotalBytes = 0
         $stderrCapturedBytes = 0
         $stderrTruncated = $false
+        $stdoutPreview = ""
+        $stderrPreview = ""
+        $fixtureDir = $null
 
         try {
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = "powershell.exe"
             $fastFlag = if ($useFast) { "-SelfTestFastFault" } else { "" }
-            $pinfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag"
-            $pinfo.RedirectStandardOutput = $true
-            $pinfo.RedirectStandardError = $true  # R3-REM-02: Redirect stderr
-            $pinfo.UseShellExecute = $false
-            $pinfo.CreateNoWindow = $true
+            $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag"
 
-            $proc = [System.Diagnostics.Process]::Start($pinfo)
+            if ($fixtureType -eq 'timeout') {
+                # R4-REM-03: For timeout, use direct stream reading to capture pre-timeout marker
+                # cmd.exe buffers output which prevents capturing before kill
+                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pinfo.FileName = "powershell.exe"
+                $pinfo.Arguments = $childArgs
+                $pinfo.RedirectStandardOutput = $true
+                $pinfo.RedirectStandardError = $true
+                $pinfo.UseShellExecute = $false
+                $pinfo.CreateNoWindow = $true
 
-            # R3-REM-01: Bounded capture — use async reads with post-hoc byte limiting
-            # Event handlers in PS 5.1 have scope issues; use ReadToEndAsync instead
-            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-            $stderrTask = $proc.StandardError.ReadToEndAsync()
+                $proc = [System.Diagnostics.Process]::Start($pinfo)
+                $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+                $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-            # R3-REM-03: Wait with timeout
-            $exited = $proc.WaitForExit($timeoutMs)
-            if (-not $exited) {
-                $timedOut = $true
-                try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
-                $stdout = "(timed out after $($timeoutMs/1000)s)"
-                $stderr = ""
-                $exitCode = -1
+                $exited = $proc.WaitForExit($timeoutMs)
+                if (-not $exited) {
+                    $timedOut = $true
+                    try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
+                    $exitCode = -1
+                } else {
+                    $exitCode = $proc.ExitCode
+                }
+                # Drain streams (they complete after process exits)
+                try {
+                    $rawStdout = $stdoutTask.Result
+                    $rawStderr = $stderrTask.Result
+                    $stdoutTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStdout)
+                    $stderrTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStderr)
+                    if ($stdoutTotalBytes -gt $maxStreamBytes) {
+                        $stdout = $rawStdout.Substring(0, $maxStreamBytes) + "...(truncated)"
+                        $stdoutCapturedBytes = $maxStreamBytes
+                        $stdoutTruncated = $true
+                    } else {
+                        $stdout = $rawStdout
+                        $stdoutCapturedBytes = $stdoutTotalBytes
+                    }
+                    if ($stderrTotalBytes -gt $maxStreamBytes) {
+                        $stderr = $rawStderr.Substring(0, $maxStreamBytes) + "...(truncated)"
+                        $stderrCapturedBytes = $maxStreamBytes
+                        $stderrTruncated = $true
+                    } else {
+                        $stderr = $rawStderr
+                        $stderrCapturedBytes = $stderrTotalBytes
+                    }
+                } catch {
+                    $stdout = "(stream read error: $($_.Exception.Message))"
+                }
             } else {
-                # Get results with bounded capture
-                $rawStdout = $stdoutTask.Result
-                $rawStderr = $stderrTask.Result
-                $stdoutByteCount = [System.Text.Encoding]::UTF8.GetByteCount($rawStdout)
-                $stderrByteCount = [System.Text.Encoding]::UTF8.GetByteCount($rawStderr)
+                # R4-REM-01: For non-timeout fixtures, use temp files for bounded capture
+                $fixtureDir = Join-Path $env:TEMP "plf-$fault-$(Get-Random)"
+                New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+                $stdoutPath = Join-Path $fixtureDir "stdout.txt"
+                $stderrPath = Join-Path $fixtureDir "stderr.txt"
 
-                if ($stdoutByteCount -gt $maxStreamBytes) {
-                    # Truncate to byte limit
-                    $charLimit = [Math]::Floor($maxStreamBytes * $rawStdout.Length / $stdoutByteCount)
-                    $stdout = $rawStdout.Substring(0, $charLimit) + "...(truncated)"
-                    $stdoutCapturedBytes = $maxStreamBytes
-                    $stdoutTruncated = $true
+                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pinfo.FileName = "cmd.exe"
+                $pinfo.Arguments = "/c powershell.exe $childArgs > `"$stdoutPath`" 2> `"$stderrPath`""
+                $pinfo.UseShellExecute = $false
+                $pinfo.CreateNoWindow = $true
+
+                $proc = [System.Diagnostics.Process]::Start($pinfo)
+
+                $exited = $proc.WaitForExit($timeoutMs)
+                if (-not $exited) {
+                    $timedOut = $true
+                    try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
+                    $exitCode = -1
                 } else {
-                    $stdout = $rawStdout
-                    $stdoutCapturedBytes = $stdoutByteCount
+                    $exitCode = $proc.ExitCode
                 }
 
-                if ($stderrByteCount -gt $maxStreamBytes) {
-                    $charLimit = [Math]::Floor($maxStreamBytes * $rawStderr.Length / $stderrByteCount)
-                    $stderr = $rawStderr.Substring(0, $charLimit) + "...(truncated)"
-                    $stderrCapturedBytes = $maxStreamBytes
-                    $stderrTruncated = $true
-                } else {
-                    $stderr = $rawStderr
-                    $stderrCapturedBytes = $stderrByteCount
+                # R4-REM-01: Check file sizes FIRST, then read with byte limit
+                if (Test-Path $stdoutPath) {
+                    $stdoutInfo = Get-Item $stdoutPath -ErrorAction SilentlyContinue
+                    $stdoutTotalBytes = if ($stdoutInfo) { $stdoutInfo.Length } else { 0 }
+                    if ($stdoutTotalBytes -gt 0) {
+                        $readBytes = [Math]::Min($stdoutTotalBytes, $maxStreamBytes)
+                        $fs = [System.IO.File]::OpenRead($stdoutPath)
+                        try {
+                            $buf = New-Object byte[] $readBytes
+                            $bytesRead = $fs.Read($buf, 0, $readBytes)
+                            $stdout = [System.Text.Encoding]::UTF8.GetString($buf, 0, $bytesRead)
+                        } finally { $fs.Close() }
+                        $stdoutCapturedBytes = [System.Text.Encoding]::UTF8.GetByteCount($stdout)
+                        $stdoutTruncated = ($stdoutTotalBytes -gt $maxStreamBytes)
+                    }
                 }
-
-                $exitCode = $proc.ExitCode
+                if (Test-Path $stderrPath) {
+                    $stderrInfo = Get-Item $stderrPath -ErrorAction SilentlyContinue
+                    $stderrTotalBytes = if ($stderrInfo) { $stderrInfo.Length } else { 0 }
+                    if ($stderrTotalBytes -gt 0) {
+                        $readBytes = [Math]::Min($stderrTotalBytes, $maxStreamBytes)
+                        $fs = [System.IO.File]::OpenRead($stderrPath)
+                        try {
+                            $buf = New-Object byte[] $readBytes
+                            $bytesRead = $fs.Read($buf, 0, $readBytes)
+                            $stderr = [System.Text.Encoding]::UTF8.GetString($buf, 0, $bytesRead)
+                        } finally { $fs.Close() }
+                        $stderrCapturedBytes = [System.Text.Encoding]::UTF8.GetByteCount($stderr)
+                        $stderrTruncated = ($stderrTotalBytes -gt $maxStreamBytes)
+                    }
+                }
             }
         } catch {
             $stdout = "(exception: $($_.Exception.Message))"
             $stderr = ""
             $exitCode = -1
         } finally {
-            # R3-REM-03: Cleanup — kill if still running, dispose all resources
+            # R4-REM-01: Cleanup — kill if still running, dispose, remove temp dir
             if ($proc -and -not $proc.HasExited) {
                 try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
             }
             if ($proc) { $proc.Dispose() }
-        }
-
-        # R3-REM-01: Report bounded capture evidence
-        Write-Host "  [$fault] stdout: captured=$stdoutCapturedBytes bytes, truncated=$stdoutTruncated" -ForegroundColor Gray
-        if ($stderr.Length -gt 0) {
-            Write-Host "  [$fault] stderr: captured=$stderrCapturedBytes bytes, truncated=$stderrTruncated" -ForegroundColor Gray
-        }
-
-        # Assertions
-        if ($fault -eq 'Timeout') {
-            # R3-REM-03: Timeout fixture — must trigger timeout, not succeed
-            $exitOk = ($exitCode -eq -1)  # Killed process returns -1
-            $timedOutOk = $timedOut
-            $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
-            $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
-            $pass = $exitOk -and $timedOutOk -and $noSuccessBanner -and $withinBudget
-            $tests += [PSCustomObject]@{
-                Name = "Fault=$fault"
-                Expected = "exit=-1 timedOut noSuccess withinBudget"
-                Actual = "exit=$exitCode timedOut=$timedOutOk noSuccess=$noSuccessBanner budget=$withinBudget captured=$stdoutCapturedBytes"
-                Pass = $pass
+            if ($fixtureDir -and (Test-Path $fixtureDir)) {
+                Remove-Item $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
             }
-        } else {
-            # Normal structural fault assertions
-            $exitOk = ($exitCode -eq 3)
-            $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
-            $noTrustedTotals = ($stdout -notmatch '\d+/\d+ PASS')
-            $noSkippedAsPassed = ($stdout -notmatch 'ProcessLevelFaults.*Passed=5')
-            $hasSuiteValidation = ($stdout -match 'SUITE-VALIDATION')
-            $hasScriptInternal = ($stdout -match 'ScriptInternal')
-            $hasFailStatus = ($stdout -match 'FAIL.*Suite') -or ($stdout -match 'FAIL.*Manifest')
-            $hasStructuredEvidence = $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus
-            $hasUntrusted = ($stdout -match 'UNTRUSTED')
-            $withinTimeout = (-not $timedOut)
-            # R3-REM-02: Stderr should be empty for normal faults
-            $stderrEmpty = ($stderr.Length -eq 0)
-            # R3-REM-01: Bounded capture
-            $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
+        }
 
-            $pass = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasStructuredEvidence -and $hasUntrusted -and $withinTimeout -and $stderrEmpty -and $withinBudget
-            $tests += [PSCustomObject]@{
-                Name = "Fault=$fault"
-                Expected = "exit=3 noSuccess noTrusted struct untrusted stderrEmpty withinBudget"
-                Actual = "exit=$exitCode noSuccess=$noSuccessBanner noTrusted=$noTrustedTotals struct=$hasStructuredEvidence untrusted=$hasUntrusted stderr=$stderrEmpty budget=$withinBudget"
-                Pass = $pass
+        # Report bounded capture evidence
+        Write-Host "  [$fault] stdout: total=$stdoutTotalBytes captured=$stdoutCapturedBytes truncated=$stdoutTruncated" -ForegroundColor Gray
+        if ($stderrTotalBytes -gt 0) {
+            Write-Host "  [$fault] stderr: total=$stderrTotalBytes captured=$stderrCapturedBytes truncated=$stderrTruncated" -ForegroundColor Gray
+        }
+
+        # Assertions by fixture type
+        switch ($fixtureType) {
+            'timeout' {
+                # R4-REM-03: Must trigger timeout, capture pre-timeout marker
+                $exitOk = ($exitCode -eq -1)
+                $timedOutOk = $timedOut
+                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
+                $hasPreTimeoutMarker = ($stdout -match 'PRE-TIMEOUT-MARKER')
+                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
+                # R4-REM-03: captured bytes must be > 0 (marker should be captured)
+                $hasRealCapture = ($stdoutCapturedBytes -gt 0)
+                $pass = $exitOk -and $timedOutOk -and $noSuccessBanner -and $hasPreTimeoutMarker -and $withinBudget -and $hasRealCapture
+                $tests += [PSCustomObject]@{
+                    Name = "Fault=$fault"
+                    Expected = "exit=-1 timedOut noSuccess hasMarker captured>0 withinBudget"
+                    Actual = "exit=$exitCode timedOut=$timedOutOk noSuccess=$noSuccessBanner marker=$hasPreTimeoutMarker captured=$stdoutCapturedBytes budget=$withinBudget"
+                    Pass = $pass
+                }
+            }
+            'structural' {
+                $exitOk = ($exitCode -eq 3)
+                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
+                $noTrustedTotals = ($stdout -notmatch '\d+/\d+ PASS')
+                $noSkippedAsPassed = ($stdout -notmatch 'ProcessLevelFaults.*Passed=\d+')
+                $hasSuiteValidation = ($stdout -match 'SUITE-VALIDATION')
+                $hasScriptInternal = ($stdout -match 'ScriptInternal')
+                $hasFailStatus = ($stdout -match 'FAIL.*Suite') -or ($stdout -match 'FAIL.*Manifest')
+                $hasStructuredEvidence = $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus
+                $hasUntrusted = ($stdout -match 'UNTRUSTED')
+                $withinTimeout = (-not $timedOut)
+                $stderrEmpty = ($stderr.Length -eq 0)
+                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
+                $pass = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasStructuredEvidence -and $hasUntrusted -and $withinTimeout -and $stderrEmpty -and $withinBudget
+                $tests += [PSCustomObject]@{
+                    Name = "Fault=$fault"
+                    Expected = "exit=3 noSuccess noTrusted struct untrusted stderrEmpty withinBudget"
+                    Actual = "exit=$exitCode noSuccess=$noSuccessBanner noTrusted=$noTrustedTotals struct=$hasStructuredEvidence untrusted=$hasUntrusted stderr=$stderrEmpty budget=$withinBudget"
+                    Pass = $pass
+                }
+            }
+            'oversize' {
+                # R4-REM-02: Oversize fixtures — must exit 3, capture bounded, truncated
+                $exitOk = ($exitCode -eq 3)
+                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
+                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
+                # At least one stream must be over limit
+                $anyOverLimit = ($stdoutTotalBytes -gt $maxStreamBytes) -or ($stderrTotalBytes -gt $maxStreamBytes)
+                $anyTruncated = $stdoutTruncated -or $stderrTruncated
+                $pass = $exitOk -and $withinBudget -and $anyOverLimit -and $anyTruncated -and $noSuccessBanner
+                $tests += [PSCustomObject]@{
+                    Name = "Fault=$fault"
+                    Expected = "exit=3 withinBudget anyOverLimit anyTruncated noSuccess"
+                    Actual = "exit=$exitCode budget=$withinBudget stdoutTotal=$stdoutTotalBytes stdoutTrunc=$stdoutTruncated stderrTotal=$stderrTotalBytes stderrTrunc=$stderrTruncated"
+                    Pass = $pass
+                }
+            }
+            'boundary' {
+                # R4-REM-02: Boundary fixtures — exact limit and limit+1
+                $exitOk = ($exitCode -eq 3)
+                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
+                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
+                if ($fault -eq 'BoundaryExact') {
+                    # Exactly at limit: not truncated
+                    $totalOk = ($stdoutTotalBytes -eq $maxStreamBytes)
+                    $notTruncated = (-not $stdoutTruncated)
+                    $pass = $exitOk -and $withinBudget -and $totalOk -and $notTruncated -and $noSuccessBanner
+                    $tests += [PSCustomObject]@{
+                        Name = "Fault=$fault"
+                        Expected = "exit=3 total=limit notTruncated"
+                        Actual = "exit=$exitCode total=$stdoutTotalBytes truncated=$stdoutTruncated captured=$stdoutCapturedBytes"
+                        Pass = $pass
+                    }
+                } else {
+                    # Over limit: truncated
+                    $totalOver = ($stdoutTotalBytes -gt $maxStreamBytes)
+                    $isTruncated = $stdoutTruncated
+                    $pass = $exitOk -and $withinBudget -and $totalOver -and $isTruncated -and $noSuccessBanner
+                    $tests += [PSCustomObject]@{
+                        Name = "Fault=$fault"
+                        Expected = "exit=3 total>limit truncated"
+                        Actual = "exit=$exitCode total=$stdoutTotalBytes truncated=$isTruncated captured=$stdoutCapturedBytes"
+                        Pass = $pass
+                    }
+                }
             }
         }
         if (-not $tests[-1].Pass) { $allPassed = $false }
     }
 
-    $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=6; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
+    # R4-REM-05: Dynamic count from actual faults array
+    $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=$faults.Count; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
 
     Write-Host "`n=== Process-Level Fault Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
@@ -3888,18 +4051,25 @@ if ($SelfTestFastFault) {
         'GateSummary'      = @{ Declared=15;  Actual=15;  Passed=15;  Failed=0 }
         'LockfileReader'   = @{ Declared=102; Actual=102; Passed=102; Failed=0 }
         'ManifestCompare'  = @{ Declared=14;  Actual=14;  Passed=14;  Failed=0 }
-        'SuiteEvidence'    = @{ Declared=5;   Actual=5;   Passed=5;   Failed=0 }
+        'SuiteEvidence'    = @{ Declared=11;  Actual=11;  Passed=11;  Failed=0 }
     }
 
     # Inject fault
     $manifestComparisonForAggregation = $null
+    $maxStreamBytes = 51200  # Must match Test-ProcessLevelFaults
     switch ($SelfTestFault) {
-        'MissingSuite'     { $script:SelfTestSuiteResults.Remove('Aggregation') }
-        'DeclaredMismatch' { $script:SelfTestSuiteResults['Aggregation'].Declared = 999 }
-        'PassedMismatch'   { $script:SelfTestSuiteResults['Aggregation'].Passed = 999 }
-        'FailedNonZero'    { $script:SelfTestSuiteResults['Aggregation'].Failed = 1 }
-        'ManifestMismatch' { $manifestComparisonForAggregation = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z") }
-        'Timeout'          { Write-Host "FAST FAULT: Timeout child starting hang..."; Start-Sleep -Seconds 300 }  # Hang for 5 minutes
+        'MissingSuite'      { $script:SelfTestSuiteResults.Remove('Aggregation') }
+        'DeclaredMismatch'  { $script:SelfTestSuiteResults['Aggregation'].Declared = 999 }
+        'PassedMismatch'    { $script:SelfTestSuiteResults['Aggregation'].Passed = 999 }
+        'FailedNonZero'     { $script:SelfTestSuiteResults['Aggregation'].Failed = 1 }
+        'ManifestMismatch'  { $manifestComparisonForAggregation = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z") }
+        'Timeout'           { Write-Host "PRE-TIMEOUT-MARKER: $(Get-Date -Format 'o')"; [Console]::Out.Flush(); Start-Sleep -Seconds 300 }
+        'StdoutOversize'    { $chunk = "X" * 1024; for ($i = 0; $i -lt 60; $i++) { [Console]::Out.Write($chunk + "`n") }; exit 3 }
+        'StderrOversize'    { $chunk = "E" * 1024; for ($i = 0; $i -lt 60; $i++) { [Console]::Error.Write($chunk + "`n") }; exit 3 }
+        'DualStreamOversize'{ $chunk = "D" * 1024; for ($i = 0; $i -lt 60; $i++) { [Console]::Out.Write($chunk + "`n"); [Console]::Error.Write($chunk + "`n") }; exit 3 }
+        'LongLine'          { [Console]::Out.Write("L" * 61440 + "`n"); exit 3 }
+        'BoundaryExact'     { [Console]::Out.Write("B" * ($maxStreamBytes - 1) + "`n"); exit 3 }
+        'BoundaryOver'      { [Console]::Out.Write("O" * $maxStreamBytes + "`n"); exit 3 }
     }
 
     # Call shared aggregation — same path as normal -SelfTestOnly
@@ -3910,7 +4080,7 @@ if ($SelfTestFastFault) {
       -ManifestComparison $manifestComparisonForAggregation `
       -PureTotal 54 -PurePassed 54 `
       -NodeTotal 102 -NodePassed 102 `
-      -R15Total 19 -R15Passed 19
+      -R15Total 25 -R15Passed 25
 
     Write-Host "`nSELF-TEST OVERALL: $($aggResult.Overall) (exit $($aggResult.ExitCode))" -ForegroundColor $(
         switch ($aggResult.Overall) { "PASS" { "Green" } "FAIL" { "Red" } "BLOCKED" { "Yellow" } "ERROR" { "Magenta" } }
