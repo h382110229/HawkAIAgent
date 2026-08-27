@@ -1,7 +1,7 @@
-# G0-S1 R3 Remediation Evidence Report
+# G0-S1 R4 Remediation Evidence Report
 
-**Gate:** REMEDIATION ROUND 3 PUBLISHED FOR INDEPENDENT REVIEW — Phase B remains BLOCKED
-**Date:** 2026-08-26
+**Gate:** REMEDIATION ROUND 4 PUBLISHED FOR INDEPENDENT REVIEW — Phase B remains BLOCKED
+**Date:** 2026-08-27
 
 ---
 
@@ -9,66 +9,72 @@
 
 | Field | Value |
 |---|---|
-| Commit | `493e162` |
-| Parent | `7a9de9a` (R2 docs) |
-| Subject | `test: add bounded stream capture, stderr redirect, timeout fixture, and fast fault children for R3 remediation` |
+| Commit | `287e51f` |
+| Parent | `257a0c4` (R3 docs) |
+| Subject | `test: add temp-file bounded capture, oversize/boundary fixtures, timeout marker, and count validation matrix for R4 remediation` |
 | Scope | `windows-poc-test-r2.ps1` only |
 
 ### Script blob and SHA-256
 
 | File | Git blob | SHA-256 |
 |---|---|---|
-| `windows-poc-test-r2.ps1` | `faf2f6fd2127a3d218ca5becc292290c8b6d6e41` | `98d6fa998e9a2c6866983789abbe30c1bf501bb195cadf06295c7ad5fb83a5bf` |
+| `windows-poc-test-r2.ps1` | `e3e430c02f58f15afbcd0a697e665f8f67bd000e` | `811c70cd21905b1ff90b9fa96e46b87842435539b6fbdf5c2ee553c5d92f8413` |
 
 *(This document's own blob/hash cannot be known until after this commit.)*
 
 ---
 
-## 2. R3-REM Fixes
+## 2. R4-REM Fixes
 
-### R3-REM-01: Bounded stream capture
+### R4-REM-01: True bounded capture via temp files
 
-**Before:** `ReadToEndAsync()` loaded full stdout into memory, then truncated with `Substring`.
+**Before:** `ReadToEndAsync()` loaded full stdout into memory, then truncated post-hoc.
 
-**After:** `ReadToEndAsync()` for both streams, followed by byte-count check and truncation to `$maxStreamBytes` (50KB). Reports `captured bytes`, `truncated` flag.
+**After:** Non-timeout fixtures use `cmd.exe /c ... > tempfile 2> tempfile` with file-redirect. After process exits, `Get-Item` checks file size FIRST, then reads up to `maxStreamBytes` (50KB) using bounded `FileStream.Read()`. Files cleaned in `finally`.
 
-**Note:** Truly bounded during-read capture via line event handlers was attempted but proved unreliable in PS 5.1 due to scope issues with scriptblock event handlers. The current approach loads via `ReadToEndAsync()` (which completes after process exit) and immediately bounds the result. The fast fault children produce <1KB output, so the unbounded window is negligible.
+Timeout fixture uses direct stream reading (small output only — one marker line).
 
-### R3-REM-02: Stderr redirect and verification
+### R4-REM-02: Oversize/boundary fixtures
 
-**Before:** Only `RedirectStandardOutput=$true`.
+Added 6 new fixtures:
 
-**After:** Both `RedirectStandardOutput=$true` and `RedirectStandardError=$true`. Normal faults expect stderr empty. Timeout fixture ignores stderr.
+| Fixture | Output | Verification |
+|---------|--------|-------------|
+| StdoutOversize | 60KB stdout | total=61500, captured=51200, truncated=True |
+| StderrOversize | 60KB stderr | total=61500, captured=51200, truncated=True |
+| DualStreamOversize | 60KB each | both total=61500, both truncated=True |
+| LongLine | 60KB single line | total=61441, captured=51200, truncated=True |
+| BoundaryExact | 51199 chars + newline = 51200 bytes | total=51200, not truncated |
+| BoundaryOver | 51200 chars + newline = 51201 bytes | total=51201, truncated=True |
 
-### R3-REM-03: Timeout fixture with cleanup
+### R4-REM-03: Timeout fixture with real marker capture
 
-**Before:** No timeout testing.
+**Before:** `captured=0` — default value, not real capture.
 
-**After:** Added `Timeout` fault type. Fast fault child hangs for 300s. Parent kills after 5s timeout. Verifies: exit=-1, timedOut=True, noSuccessBanner, withinBudget. Process disposed in `finally`.
+**After:** Uses direct stream reading (`ReadToEndAsync`). Child outputs `PRE-TIMEOUT-MARKER: <timestamp>` then hangs. Parent kills after 5s, drains streams. Verifies: marker=True, captured=54 bytes (real), timedOut=True.
 
-### R3-REM-04: Fast deterministic fault children
+### R4-REM-04: Count validation fault matrix
 
-**Before:** Each fault child ran full 180-test suite (~90s each).
+Added 6 new tests to Test-SuiteEvidence (T6-T11):
 
-**After:** `-SelfTestFastFault` parameter constructs deterministic valid suite records, injects fault, calls `Invoke-SelfTestAggregation`, exits. Each child completes in <5s.
+| Test | Fault | Result |
+|------|-------|--------|
+| T6 | Missing field (no 'Declared') | ERROR/3 |
+| T7 | String value ('11' not 11) | ERROR/3 |
+| T8 | Float value (11.5) | ERROR/3 |
+| T9 | Negative value (Failed=-1) | ERROR/3 |
+| T10 | Overflow (MaxValue+1) | ERROR/3 |
+| T11 | Passed+Failed != Actual | ERROR/3 |
 
-### R3-REM-05: Complete type validation
+### R4-REM-05: Dynamic displayed inventory
 
-**Before:** Only checked `Passed > Actual` and `Failed < 0`.
+All suite headings, formula, and Declared values derived from runtime objects. No hardcoded counts.
 
-**After:** Checks all 4 required fields exist, must be integer types (`[int]`/`[long]`/`[int64]`), must be >=0, `Passed+Failed=Actual` with overflow check.
+### R4-REM-06: Preflight corrections
 
-### R3-REM-06: Corrected inventory
-
-R2 → R3 delta:
-
-| Category | Count | Detail |
-|----------|-------|--------|
-| Unchanged retained | 175 | All suites except ProcessLevelFaults |
-| Replaced | 5 | ProcessLevelFaults (rewritten with bounded capture, stderr, timeout, fast children) |
-| Added | 1 | Timeout fixture in ProcessLevelFaults |
-| Removed | 0 | — |
-| **Total** | **181** | 175 + 5 + 1 = 181 ✓ |
+- Removed "unbounded window negligible" overclaiming
+- Bounded capture verified with real byte counts from 6 oversize/boundary fixtures
+- Inventory mechanically derived from runtime suite objects
 
 ---
 
@@ -80,10 +86,10 @@ R2 → R3 delta:
 
 ### Normal self-test (consecutive)
 
-| Run | Exit Code | Total | Passed | Failed | Duration |
-|-----|-----------|-------|--------|--------|----------|
-| A | 0 | 181 | 181 | 0 | ~4min |
-| B | 0 | 181 | 181 | 0 | ~4min |
+| Run | Exit Code | Total | Passed | Failed |
+|-----|-----------|-------|--------|--------|
+| A | 0 | 193 | 193 | 0 |
+| B | 0 | 193 | 193 | 0 |
 
 ### Runtime-derived suite inventory
 
@@ -95,34 +101,46 @@ R2 → R3 delta:
 | GateSummary | 15 | 15 | 15 | 0 |
 | LockfileReader | 102 | 102 | 102 | 0 |
 | ManifestCompare | 14 | 14 | 14 | 0 |
-| SuiteEvidence | 5 | 5 | 5 | 0 |
-| ProcessLevelFaults | 6 | 6 | 6 | 0 |
-| **Overall** | **181** | **181** | **181** | **0** |
+| SuiteEvidence | 11 | 11 | 11 | 0 |
+| ProcessLevelFaults | 12 | 12 | 12 | 0 |
+| **Overall** | **193** | **193** | **193** | **0** |
 
-11+24+4+15+102 = 156 + 14+5+6 = 25 = **181** ✓
+11+24+4+15+102 = 156 + 14+11+12 = 37 = **193** ✓
+
+### Bounded capture evidence (from run A)
+
+| Fixture | stdout total | stdout captured | stdout truncated | stderr total | stderr captured | stderr truncated |
+|---------|-------------|----------------|-----------------|-------------|----------------|-----------------|
+| MissingSuite | 483 | 483 | False | 0 | 0 | False |
+| DeclaredMismatch | 483 | 483 | False | 0 | 0 | False |
+| PassedMismatch | 483 | 483 | False | 0 | 0 | False |
+| FailedNonZero | 465 | 465 | False | 0 | 0 | False |
+| ManifestMismatch | 420 | 420 | False | 0 | 0 | False |
+| Timeout | 54 | 54 | False | 0 | 0 | False |
+| StdoutOversize | 61500 | 51200 | True | 0 | 0 | False |
+| StderrOversize | 0 | 0 | False | 61500 | 51200 | True |
+| DualStreamOversize | 61500 | 51200 | True | 61500 | 51200 | True |
+| LongLine | 61441 | 51200 | True | 0 | 0 | False |
+| BoundaryExact | 51200 | 51200 | False | 0 | 0 | False |
+| BoundaryOver | 51201 | 51200 | True | 0 | 0 | False |
+
+All captured bytes ≤ 51200 byte limit. ✓
+Truncated is True if and only if total > limit. ✓
 
 ### Process-level fault fixtures
 
-| Fault | Exit | noSuccess | noTrusted | Structured | UNTRUSTED | stderrEmpty | Budget | Timeout |
-|-------|------|-----------|-----------|------------|-----------|-------------|--------|---------|
+| Fault | Exit | noSuccess | noTrusted | Structured | UNTRUSTED | stderrEmpty | Budget | Marker |
+|-------|------|-----------|-----------|------------|-----------|-------------|--------|--------|
 | MissingSuite | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | DeclaredMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | PassedMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | FailedNonZero | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | ManifestMismatch | 3 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
-| Timeout | -1 | ✓ | — | — | — | — | ✓ | ✓ |
+| Timeout | -1 | ✓ | — | — | — | — | ✓ | ✓ (54 bytes) |
 
-### Bounded capture evidence (from stdout)
-```
-[MissingSuite] stdout: captured=483 bytes, truncated=False
-[DeclaredMismatch] stdout: captured=483 bytes, truncated=False
-[PassedMismatch] stdout: captured=483 bytes, truncated=False
-[FailedNonZero] stdout: captured=465 bytes, truncated=False
-[ManifestMismatch] stdout: captured=420 bytes, truncated=False
-[Timeout] stdout: captured=0 bytes, truncated=False
-```
+### Temp file cleanup
 
-All captured bytes < 51200 byte limit. ✓
+All fixture directories (`plf-*`) removed in `finally` blocks. No orphan temp files.
 
 ---
 
