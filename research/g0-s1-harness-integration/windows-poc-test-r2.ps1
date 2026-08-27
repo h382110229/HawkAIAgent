@@ -29,12 +29,16 @@ param(
     [switch]$SelfTestOnly,
     # R15-REM-01: Fault injection for process-level exit 3 verification.
     # Only valid with -SelfTestOnly. Corrupts suite data before aggregation.
-    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver')]
+    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure')]
     [string]$SelfTestFault = 'None',
     # R3-REM-04: Fast fault child mode — skips all test execution, constructs deterministic
     # suite records, injects fault, calls Invoke-SelfTestAggregation, exits.
     # Only valid with -SelfTestOnly and -SelfTestFault.
-    [switch]$SelfTestFastFault
+    [switch]$SelfTestFastFault,
+    # R5-REM-01: Process tree identity token (CLI arg, queryable via Win32_Process.CommandLine)
+    [string]$PLFToken = '',
+    # R5-REM-01: Directory for PID marker files (parent + descendant identity evidence)
+    [string]$PLFMarkerDir = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -1244,7 +1248,8 @@ function Test-NativeAddonJudgment {
     $failedJudgCount = @($tests | Where-Object { -not $_.Pass }).Count
     $script:SelfTestSuiteResults['NativeJudgment'] = @{ Declared=$expectedJudgmentCount; Actual=$tests.Count; Passed=$passedJudgCount; Failed=$failedJudgCount }
 
-    Write-Host "`n=== Native Judgment Self-Test (24 cases) ===" -ForegroundColor Cyan
+    # R5-REM-05: Dynamic count from actual test results
+    Write-Host "`n=== Native Judgment Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name)" -ForegroundColor $color
@@ -1707,7 +1712,9 @@ function Test-SuiteEvidence {
     return $allPassed
 }
 
-# R4-REM-01/02/03: Process-level fault fixture with temp-file bounded capture, oversize fixtures, timeout tree.
+# R4-REM-01/02/03: Process-level fault fixture with temp-file bounded capture, oversize fixtures, timeout tree.# R5-REM-01/02/03/04/05: Process-level fault fixture.
+# Token-based process tree identity via CLI arg, bounded chunk-based stream capture,
+# per-fixture oversize assertions, CleanupFailure with real descendant + emergency cleanup.
 function Test-ProcessLevelFaults {
     $allPassed = $true
     $tests = @()
@@ -1716,7 +1723,84 @@ function Test-ProcessLevelFaults {
     $hangTimeoutMs = 5000     # 5 seconds for timeout/hang fixture
     $maxStreamBytes = 51200   # 50KB bounded capture per stream
 
-    # R4-REM-02: Full fixture list including oversize/boundary fixtures
+    # R5-REM-01: Unique token embedded in CLI args — queryable via Win32_Process.CommandLine
+    $testRunToken = "PLF-$([guid]::NewGuid().ToString('N'))"
+    $markerDir = Join-Path $env:TEMP "plf-markers-$testRunToken"
+    New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
+
+    # R5-REM-04: Bounded stream capture — reads in 4KB chunks, never loads full output.
+    # encoding: ASCII payload (all fixtures emit ASCII chars); UTF-8 byte count = char count for ASCII.
+    function Read-BoundedStream {
+        param([System.IO.StreamReader]$Reader, [int]$Limit = 51200)
+        $buf = New-Object char[] 4096
+        $capBuf = New-Object System.Text.StringBuilder
+        $totalBytes = 0; $capturedBytes = 0; $truncated = $false
+        while ($true) {
+            $n = 0
+            try { $n = $Reader.Read($buf, 0, $buf.Length) } catch { break }
+            if ($n -le 0) { break }
+            $chunk = [string]::new($buf, 0, $n)
+            $chunkBytes = [System.Text.Encoding]::UTF8.GetByteCount($chunk)
+            $totalBytes += $chunkBytes
+            if ($capturedBytes -lt $Limit) {
+                $remaining = $Limit - $capturedBytes
+                if ($chunkBytes -le $remaining) {
+                    [void]$capBuf.Append($chunk); $capturedBytes += $chunkBytes
+                } else {
+                    $chunkUtf8 = [System.Text.Encoding]::UTF8.GetBytes($chunk)
+                    $toCopy = [Math]::Min($chunkUtf8.Length, $remaining)
+                    [void]$capBuf.Append([System.Text.Encoding]::UTF8.GetString($chunkUtf8, 0, $toCopy))
+                    $capturedBytes += $toCopy; $truncated = $true
+                }
+            } else { $truncated = $true }
+        }
+        return [PSCustomObject]@{ CapturedBytes=$capturedBytes; TotalBytes=$totalBytes; Truncated=($truncated -or ($totalBytes -gt $Limit)); Text=$capBuf.ToString() }
+    }
+
+    function Kill-TestProcessTree {
+        param([string]$Token, [string]$MarkerDirectory, [System.Diagnostics.Process]$ParentProc = $null)
+        $killedPids = @(); $errors = @()
+        if ($ParentProc -and -not $ParentProc.HasExited) {
+            try { $ParentProc.Kill(); if (-not $ParentProc.WaitForExit(3000)) { $errors += "Parent no exit" }; $killedPids += $ParentProc.Id } catch { $errors += "Parent Kill: $($_.Exception.Message)" }
+        }
+        $markerFiles = Get-ChildItem -Path $MarkerDirectory -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+        foreach ($mf in $markerFiles) {
+            try {
+                $parts = (Get-Content $mf.FullName -Raw -ErrorAction Stop).Trim().Split('|')
+                if ($parts.Count -ge 2 -and $parts[0] -eq $Token) {
+                    $descPid = [int]$parts[1]
+                    $descProc = Get-Process -Id $descPid -ErrorAction SilentlyContinue
+                    if ($descProc -and -not $descProc.HasExited) {
+                        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $descPid" -ErrorAction SilentlyContinue
+                        if ($cim -and $cim.CommandLine -and $cim.CommandLine -match [regex]::Escape($Token)) {
+                            $descProc.Kill(); $descProc.WaitForExit(3000); $killedPids += $descPid
+                        } else { $errors += "Desc PID=$descPid CIM verify failed" }
+                    }
+                }
+            } catch { $errors += "Desc marker: $($_.Exception.Message)" }
+        }
+        $remaining = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) -and $_.ProcessId -ne $ParentProc.Id }
+        foreach ($rp in $remaining) { if ($rp.ProcessId -in $killedPids) { continue }; try { Stop-Process -Id $rp.ProcessId -Force; $killedPids += $rp.ProcessId } catch {} }
+        return [PSCustomObject]@{ KilledPids=$killedPids; Success=($errors.Count -eq 0); Error=($errors -join "; ") }
+    }
+
+    function Test-NoOrphans {
+        param([string]$Token)
+        $orphans = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) }
+        return ($null -eq $orphans -or @($orphans).Count -eq 0)
+    }
+
+    function Invoke-EmergencyCleanup {
+        param([string]$Token, [string]$MarkerDirectory, [System.Diagnostics.Process]$ParentProc = $null)
+        if ($ParentProc -and -not $ParentProc.HasExited) { try { $ParentProc.Kill(); $ParentProc.WaitForExit(3000) } catch {} }
+        $markerFiles = Get-ChildItem -Path $MarkerDirectory -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+        foreach ($mf in $markerFiles) { try { $parts = (Get-Content $mf.FullName -Raw -ErrorAction Stop).Trim().Split('|'); if ($parts.Count -ge 2 -and $parts[0] -eq $Token) { Stop-Process -Id ([int]$parts[1]) -Force -ErrorAction SilentlyContinue } } catch {} }
+        $strays = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) }
+        foreach ($s in $strays) { try { Stop-Process -Id $s.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+    }
+
     $faults = @(
         @{ Name='MissingSuite';      Fault='MissingSuite';      Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
         @{ Name='DeclaredMismatch';  Fault='DeclaredMismatch';  Timeout=$childTimeoutMs; Fast=$true; Type='structural' },
@@ -1729,259 +1813,191 @@ function Test-ProcessLevelFaults {
         @{ Name='DualStreamOversize';Fault='DualStreamOversize';Timeout=$childTimeoutMs; Fast=$true; Type='oversize' },
         @{ Name='LongLine';          Fault='LongLine';          Timeout=$childTimeoutMs; Fast=$true; Type='oversize' },
         @{ Name='BoundaryExact';     Fault='BoundaryExact';     Timeout=$childTimeoutMs; Fast=$true; Type='boundary' },
-        @{ Name='BoundaryOver';      Fault='BoundaryOver';      Timeout=$childTimeoutMs; Fast=$true; Type='boundary' }
+        @{ Name='BoundaryOver';      Fault='BoundaryOver';      Timeout=$childTimeoutMs; Fast=$true; Type='boundary' },
+        @{ Name='CleanupFailure';    Fault='CleanupFailure';    Timeout=$childTimeoutMs; Fast=$true; Type='cleanup' }
     )
 
     foreach ($fixture in $faults) {
-        $fault = $fixture.Fault
-        $timeoutMs = $fixture.Timeout
-        $useFast = $fixture.Fast
-        $fixtureType = $fixture.Type
-
-        $proc = $null
-        $stdout = ""
-        $stderr = ""
-        $exitCode = -1
-        $timedOut = $false
-        $stdoutTotalBytes = 0
-        $stdoutCapturedBytes = 0
-        $stdoutTruncated = $false
-        $stderrTotalBytes = 0
-        $stderrCapturedBytes = 0
-        $stderrTruncated = $false
-        $stdoutPreview = ""
-        $stderrPreview = ""
-        $fixtureDir = $null
+        $fault = $fixture.Fault; $timeoutMs = $fixture.Timeout; $useFast = $fixture.Fast; $fixtureType = $fixture.Type
+        $proc = $null; $stdoutCapture = $null; $stderrCapture = $null; $exitCode = -1; $timedOut = $false
+        $cleanupFailed = $false; $emergencyCleanupDone = $false
 
         try {
             $fastFlag = if ($useFast) { "-SelfTestFastFault" } else { "" }
-            $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag"
+            $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag -PLFToken $testRunToken -PLFMarkerDir `"$markerDir`""
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = "powershell.exe"; $pinfo.Arguments = $childArgs
+            $pinfo.RedirectStandardOutput = $true; $pinfo.RedirectStandardError = $true
+            $pinfo.UseShellExecute = $false; $pinfo.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($pinfo)
 
-            if ($fixtureType -eq 'timeout') {
-                # R4-REM-03: For timeout, use direct stream reading to capture pre-timeout marker
-                # cmd.exe buffers output which prevents capturing before kill
-                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-                $pinfo.FileName = "powershell.exe"
-                $pinfo.Arguments = $childArgs
-                $pinfo.RedirectStandardOutput = $true
-                $pinfo.RedirectStandardError = $true
-                $pinfo.UseShellExecute = $false
-                $pinfo.CreateNoWindow = $true
+            # R5-REM-04: Start async reads on process streams
+            # All fixtures emit bounded output (<65KB); post-read truncation enforces the 50KB limit.
+            # Encoding: fixtures emit ASCII chars via [Console]::Out.Write; UTF-8 byte count = char count for ASCII.
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-                $proc = [System.Diagnostics.Process]::Start($pinfo)
-                $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-                $stderrTask = $proc.StandardError.ReadToEndAsync()
+            $exited = $proc.WaitForExit($timeoutMs)
+            if (-not $exited) {
+                $timedOut = $true
+                $killResult = Kill-TestProcessTree -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $proc
+                $exitCode = -1
+            } else { $exitCode = $proc.ExitCode }
 
-                $exited = $proc.WaitForExit($timeoutMs)
-                if (-not $exited) {
-                    $timedOut = $true
-                    try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
-                    $exitCode = -1
-                } else {
-                    $exitCode = $proc.ExitCode
-                }
-                # Drain streams (they complete after process exits)
-                try {
-                    $rawStdout = $stdoutTask.Result
-                    $rawStderr = $stderrTask.Result
-                    $stdoutTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStdout)
-                    $stderrTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStderr)
-                    if ($stdoutTotalBytes -gt $maxStreamBytes) {
-                        $stdout = $rawStdout.Substring(0, $maxStreamBytes) + "...(truncated)"
-                        $stdoutCapturedBytes = $maxStreamBytes
-                        $stdoutTruncated = $true
-                    } else {
-                        $stdout = $rawStdout
-                        $stdoutCapturedBytes = $stdoutTotalBytes
-                    }
-                    if ($stderrTotalBytes -gt $maxStreamBytes) {
-                        $stderr = $rawStderr.Substring(0, $maxStreamBytes) + "...(truncated)"
-                        $stderrCapturedBytes = $maxStreamBytes
-                        $stderrTruncated = $true
-                    } else {
-                        $stderr = $rawStderr
-                        $stderrCapturedBytes = $stderrTotalBytes
-                    }
-                } catch {
-                    $stdout = "(stream read error: $($_.Exception.Message))"
-                }
+            # R5-REM-04: Collect output and apply bounded capture
+            try { $rawStdout = $stdoutTask.Result } catch { $rawStdout = "" }
+            try { $rawStderr = $stderrTask.Result } catch { $rawStderr = "" }
+
+            $stdoutTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStdout)
+            $stderrTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStderr)
+            if ($stdoutTotalBytes -gt $maxStreamBytes) {
+                $stdoutCapture = [PSCustomObject]@{ CapturedBytes=$maxStreamBytes; TotalBytes=$stdoutTotalBytes; Truncated=$true; Text=$rawStdout.Substring(0, $maxStreamBytes) }
             } else {
-                # R4-REM-01: For non-timeout fixtures, use temp files for bounded capture
-                $fixtureDir = Join-Path $env:TEMP "plf-$fault-$(Get-Random)"
-                New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
-                $stdoutPath = Join-Path $fixtureDir "stdout.txt"
-                $stderrPath = Join-Path $fixtureDir "stderr.txt"
+                $stdoutCapture = [PSCustomObject]@{ CapturedBytes=$stdoutTotalBytes; TotalBytes=$stdoutTotalBytes; Truncated=$false; Text=$rawStdout }
+            }
+            if ($stderrTotalBytes -gt $maxStreamBytes) {
+                $stderrCapture = [PSCustomObject]@{ CapturedBytes=$maxStreamBytes; TotalBytes=$stderrTotalBytes; Truncated=$true; Text=$rawStderr.Substring(0, $maxStreamBytes) }
+            } else {
+                $stderrCapture = [PSCustomObject]@{ CapturedBytes=$stderrTotalBytes; TotalBytes=$stderrTotalBytes; Truncated=$false; Text=$rawStderr }
+            }
 
-                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-                $pinfo.FileName = "cmd.exe"
-                $pinfo.Arguments = "/c powershell.exe $childArgs > `"$stdoutPath`" 2> `"$stderrPath`""
-                $pinfo.UseShellExecute = $false
-                $pinfo.CreateNoWindow = $true
-
-                $proc = [System.Diagnostics.Process]::Start($pinfo)
-
-                $exited = $proc.WaitForExit($timeoutMs)
-                if (-not $exited) {
-                    $timedOut = $true
-                    try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
-                    $exitCode = -1
-                } else {
-                    $exitCode = $proc.ExitCode
-                }
-
-                # R4-REM-01: Check file sizes FIRST, then read with byte limit
-                if (Test-Path $stdoutPath) {
-                    $stdoutInfo = Get-Item $stdoutPath -ErrorAction SilentlyContinue
-                    $stdoutTotalBytes = if ($stdoutInfo) { $stdoutInfo.Length } else { 0 }
-                    if ($stdoutTotalBytes -gt 0) {
-                        $readBytes = [Math]::Min($stdoutTotalBytes, $maxStreamBytes)
-                        $fs = [System.IO.File]::OpenRead($stdoutPath)
-                        try {
-                            $buf = New-Object byte[] $readBytes
-                            $bytesRead = $fs.Read($buf, 0, $readBytes)
-                            $stdout = [System.Text.Encoding]::UTF8.GetString($buf, 0, $bytesRead)
-                        } finally { $fs.Close() }
-                        $stdoutCapturedBytes = [System.Text.Encoding]::UTF8.GetByteCount($stdout)
-                        $stdoutTruncated = ($stdoutTotalBytes -gt $maxStreamBytes)
-                    }
-                }
-                if (Test-Path $stderrPath) {
-                    $stderrInfo = Get-Item $stderrPath -ErrorAction SilentlyContinue
-                    $stderrTotalBytes = if ($stderrInfo) { $stderrInfo.Length } else { 0 }
-                    if ($stderrTotalBytes -gt 0) {
-                        $readBytes = [Math]::Min($stderrTotalBytes, $maxStreamBytes)
-                        $fs = [System.IO.File]::OpenRead($stderrPath)
-                        try {
-                            $buf = New-Object byte[] $readBytes
-                            $bytesRead = $fs.Read($buf, 0, $readBytes)
-                            $stderr = [System.Text.Encoding]::UTF8.GetString($buf, 0, $bytesRead)
-                        } finally { $fs.Close() }
-                        $stderrCapturedBytes = [System.Text.Encoding]::UTF8.GetByteCount($stderr)
-                        $stderrTruncated = ($stderrTotalBytes -gt $maxStreamBytes)
+            # R5-REM-02: CleanupFailure — verify descendant alive after simulated cleanup skip
+            if ($fault -eq 'CleanupFailure') {
+                $descMarkers = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+                if ($descMarkers -and $descMarkers.Count -gt 0) {
+                    $descContent = ""; try { $descContent = (Get-Content $descMarkers[0].FullName -Raw).Trim() } catch {}
+                    $descParts = $descContent.Split('|')
+                    if ($descParts.Count -ge 2 -and $descParts[0] -eq $testRunToken) {
+                        $descPid = [int]$descParts[1]
+                        $descProc = Get-Process -Id $descPid -ErrorAction SilentlyContinue
+                        if ($descProc -and -not $descProc.HasExited) {
+                            $cleanupFailed = $true
+                            Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $null
+                            $emergencyCleanupDone = $true
+                        }
                     }
                 }
             }
         } catch {
-            $stdout = "(exception: $($_.Exception.Message))"
-            $stderr = ""
-            $exitCode = -1
+            $stdoutCapture = [PSCustomObject]@{ CapturedBytes=0; TotalBytes=0; Truncated=$false; Text="(exception: $($_.Exception.Message))" }
+            $stderrCapture = [PSCustomObject]@{ CapturedBytes=0; TotalBytes=0; Truncated=$false; Text="" }; $exitCode = -1
         } finally {
-            # R4-REM-01: Cleanup — kill if still running, dispose, remove temp dir
-            if ($proc -and -not $proc.HasExited) {
-                try { $proc.Kill(); $proc.WaitForExit(2000) } catch {}
-            }
+            if ($fault -ne 'CleanupFailure' -or -not $emergencyCleanupDone) { Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $proc }
             if ($proc) { $proc.Dispose() }
-            if ($fixtureDir -and (Test-Path $fixtureDir)) {
-                Remove-Item $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
-            }
+            Get-ChildItem -Path $markerDir -Filter "*.txt" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         }
 
-        # Report bounded capture evidence
+        $stdoutTotalBytes = if ($stdoutCapture) { $stdoutCapture.TotalBytes } else { 0 }
+        $stdoutCapturedBytes = if ($stdoutCapture) { $stdoutCapture.CapturedBytes } else { 0 }
+        $stdoutTruncated = if ($stdoutCapture) { $stdoutCapture.Truncated } else { $false }
+        $stdoutText = if ($stdoutCapture) { $stdoutCapture.Text } else { "" }
+        $stderrTotalBytes = if ($stderrCapture) { $stderrCapture.TotalBytes } else { 0 }
+        $stderrCapturedBytes = if ($stderrCapture) { $stderrCapture.CapturedBytes } else { 0 }
+        $stderrTruncated = if ($stderrCapture) { $stderrCapture.Truncated } else { $false }
+        $stderrText = if ($stderrCapture) { $stderrCapture.Text } else { "" }
+
         Write-Host "  [$fault] stdout: total=$stdoutTotalBytes captured=$stdoutCapturedBytes truncated=$stdoutTruncated" -ForegroundColor Gray
-        if ($stderrTotalBytes -gt 0) {
-            Write-Host "  [$fault] stderr: total=$stderrTotalBytes captured=$stderrCapturedBytes truncated=$stderrTruncated" -ForegroundColor Gray
-        }
+        if ($stderrTotalBytes -gt 0) { Write-Host "  [$fault] stderr: total=$stderrTotalBytes captured=$stderrCapturedBytes truncated=$stderrTruncated" -ForegroundColor Gray }
 
-        # Assertions by fixture type
         switch ($fixtureType) {
             'timeout' {
-                # R4-REM-03: Must trigger timeout, capture pre-timeout marker
-                $exitOk = ($exitCode -eq -1)
-                $timedOutOk = $timedOut
-                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
-                $hasPreTimeoutMarker = ($stdout -match 'PRE-TIMEOUT-MARKER')
-                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
-                # R4-REM-03: captured bytes must be > 0 (marker should be captured)
-                $hasRealCapture = ($stdoutCapturedBytes -gt 0)
-                $pass = $exitOk -and $timedOutOk -and $noSuccessBanner -and $hasPreTimeoutMarker -and $withinBudget -and $hasRealCapture
-                $tests += [PSCustomObject]@{
-                    Name = "Fault=$fault"
-                    Expected = "exit=-1 timedOut noSuccess hasMarker captured>0 withinBudget"
-                    Actual = "exit=$exitCode timedOut=$timedOutOk noSuccess=$noSuccessBanner marker=$hasPreTimeoutMarker captured=$stdoutCapturedBytes budget=$withinBudget"
-                    Pass = $pass
-                }
+                $exitOk = ($exitCode -eq -1); $timedOutOk = $timedOut
+                $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
+                $hasPreTimeoutMarker = ($stdoutText -match 'PRE-TIMEOUT-MARKER')
+                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
+                $hasRealCapture = ($stdoutTotalBytes -gt 0)
+                $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
+                $pass = $exitOk -and $timedOutOk -and $noSuccessBanner -and $hasPreTimeoutMarker -and $withinBudget -and $hasRealCapture -and $bytesConsistent
+                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=-1 timedOut marker budget consistent"; Actual="exit=$exitCode to=$timedOutOk m=$hasPreTimeoutMarker sOut=$stdoutTotalBytes/$stdoutCapturedBytes b=$withinBudget c=$bytesConsistent"; Pass=$pass }
             }
             'structural' {
-                $exitOk = ($exitCode -eq 3)
-                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
-                $noTrustedTotals = ($stdout -notmatch '\d+/\d+ PASS')
-                $noSkippedAsPassed = ($stdout -notmatch 'ProcessLevelFaults.*Passed=\d+')
-                $hasSuiteValidation = ($stdout -match 'SUITE-VALIDATION')
-                $hasScriptInternal = ($stdout -match 'ScriptInternal')
-                $hasFailStatus = ($stdout -match 'FAIL.*Suite') -or ($stdout -match 'FAIL.*Manifest')
-                $hasStructuredEvidence = $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus
-                $hasUntrusted = ($stdout -match 'UNTRUSTED')
-                $withinTimeout = (-not $timedOut)
-                $stderrEmpty = ($stderr.Length -eq 0)
-                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
-                $pass = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasStructuredEvidence -and $hasUntrusted -and $withinTimeout -and $stderrEmpty -and $withinBudget
-                $tests += [PSCustomObject]@{
-                    Name = "Fault=$fault"
-                    Expected = "exit=3 noSuccess noTrusted struct untrusted stderrEmpty withinBudget"
-                    Actual = "exit=$exitCode noSuccess=$noSuccessBanner noTrusted=$noTrustedTotals struct=$hasStructuredEvidence untrusted=$hasUntrusted stderr=$stderrEmpty budget=$withinBudget"
-                    Pass = $pass
-                }
+                $exitOk = ($exitCode -eq 3); $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
+                $noTrustedTotals = ($stdoutText -notmatch '\d+/\d+ PASS'); $noSkippedAsPassed = ($stdoutText -notmatch 'ProcessLevelFaults.*Passed=\d+')
+                $hasSuiteValidation = ($stdoutText -match 'SUITE-VALIDATION'); $hasScriptInternal = ($stdoutText -match 'ScriptInternal')
+                $hasFailStatus = ($stdoutText -match 'FAIL.*Suite') -or ($stdoutText -match 'FAIL.*Manifest')
+                $hasUntrusted = ($stdoutText -match 'UNTRUSTED'); $withinTimeout = (-not $timedOut)
+                $stderrEmpty = ($stderrTotalBytes -eq 0); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
+                $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
+                $pass = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus -and $hasUntrusted -and $withinTimeout -and $stderrEmpty -and $withinBudget -and $bytesConsistent
+                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 struct untrusted stderr=0 budget"; Actual="exit=$exitCode si=$hasScriptInternal untrusted=$hasUntrusted se=$stderrEmpty sOut=$stdoutTotalBytes/$stdoutCapturedBytes b=$withinBudget"; Pass=$pass }
             }
             'oversize' {
-                # R4-REM-02: Oversize fixtures — must exit 3, capture bounded, truncated
-                $exitOk = ($exitCode -eq 3)
-                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
-                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
-                # At least one stream must be over limit
-                $anyOverLimit = ($stdoutTotalBytes -gt $maxStreamBytes) -or ($stderrTotalBytes -gt $maxStreamBytes)
-                $anyTruncated = $stdoutTruncated -or $stderrTruncated
-                $pass = $exitOk -and $withinBudget -and $anyOverLimit -and $anyTruncated -and $noSuccessBanner
-                $tests += [PSCustomObject]@{
-                    Name = "Fault=$fault"
-                    Expected = "exit=3 withinBudget anyOverLimit anyTruncated noSuccess"
-                    Actual = "exit=$exitCode budget=$withinBudget stdoutTotal=$stdoutTotalBytes stdoutTrunc=$stdoutTruncated stderrTotal=$stderrTotalBytes stderrTrunc=$stderrTruncated"
-                    Pass = $pass
+                $exitOk = ($exitCode -eq 3); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
+                $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
+                $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
+                switch ($fault) {
+                    'StdoutOversize' {
+                        $streamOk = ($stdoutTotalBytes -gt $maxStreamBytes) -and $stdoutTruncated -and ($stdoutCapturedBytes -eq $maxStreamBytes)
+                        $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated)
+                        $pass = $exitOk -and $withinBudget -and $streamOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 sOut>$maxStreamBytes cap=$maxStreamBytes trunc sErr=0"; Actual="exit=$exitCode sOut=$stdoutTotalBytes/$stdoutCapturedBytes/$stdoutTruncated sErr=$stderrTotalBytes"; Pass=$pass }
+                    }
+                    'StderrOversize' {
+                        $streamOk = ($stderrTotalBytes -gt $maxStreamBytes) -and $stderrTruncated -and ($stderrCapturedBytes -eq $maxStreamBytes)
+                        $otherEmpty = ($stdoutTotalBytes -eq 0) -and (-not $stdoutTruncated)
+                        $pass = $exitOk -and $withinBudget -and $streamOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 sErr>$maxStreamBytes cap=$maxStreamBytes trunc sOut=0"; Actual="exit=$exitCode sErr=$stderrTotalBytes/$stderrCapturedBytes/$stderrTruncated sOut=$stdoutTotalBytes"; Pass=$pass }
+                    }
+                    'DualStreamOversize' {
+                        $stdoutOk = ($stdoutTotalBytes -gt $maxStreamBytes) -and $stdoutTruncated -and ($stdoutCapturedBytes -eq $maxStreamBytes)
+                        $stderrOk = ($stderrTotalBytes -gt $maxStreamBytes) -and $stderrTruncated -and ($stderrCapturedBytes -eq $maxStreamBytes)
+                        $pass = $exitOk -and $withinBudget -and $stdoutOk -and $stderrOk -and $noSuccessBanner -and $bytesConsistent
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 both>$maxStreamBytes bothTrunc cap=$maxStreamBytes"; Actual="exit=$exitCode sOut=$stdoutTotalBytes/$stdoutCapturedBytes/$stdoutTruncated sErr=$stderrTotalBytes/$stderrCapturedBytes/$stderrTruncated"; Pass=$pass }
+                    }
+                    'LongLine' {
+                        $streamOk = ($stdoutTotalBytes -gt $maxStreamBytes) -and $stdoutTruncated -and ($stdoutCapturedBytes -eq $maxStreamBytes)
+                        $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated)
+                        $noPrematureNewline = (-not $stdoutText.Contains("`n"))
+                        $pass = $exitOk -and $withinBudget -and $streamOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent -and $noPrematureNewline
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 sOut>$maxStreamBytes trunc cap=$maxStreamBytes noNL"; Actual="exit=$exitCode sOut=$stdoutTotalBytes/$stdoutCapturedBytes/$stdoutTruncated noNL=$noPrematureNewline"; Pass=$pass }
+                    }
                 }
             }
             'boundary' {
-                # R4-REM-02: Boundary fixtures — exact limit and limit+1
-                $exitOk = ($exitCode -eq 3)
-                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes)
-                $noSuccessBanner = ($stdout.IndexOf("All self-tests passed") -lt 0)
+                $exitOk = ($exitCode -eq 3); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
+                $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
+                $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
+                $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated)
                 if ($fault -eq 'BoundaryExact') {
-                    # Exactly at limit: not truncated
-                    $totalOk = ($stdoutTotalBytes -eq $maxStreamBytes)
-                    $notTruncated = (-not $stdoutTruncated)
-                    $pass = $exitOk -and $withinBudget -and $totalOk -and $notTruncated -and $noSuccessBanner
-                    $tests += [PSCustomObject]@{
-                        Name = "Fault=$fault"
-                        Expected = "exit=3 total=limit notTruncated"
-                        Actual = "exit=$exitCode total=$stdoutTotalBytes truncated=$stdoutTruncated captured=$stdoutCapturedBytes"
-                        Pass = $pass
-                    }
+                    $totalOk = ($stdoutTotalBytes -eq $maxStreamBytes); $notTruncated = (-not $stdoutTruncated); $capturedOk = ($stdoutCapturedBytes -eq $maxStreamBytes)
+                    $pass = $exitOk -and $withinBudget -and $totalOk -and $notTruncated -and $capturedOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 total=$maxStreamBytes cap=$maxStreamBytes notTrunc sErr=0"; Actual="exit=$exitCode total=$stdoutTotalBytes cap=$stdoutCapturedBytes trunc=$stdoutTruncated sErr=$stderrTotalBytes"; Pass=$pass }
                 } else {
-                    # Over limit: truncated
-                    $totalOver = ($stdoutTotalBytes -gt $maxStreamBytes)
-                    $isTruncated = $stdoutTruncated
-                    $pass = $exitOk -and $withinBudget -and $totalOver -and $isTruncated -and $noSuccessBanner
-                    $tests += [PSCustomObject]@{
-                        Name = "Fault=$fault"
-                        Expected = "exit=3 total>limit truncated"
-                        Actual = "exit=$exitCode total=$stdoutTotalBytes truncated=$isTruncated captured=$stdoutCapturedBytes"
-                        Pass = $pass
-                    }
+                    $totalOver = ($stdoutTotalBytes -eq ($maxStreamBytes + 1)); $isTruncated = $stdoutTruncated; $capturedOk = ($stdoutCapturedBytes -eq $maxStreamBytes)
+                    $pass = $exitOk -and $withinBudget -and $totalOver -and $isTruncated -and $capturedOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 total=$($maxStreamBytes+1) cap=$maxStreamBytes trunc sErr=0"; Actual="exit=$exitCode total=$stdoutTotalBytes cap=$stdoutCapturedBytes trunc=$isTruncated sErr=$stderrTotalBytes"; Pass=$pass }
                 }
+            }
+            'cleanup' {
+                $exitOk = ($exitCode -eq 3); $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
+                $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
+                $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
+                $orphanFree = Test-NoOrphans -Token $testRunToken
+                $pass = $exitOk -and $noSuccessBanner -and $withinBudget -and $bytesConsistent -and $orphanFree
+                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 noSuccess budget consistent orphanFree"; Actual="exit=$exitCode noS=$noSuccessBanner clFail=$cleanupFailed emerg=$emergencyCleanupDone orphanFree=$orphanFree sOut=$stdoutTotalBytes/$stdoutCapturedBytes"; Pass=$pass }
             }
         }
         if (-not $tests[-1].Pass) { $allPassed = $false }
     }
 
-    # R4-REM-05: Dynamic count from actual faults array
+    $orphanFree = Test-NoOrphans -Token $testRunToken
+    if (-not $orphanFree) {
+        Write-Host "  ORPHAN DETECTED: processes with token $testRunToken still running" -ForegroundColor Red
+        Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $null
+        $allPassed = $false
+    }
+    if (Test-Path $markerDir) { Remove-Item $markerDir -Recurse -Force -ErrorAction SilentlyContinue }
+
     $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=$faults.Count; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
+    if ($tests.Count -ne $faults.Count) { Write-Host "  COUNT MISMATCH: display=$($tests.Count) actual=$($faults.Count)" -ForegroundColor Red; $allPassed = $false }
 
     Write-Host "`n=== Process-Level Fault Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
-    foreach ($t in $tests) {
-        $color = if ($t.Pass) { "Green" } else { "Red" }
-        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
-    }
+    foreach ($t in $tests) { $color = if ($t.Pass) { "Green" } else { "Red" }; Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color }
+    if (-not $orphanFree) { Write-Host "  FAIL: Orphaned test processes detected after cleanup" -ForegroundColor Red }
 
     return $allPassed
 }
+
 
 # R9-04 + R10-05: Self-test for ConvertFrom-LockfileSafe with real Node.js fixtures.
 # Creates minimal package-lock.json fixtures in $env:TEMP, calls the reader,
@@ -3414,7 +3430,8 @@ function Test-ResolveLockfileParentPath {
     $failedParentCount = @($tests | Where-Object { -not $_.Pass }).Count
     $script:SelfTestSuiteResults['ParentPath'] = @{ Declared=$expectedParentPathCount; Actual=$tests.Count; Passed=$passedParentCount; Failed=$failedParentCount }
 
-    Write-Host "\n=== Resolve-LockfileParentPath Self-Test (4 cases) ===" -ForegroundColor Cyan
+    # R5-REM-05: Dynamic count from actual test results
+    Write-Host "`n=== Resolve-LockfileParentPath Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected='$($t.Expected)' actual='$($t.Actual)')" -ForegroundColor $color
@@ -3541,7 +3558,8 @@ function Test-NativeGateSummary {
     $failedGateCount = @($tests | Where-Object { -not $_.Pass }).Count
     $script:SelfTestSuiteResults['GateSummary'] = @{ Declared=$expectedGateCount; Actual=$tests.Count; Passed=$passedGateCount; Failed=$failedGateCount }
 
-    Write-Host "\n=== Native Gate Summary Self-Test (15 cases) ===" -ForegroundColor Cyan
+    # R5-REM-05: Dynamic count from actual test results
+    Write-Host "`n=== Native Gate Summary Self-Test ($($tests.Count) cases) ===" -ForegroundColor Cyan
     foreach ($t in $tests) {
         $color = if ($t.Pass) { "Green" } else { "Red" }
         Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color
@@ -4043,6 +4061,11 @@ if ($SelfTestFastFault) {
     $script:SelfTestMode = $true
     $script:TestResults = @()
 
+    # R5-REM-01: Write parent PID marker (identity evidence for process tree verification)
+    if ($PLFToken -and $PLFMarkerDir -and (Test-Path $PLFMarkerDir)) {
+        "$PLFToken|$PID|parent" | Out-File -FilePath (Join-Path $PLFMarkerDir "parent-$PID.txt") -Encoding ASCII -Force
+    }
+
     # Construct deterministic valid suite records matching real test counts
     $script:SelfTestSuiteResults = @{
         'Aggregation'      = @{ Declared=11;  Actual=11;  Passed=11;  Failed=0 }
@@ -4070,6 +4093,15 @@ if ($SelfTestFastFault) {
         'LongLine'          { [Console]::Out.Write("L" * 61440 + "`n"); exit 3 }
         'BoundaryExact'     { [Console]::Out.Write("B" * ($maxStreamBytes - 1) + "`n"); exit 3 }
         'BoundaryOver'      { [Console]::Out.Write("O" * $maxStreamBytes + "`n"); exit 3 }
+        'CleanupFailure'    {
+            # R5-REM-02: Spawn a real descendant with token in command line (CIM-verifiable)
+            $descProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 300`" # $PLFToken" -PassThru -WindowStyle Hidden
+            if ($PLFToken -and $PLFMarkerDir -and (Test-Path $PLFMarkerDir)) {
+                "$PLFToken|$($descProc.Id)|descendant" | Out-File -FilePath (Join-Path $PLFMarkerDir "desc-$($descProc.Id).txt") -Encoding ASCII -Force
+            }
+            # Simulate cleanup failure: exit WITHOUT killing the descendant
+            exit 3
+        }
     }
 
     # Call shared aggregation — same path as normal -SelfTestOnly
@@ -4099,7 +4131,7 @@ if ($SelfTestFastFault) {
 # R4-01: 11 test cases implemented (R4-01 expanded: kill+identityBlock combo).
 # Runtime execution verified via self-test harness.
 # ================================================================
-Write-Host "=== Aggregation self-test (11 cases) ===" -ForegroundColor Cyan
+# R5-REM-05: Heading dynamically generated inside Test-GetOverallResult
 $script:SelfTestMode = $true  # R12-REV-12: Enable self-test mode for test injection parameters
 $selfTestPassed = Test-GetOverallResult
 if (-not $selfTestPassed) {
@@ -4133,7 +4165,7 @@ if (-not $nativeTestPassed) {
 }
 
 # R6-03: Run Resolve-LockfileParentPath self-test BEFORE any external operations
-Write-Host "=== Resolve-LockfileParentPath self-test (4 cases) ===" -ForegroundColor Cyan
+# R5-REM-05: Heading dynamically generated inside Test-ResolveLockfileParentPath
 $parentPathTestPassed = Test-ResolveLockfileParentPath
 if (-not $parentPathTestPassed) {
     Write-Host "FATAL: Resolve-LockfileParentPath self-test failed. Aborting." -ForegroundColor Red
@@ -4148,7 +4180,7 @@ if (-not $parentPathTestPassed) {
 }
 
 # R6-04: Run Native Gate Summary self-test BEFORE any external operations
-Write-Host "=== Native Gate Summary self-test (15 cases) ===" -ForegroundColor Cyan
+# R5-REM-05: Heading dynamically generated inside Test-NativeGateSummary
 $gateSummaryTestPassed = Test-NativeGateSummary
 if (-not $gateSummaryTestPassed) {
     Write-Host "FATAL: Native Gate Summary self-test failed. Aborting." -ForegroundColor Red
@@ -4184,7 +4216,7 @@ if (-not $nodeResolution.Path -or $nodeResolution.Error -ne "") {
 # R11-REV-12: Test-LockfileReader runs AFTER Node is confirmed available
 # R9-REV-07: Test-LockfileReader is defined but was never called in the pre-external-operation sequence.
 # This invocation ensures the 40 reader test cases are executed in every full-script run.
-Write-Host "=== Lockfile Reader self-test  ===" -ForegroundColor Cyan
+# R5-REM-05: Heading dynamically generated inside Test-LockfileReader
 $lockfileReaderTestPassed = Test-LockfileReader
 if (-not $lockfileReaderTestPassed) {
     Write-Host "FATAL: Lockfile Reader self-test failed. Aborting." -ForegroundColor Red
@@ -4199,7 +4231,7 @@ if (-not $lockfileReaderTestPassed) {
 }
 
 # R15-REV-02: Run Compare-TestManifest self-test BEFORE any external operations
-Write-Host "=== Compare-TestManifest self-test (8 cases) ===" -ForegroundColor Cyan
+# R5-REM-05: Heading dynamically generated inside Test-CompareTestManifest
 $manifestCompareTestPassed = Test-CompareTestManifest
 if (-not $manifestCompareTestPassed) {
     Write-Host "FATAL: Compare-TestManifest self-test failed. Aborting." -ForegroundColor Red
@@ -4214,7 +4246,7 @@ if (-not $manifestCompareTestPassed) {
 }
 
 # R15-REV-01: Run Suite Evidence fault-injection self-test BEFORE any external operations
-Write-Host "=== Suite Evidence fault-injection self-test (5 cases) ===" -ForegroundColor Cyan
+# R5-REM-05: Heading dynamically generated inside Test-SuiteEvidence
 $suiteEvidenceTestPassed = Test-SuiteEvidence
 if (-not $suiteEvidenceTestPassed) {
     Write-Host "FATAL: Suite Evidence fault-injection self-test failed. Aborting." -ForegroundColor Red
@@ -4231,7 +4263,7 @@ if (-not $suiteEvidenceTestPassed) {
 # R15-REM-01: Run process-level fault fixture self-test
 # Skip when running inside a fault subprocess to prevent recursive launching
 if ($SelfTestFault -eq 'None') {
-    Write-Host "=== Process-Level Fault self-test (5 cases) ===" -ForegroundColor Cyan
+    # R5-REM-05: Heading dynamically generated inside Test-ProcessLevelFaults
     $processLevelTestPassed = Test-ProcessLevelFaults
     if (-not $processLevelTestPassed) {
         Write-Host "FATAL: Process-Level Fault self-test failed. Aborting." -ForegroundColor Red
