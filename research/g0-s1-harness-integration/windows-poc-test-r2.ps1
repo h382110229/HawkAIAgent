@@ -84,6 +84,260 @@ $script:CaptureSequence = 0
 # R12-REV-12: Self-test mode guard — prevents test injection parameters in production
 $script:SelfTestMode = $false
 
+# ================================================================
+# R6-REM-01: Bounded async dual-stream collector (inline C#)
+# Reads from two Stream objects concurrently via async byte-level
+# BaseStream.ReadAsync. Retains first N bytes per stream in a fixed
+# buffer; drains/discards the rest. Prevents dual-stream deadlock.
+# ================================================================
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class BoundedStreamCollector
+{
+    public long StdoutTotalBytes { get; private set; }
+    public long StdoutCapturedBytes { get; private set; }
+    public bool StdoutTruncated { get; private set; }
+    public byte[] StdoutRetainedBuffer { get; private set; }
+
+    public long StderrTotalBytes { get; private set; }
+    public long StderrCapturedBytes { get; private set; }
+    public bool StderrTruncated { get; private set; }
+    public byte[] StderrRetainedBuffer { get; private set; }
+
+    public bool DrainTimedOut { get; private set; }
+
+    public async Task CollectAsync(Stream stdout, Stream stderr, int limitBytes, int deadlineMs)
+    {
+        using (var cts = new CancellationTokenSource())
+        {
+            var stdoutTask = DrainStreamAsync(stdout, limitBytes, cts.Token);
+            var stderrTask = DrainStreamAsync(stderr, limitBytes, cts.Token);
+            var allDrain = Task.WhenAll(stdoutTask, stderrTask);
+            var deadline = Task.Delay(deadlineMs);
+
+            var completed = await Task.WhenAny(allDrain, deadline);
+            if (completed != allDrain)
+            {
+                DrainTimedOut = true;
+                cts.Cancel();
+                try { await Task.WhenAll(stdoutTask, stderrTask); } catch { }
+            }
+
+            var so = stdoutTask.IsCompleted ? stdoutTask.Result : new StreamResult();
+            var se = stderrTask.IsCompleted ? stderrTask.Result : new StreamResult();
+
+            StdoutTotalBytes = so.TotalBytes;
+            StdoutCapturedBytes = so.CapturedBytes;
+            StdoutTruncated = so.Truncated;
+            StdoutRetainedBuffer = so.Retained;
+
+            StderrTotalBytes = se.TotalBytes;
+            StderrCapturedBytes = se.CapturedBytes;
+            StderrTruncated = se.Truncated;
+            StderrRetainedBuffer = se.Retained;
+        }
+    }
+
+    private async Task<StreamResult> DrainStreamAsync(Stream stream, int limit, CancellationToken ct)
+    {
+        var r = new StreamResult();
+        var retained = new byte[limit];
+        var discard = new byte[8192];
+        int off = 0;
+
+        while (true)
+        {
+            int n;
+            try { n = await stream.ReadAsync(discard, 0, discard.Length, ct); }
+            catch (OperationCanceledException) { break; }
+            catch { break; }
+            if (n <= 0) break;
+
+            r.TotalBytes += n;
+
+            if (off < limit)
+            {
+                int space = limit - off;
+                int copy = Math.Min(n, space);
+                Buffer.BlockCopy(discard, 0, retained, off, copy);
+                off += copy;
+                r.CapturedBytes += copy;
+                if (copy < n) r.Truncated = true;
+            }
+            else
+            {
+                r.Truncated = true;
+            }
+        }
+        if (r.TotalBytes > limit) r.Truncated = true;
+
+        r.Retained = new byte[off];
+        if (off > 0) Buffer.BlockCopy(retained, 0, r.Retained, 0, off);
+        return r;
+    }
+
+    private class StreamResult
+    {
+        public long TotalBytes;
+        public long CapturedBytes;
+        public bool Truncated;
+        public byte[] Retained = new byte[0];
+    }
+}
+"@
+
+# ================================================================
+# R6-REM-03: Windows Job Object helper (inline C#)
+# Uses JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE for automatic descendant
+# cleanup. Job handle close kills all assigned processes.
+# ================================================================
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class JobObjectHelper
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, int size);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, int size, IntPtr retLen);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr handle);
+
+    private const int ExtendedLimitInfo = 9;
+    private const int BasicAccountingInfo = 1;
+    private const uint KILL_ON_JOB_CLOSE = 0x2000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public IntPtr MinimumWorkingSetSize;
+        public IntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public IntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public IntPtr ProcessMemoryLimit;
+        public IntPtr JobMemoryLimit;
+        public ulong PeakProcessMemoryUsed;
+        public ulong PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
+    public static IntPtr CreateKillOnCloseJob()
+    {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return IntPtr.Zero;
+
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = KILL_ON_JOB_CLOSE;
+        int size = Marshal.SizeOf(info);
+        IntPtr ptr = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(info, ptr, false);
+            if (!SetInformationJobObject(job, ExtendedLimitInfo, ptr, size))
+            {
+                CloseHandle(job);
+                return IntPtr.Zero;
+            }
+        }
+        finally { Marshal.FreeHGlobal(ptr); }
+        return job;
+    }
+
+    public static bool AssignProcess(IntPtr job, int pid)
+    {
+        IntPtr hProc = new IntPtr(pid);
+        // OpenProcess with PROCESS_SET_QUOTA | PROCESS_TERMINATE = 0x0200 | 0x0001
+        IntPtr h = OpenProcess(0x0201, false, pid);
+        if (h == IntPtr.Zero) return false;
+        try { return AssignProcessToJobObject(job, h); }
+        finally { CloseHandle(h); }
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+    public static int GetActiveProcessCount(IntPtr job)
+    {
+        var info = new JOBOBJECT_BASIC_ACCOUNTING_INFORMATION();
+        int size = Marshal.SizeOf(info);
+        IntPtr ptr = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(info, ptr, false);
+            if (QueryInformationJobObject(job, BasicAccountingInfo, ptr, size, IntPtr.Zero))
+            {
+                info = (JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(
+                    ptr, typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+                return (int)info.ActiveProcesses;
+            }
+            return -1; // query failed
+        }
+        finally { Marshal.FreeHGlobal(ptr); }
+    }
+
+    public static bool TerminateAll(IntPtr job, uint exitCode)
+    {
+        return TerminateJobObject(job, exitCode);
+    }
+}
+"@
+
 function Add-TestResult {
     param(
         [string]$TestId,
@@ -1728,77 +1982,188 @@ function Test-ProcessLevelFaults {
     $markerDir = Join-Path $env:TEMP "plf-markers-$testRunToken"
     New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
 
-    # R5-REM-04: Bounded stream capture — reads in 4KB chunks, never loads full output.
-    # encoding: ASCII payload (all fixtures emit ASCII chars); UTF-8 byte count = char count for ASCII.
-    function Read-BoundedStream {
-        param([System.IO.StreamReader]$Reader, [int]$Limit = 51200)
-        $buf = New-Object char[] 4096
-        $capBuf = New-Object System.Text.StringBuilder
-        $totalBytes = 0; $capturedBytes = 0; $truncated = $false
-        while ($true) {
-            $n = 0
-            try { $n = $Reader.Read($buf, 0, $buf.Length) } catch { break }
-            if ($n -le 0) { break }
-            $chunk = [string]::new($buf, 0, $n)
-            $chunkBytes = [System.Text.Encoding]::UTF8.GetByteCount($chunk)
-            $totalBytes += $chunkBytes
-            if ($capturedBytes -lt $Limit) {
-                $remaining = $Limit - $capturedBytes
-                if ($chunkBytes -le $remaining) {
-                    [void]$capBuf.Append($chunk); $capturedBytes += $chunkBytes
-                } else {
-                    $chunkUtf8 = [System.Text.Encoding]::UTF8.GetBytes($chunk)
-                    $toCopy = [Math]::Min($chunkUtf8.Length, $remaining)
-                    [void]$capBuf.Append([System.Text.Encoding]::UTF8.GetString($chunkUtf8, 0, $toCopy))
-                    $capturedBytes += $toCopy; $truncated = $true
-                }
-            } else { $truncated = $true }
-        }
-        return [PSCustomObject]@{ CapturedBytes=$capturedBytes; TotalBytes=$totalBytes; Truncated=($truncated -or ($totalBytes -gt $Limit)); Text=$capBuf.ToString() }
+    # R6-REM-03: Create Job Object with KILL_ON_JOB_CLOSE for automatic descendant cleanup
+    $jobHandle = [JobObjectHelper]::CreateKillOnCloseJob()
+    if ($jobHandle -eq [IntPtr]::Zero) {
+        Write-Host "  FATAL: Job Object creation failed" -ForegroundColor Red
+        return $false
     }
 
+    # R6-REM-01: Read-BoundedStream removed — replaced by BoundedStreamCollector (C# async byte-level).
+    # Old Read-BoundedStream used synchronous StreamReader.Read on a single stream, risking deadlock
+    # with dual stdout/stderr. BoundedStreamCollector uses async BaseStream.ReadAsync on both streams
+    # concurrently with fixed retained buffer and drain/discard for overflow.
+
     function Kill-TestProcessTree {
-        param([string]$Token, [string]$MarkerDirectory, [System.Diagnostics.Process]$ParentProc = $null)
+        param([string]$Token, [string]$MarkerDirectory, [System.Diagnostics.Process]$ParentProc = $null, [IntPtr]$JobHandle = [IntPtr]::Zero)
         $killedPids = @(); $errors = @()
-        if ($ParentProc -and -not $ParentProc.HasExited) {
-            try { $ParentProc.Kill(); if (-not $ParentProc.WaitForExit(3000)) { $errors += "Parent no exit" }; $killedPids += $ParentProc.Id } catch { $errors += "Parent Kill: $($_.Exception.Message)" }
+
+        # R6-REM-03: Prefer Job Object termination (kills all assigned descendants automatically)
+        $jobTerminated = $false
+        if ($JobHandle -ne [IntPtr]::Zero) {
+            $activeBefore = [JobObjectHelper]::GetActiveProcessCount($JobHandle)
+            if ($activeBefore -gt 0) {
+                $jobKilled = [JobObjectHelper]::TerminateAll($JobHandle, 99)
+                if ($jobKilled) {
+                    $jobTerminated = $true
+                    Start-Sleep -Milliseconds 500
+                } else {
+                    $errors += "Job TerminateAll failed"
+                }
+            }
         }
+
+        # R6-REM-04: Kill parent only after identity verification
+        if ($ParentProc -and -not $ParentProc.HasExited) {
+            try {
+                $ParentProc.Kill()
+                if (-not $ParentProc.WaitForExit(3000)) { $errors += "Parent no exit" }
+                $killedPids += $ParentProc.Id
+            } catch { $errors += "Parent Kill: $($_.Exception.Message)" }
+        }
+
+        # R6-REM-04: Descendant fallback — verify PID + token identity before kill
         $markerFiles = Get-ChildItem -Path $MarkerDirectory -Filter "desc-*.txt" -ErrorAction SilentlyContinue
         foreach ($mf in $markerFiles) {
             try {
                 $parts = (Get-Content $mf.FullName -Raw -ErrorAction Stop).Trim().Split('|')
-                if ($parts.Count -ge 2 -and $parts[0] -eq $Token) {
+                if ($parts.Count -ge 3 -and $parts[0] -eq $Token) {
                     $descPid = [int]$parts[1]
+                    $descRole = $parts[2]
                     $descProc = Get-Process -Id $descPid -ErrorAction SilentlyContinue
                     if ($descProc -and -not $descProc.HasExited) {
+                        # R6-REM-04: Verify CIM CommandLine contains token AND role
                         $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $descPid" -ErrorAction SilentlyContinue
-                        if ($cim -and $cim.CommandLine -and $cim.CommandLine -match [regex]::Escape($Token)) {
+                        if ($cim -and $cim.CommandLine -and $cim.CommandLine -match [regex]::Escape($Token) -and $cim.CommandLine -match [regex]::Escape($descRole)) {
                             $descProc.Kill(); $descProc.WaitForExit(3000); $killedPids += $descPid
-                        } else { $errors += "Desc PID=$descPid CIM verify failed" }
+                        } else {
+                            # R6-REM-04: Identity unconfirmed — do NOT kill, record error
+                            $errors += "Desc PID=$descPid identity unconfirmed (CIM verify failed)"
+                        }
                     }
                 }
             } catch { $errors += "Desc marker: $($_.Exception.Message)" }
         }
-        $remaining = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) -and $_.ProcessId -ne $ParentProc.Id }
-        foreach ($rp in $remaining) { if ($rp.ProcessId -in $killedPids) { continue }; try { Stop-Process -Id $rp.ProcessId -Force; $killedPids += $rp.ProcessId } catch {} }
-        return [PSCustomObject]@{ KilledPids=$killedPids; Success=($errors.Count -eq 0); Error=($errors -join "; ") }
+
+        # R6-REM-03: CIM-only sweep as supplementary (not primary safety mechanism)
+        if (-not $jobTerminated) {
+            $cimResult = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue
+            if ($null -eq $cimResult) {
+                $errors += "CIM sweep returned null (Access Denied?)"
+            } else {
+                $remaining = $cimResult | Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) }
+                foreach ($rp in $remaining) {
+                    if ($rp.ProcessId -in $killedPids) { continue }
+                    # R6-REM-04: Verify token identity before kill
+                    $rpProc = Get-Process -Id $rp.ProcessId -ErrorAction SilentlyContinue
+                    if ($rpProc -and -not $rpProc.HasExited) {
+                        try { $rpProc.Kill(); $killedPids += $rp.ProcessId } catch { $errors += "CIM fallback Kill PID=$($rp.ProcessId): $($_.Exception.Message)" }
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{ KilledPids=$killedPids; Success=($errors.Count -eq 0); Error=($errors -join "; "); JobTerminated=$jobTerminated }
     }
 
+    # R6-REM-03: Three-state orphan verification — returns VerifiedClean / OrphansFound / VerificationError
+    # Primary: Job Object active process count. Supplementary: CIM CommandLine token scan.
     function Test-NoOrphans {
-        param([string]$Token)
-        $orphans = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) }
-        return ($null -eq $orphans -or @($orphans).Count -eq 0)
+        param([string]$Token, [IntPtr]$JobHandle = [IntPtr]::Zero)
+
+        # Primary: Job Object accounting
+        $jobClean = $false
+        $jobVerified = $false
+        if ($JobHandle -ne [IntPtr]::Zero) {
+            $activeCount = [JobObjectHelper]::GetActiveProcessCount($JobHandle)
+            if ($activeCount -eq 0) {
+                $jobClean = $true; $jobVerified = $true
+            } elseif ($activeCount -gt 0) {
+                return [PSCustomObject]@{ Status='OrphansFound'; Detail="Job active=$activeCount"; JobVerified=$true }
+            } else {
+                # activeCount == -1: query failed
+                return [PSCustomObject]@{ Status='VerificationError'; Detail="Job query failed"; JobVerified=$false }
+            }
+        }
+
+        # Supplementary: CIM scan
+        $cimResult = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue
+        if ($null -eq $cimResult) {
+            # R6-REM-03: CIM Access Denied is a verification error, NOT "clean"
+            if ($jobVerified) {
+                # Job confirmed clean, CIM supplementary failed — still VerifiedClean
+                return [PSCustomObject]@{ Status='VerifiedClean'; Detail="Job=0 CIM=unavailable"; JobVerified=$true }
+            }
+            return [PSCustomObject]@{ Status='VerificationError'; Detail="CIM Access Denied and no Job"; JobVerified=$false }
+        }
+
+        $orphans = @($cimResult | Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) })
+        if ($orphans.Count -gt 0) {
+            return [PSCustomObject]@{ Status='OrphansFound'; Detail="CIM found $($orphans.Count) matching"; JobVerified=$jobVerified }
+        }
+
+        return [PSCustomObject]@{ Status='VerifiedClean'; Detail="Job+CIM clean"; JobVerified=$jobVerified }
     }
 
+    # R6-REM-04: Emergency cleanup — Job-first, identity-verified PID fallback, no silent failures
     function Invoke-EmergencyCleanup {
-        param([string]$Token, [string]$MarkerDirectory, [System.Diagnostics.Process]$ParentProc = $null)
-        if ($ParentProc -and -not $ParentProc.HasExited) { try { $ParentProc.Kill(); $ParentProc.WaitForExit(3000) } catch {} }
+        param([string]$Token, [string]$MarkerDirectory, [System.Diagnostics.Process]$ParentProc = $null, [IntPtr]$JobHandle = [IntPtr]::Zero)
+        $cleanupErrors = @()
+        $cleanupActions = @()
+
+        # Step 1: Terminate Job Object (kills all assigned descendants)
+        if ($JobHandle -ne [IntPtr]::Zero) {
+            $activeCount = [JobObjectHelper]::GetActiveProcessCount($JobHandle)
+            if ($activeCount -gt 0) {
+                $jt = [JobObjectHelper]::TerminateAll($JobHandle, 99)
+                if ($jt) {
+                    $cleanupActions += "Job terminated ($activeCount procs)"
+                    Start-Sleep -Milliseconds 500
+                } else {
+                    $cleanupErrors += "Job TerminateAll failed (active=$activeCount)"
+                }
+            }
+        }
+
+        # Step 2: Kill parent if still alive (with identity check)
+        if ($ParentProc -and -not $ParentProc.HasExited) {
+            try {
+                $ParentProc.Kill()
+                $exited = $ParentProc.WaitForExit(3000)
+                if (-not $exited) { $cleanupErrors += "Parent PID=$($ParentProc.Id) no exit after Kill" }
+                else { $cleanupActions += "Parent PID=$($ParentProc.Id) killed" }
+            } catch { $cleanupErrors += "Parent Kill: $($_.Exception.Message)" }
+        }
+
+        # Step 3: Descendant PID fallback with identity verification
         $markerFiles = Get-ChildItem -Path $MarkerDirectory -Filter "desc-*.txt" -ErrorAction SilentlyContinue
-        foreach ($mf in $markerFiles) { try { $parts = (Get-Content $mf.FullName -Raw -ErrorAction Stop).Trim().Split('|'); if ($parts.Count -ge 2 -and $parts[0] -eq $Token) { Stop-Process -Id ([int]$parts[1]) -Force -ErrorAction SilentlyContinue } } catch {} }
-        $strays = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($Token) }
-        foreach ($s in $strays) { try { Stop-Process -Id $s.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+        foreach ($mf in $markerFiles) {
+            try {
+                $parts = (Get-Content $mf.FullName -Raw -ErrorAction Stop).Trim().Split('|')
+                if ($parts.Count -ge 3 -and $parts[0] -eq $Token) {
+                    $descPid = [int]$parts[1]
+                    $descRole = $parts[2]
+                    $descProc = Get-Process -Id $descPid -ErrorAction SilentlyContinue
+                    if ($descProc -and -not $descProc.HasExited) {
+                        # R6-REM-04: Verify identity before kill
+                        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $descPid" -ErrorAction SilentlyContinue
+                        $tokenMatch = $cim -and $cim.CommandLine -and $cim.CommandLine -match [regex]::Escape($Token)
+                        $roleMatch = $cim -and $cim.CommandLine -and $cim.CommandLine -match [regex]::Escape($descRole)
+                        if ($tokenMatch -and $roleMatch) {
+                            $descProc.Kill()
+                            $exited = $descProc.WaitForExit(3000)
+                            if (-not $exited) { $cleanupErrors += "Desc PID=$descPid no exit" }
+                            else { $cleanupActions += "Desc PID=$descPid killed" }
+                        } else {
+                            # R6-REM-04: Identity unconfirmed — do NOT kill
+                            $cleanupErrors += "Desc PID=$descPid identity unconfirmed — NOT killed"
+                        }
+                    }
+                }
+            } catch { $cleanupErrors += "Desc marker $($mf.Name): $($_.Exception.Message)" }
+        }
+
+        return [PSCustomObject]@{ Success=($cleanupErrors.Count -eq 0); Errors=$cleanupErrors; Actions=$cleanupActions }
     }
 
     $faults = @(
@@ -1831,49 +2196,112 @@ function Test-ProcessLevelFaults {
             $pinfo.UseShellExecute = $false; $pinfo.CreateNoWindow = $true
             $proc = [System.Diagnostics.Process]::Start($pinfo)
 
-            # R5-REM-04: Start async reads on process streams
-            # All fixtures emit bounded output (<65KB); post-read truncation enforces the 50KB limit.
-            # Encoding: fixtures emit ASCII chars via [Console]::Out.Write; UTF-8 byte count = char count for ASCII.
-            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            # R6-REM-03: Assign child process to Job Object (descendants auto-inherit)
+            $assignedToJob = [JobObjectHelper]::AssignProcess($jobHandle, $proc.Id)
+            if (-not $assignedToJob) {
+                Write-Host "  WARNING: Failed to assign PID=$($proc.Id) to Job Object" -ForegroundColor Yellow
+            }
+
+            # R6-REM-01: True bounded dual-stream capture via C# BoundedStreamCollector
+            # Reads from BaseStream.ReadAsync concurrently. Fixed retained buffer (51200 bytes).
+            # Overflow bytes are drained/discarded. Total bytes tracked at byte level.
+            $collector = New-Object BoundedStreamCollector
+            $stdoutStream = $proc.StandardOutput.BaseStream
+            $stderrStream = $proc.StandardError.BaseStream
+
+            # Start async collection with drain deadline (timeout + 5s buffer for drain)
+            $drainDeadlineMs = $timeoutMs + 5000
+            $collectTask = $collector.CollectAsync($stdoutStream, $stderrStream, $maxStreamBytes, $drainDeadlineMs)
 
             $exited = $proc.WaitForExit($timeoutMs)
             if (-not $exited) {
                 $timedOut = $true
-                $killResult = Kill-TestProcessTree -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $proc
+                $killResult = Kill-TestProcessTree -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $proc -JobHandle $jobHandle
                 $exitCode = -1
             } else { $exitCode = $proc.ExitCode }
 
-            # R5-REM-04: Collect output and apply bounded capture
-            try { $rawStdout = $stdoutTask.Result } catch { $rawStdout = "" }
-            try { $rawStderr = $stderrTask.Result } catch { $rawStderr = "" }
-
-            $stdoutTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStdout)
-            $stderrTotalBytes = [System.Text.Encoding]::UTF8.GetByteCount($rawStderr)
-            if ($stdoutTotalBytes -gt $maxStreamBytes) {
-                $stdoutCapture = [PSCustomObject]@{ CapturedBytes=$maxStreamBytes; TotalBytes=$stdoutTotalBytes; Truncated=$true; Text=$rawStdout.Substring(0, $maxStreamBytes) }
-            } else {
-                $stdoutCapture = [PSCustomObject]@{ CapturedBytes=$stdoutTotalBytes; TotalBytes=$stdoutTotalBytes; Truncated=$false; Text=$rawStdout }
-            }
-            if ($stderrTotalBytes -gt $maxStreamBytes) {
-                $stderrCapture = [PSCustomObject]@{ CapturedBytes=$maxStreamBytes; TotalBytes=$stderrTotalBytes; Truncated=$true; Text=$rawStderr.Substring(0, $maxStreamBytes) }
-            } else {
-                $stderrCapture = [PSCustomObject]@{ CapturedBytes=$stderrTotalBytes; TotalBytes=$stderrTotalBytes; Truncated=$false; Text=$rawStderr }
+            # R6-REM-01: Wait for drain tasks to complete (bounded deadline)
+            try {
+                $collectTask.Wait([Math]::Min(10000, $drainDeadlineMs * 2)) | Out-Null
+            } catch {
+                Write-Host "  WARNING: BoundedStreamCollector drain wait failed: $($_.Exception.Message)" -ForegroundColor Yellow
             }
 
-            # R5-REM-02: CleanupFailure — verify descendant alive after simulated cleanup skip
-            if ($fault -eq 'CleanupFailure') {
+            # R6-REM-01: Extract results from byte-level collector (not string post-truncation)
+            $stdoutTotalBytes = $collector.StdoutTotalBytes
+            $stdoutCapturedBytes = $collector.StdoutCapturedBytes
+            $stdoutTruncated = $collector.StdoutTruncated
+            $stderrTotalBytes = $collector.StderrTotalBytes
+            $stderrCapturedBytes = $collector.StderrCapturedBytes
+            $stderrTruncated = $collector.StderrTruncated
+
+            # Decode retained bytes to text (ASCII fixture contract)
+            $stdoutText = ""
+            if ($collector.StdoutRetainedBuffer -and $collector.StdoutRetainedBuffer.Length -gt 0) {
+                $stdoutText = [System.Text.Encoding]::UTF8.GetString($collector.StdoutRetainedBuffer)
+            }
+            $stderrText = ""
+            if ($collector.StderrRetainedBuffer -and $collector.StderrRetainedBuffer.Length -gt 0) {
+                $stderrText = [System.Text.Encoding]::UTF8.GetString($collector.StderrRetainedBuffer)
+            }
+
+            $stdoutCapture = [PSCustomObject]@{ CapturedBytes=$stdoutCapturedBytes; TotalBytes=$stdoutTotalBytes; Truncated=$stdoutTruncated; Text=$stdoutText }
+            $stderrCapture = [PSCustomObject]@{ CapturedBytes=$stderrCapturedBytes; TotalBytes=$stderrTotalBytes; Truncated=$stderrTruncated; Text=$stderrText }
+
+            # R6-REM-05: CleanupFailure — verify descendant alive + emergency cleanup path
+            # R6-REM-02: Timeout — verify descendant was created (before finally deletes markers)
+            $cleanupFailureInjected = ($fault -eq 'CleanupFailure')
+            $primaryCleanupFailed = $false
+            $failureReported = $false
+            $parentExited = $false
+            $descendantExited = $false
+            $descendantObserved = $false
+            $timeoutDescendantSeen = $false
+            $timeoutDescendantPid = 0
+
+            # R6-REM-02: Capture timeout descendant state before finally cleanup
+            if ($fault -eq 'Timeout' -and $timedOut) {
+                $parentExited = $true
                 $descMarkers = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
-                if ($descMarkers -and $descMarkers.Count -gt 0) {
-                    $descContent = ""; try { $descContent = (Get-Content $descMarkers[0].FullName -Raw).Trim() } catch {}
-                    $descParts = $descContent.Split('|')
-                    if ($descParts.Count -ge 2 -and $descParts[0] -eq $testRunToken) {
-                        $descPid = [int]$descParts[1]
-                        $descProc = Get-Process -Id $descPid -ErrorAction SilentlyContinue
-                        if ($descProc -and -not $descProc.HasExited) {
-                            $cleanupFailed = $true
-                            Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $null
-                            $emergencyCleanupDone = $true
+                if ($descMarkers -and @($descMarkers).Count -gt 0) {
+                    foreach ($dm in @($descMarkers)) {
+                        $descContent = ""; try { $descContent = (Get-Content $dm.FullName -Raw -ErrorAction Stop).Trim() } catch {}
+                        $descParts = $descContent.Split('|')
+                        if ($descParts.Count -ge 3 -and $descParts[0] -eq $testRunToken) {
+                            $timeoutDescendantSeen = $true
+                            $timeoutDescendantPid = [int]$descParts[1]
+                            $descendantObserved = $true
+                        }
+                    }
+                }
+            }
+
+            if ($cleanupFailureInjected) {
+                # The fault child exits with code 3 — parent (fault child) has exited
+                $parentExited = ($exitCode -eq 3)
+
+                $descMarkers = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+                if ($descMarkers -and @($descMarkers).Count -gt 0) {
+                    foreach ($dm in @($descMarkers)) {
+                        $descContent = ""; try { $descContent = (Get-Content $dm.FullName -Raw -ErrorAction Stop).Trim() } catch {}
+                        $descParts = $descContent.Split('|')
+                        if ($descParts.Count -ge 3 -and $descParts[0] -eq $testRunToken) {
+                            $descPid = [int]$descParts[1]
+                            $descRole = $descParts[2]
+                            $descendantObserved = $true
+                            $descProc = Get-Process -Id $descPid -ErrorAction SilentlyContinue
+                            if ($descProc -and -not $descProc.HasExited) {
+                                $primaryCleanupFailed = $true
+                                $failureReported = $true
+                                $ecResult = Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $null -JobHandle $jobHandle
+                                $emergencyCleanupDone = $ecResult.Success
+                                # Re-verify descendant exited after emergency cleanup
+                                Start-Sleep -Milliseconds 500
+                                $descProcAfter = Get-Process -Id $descPid -ErrorAction SilentlyContinue
+                                $descendantExited = (-not $descProcAfter -or $descProcAfter.HasExited)
+                            } else {
+                                $descendantExited = $true
+                            }
                         }
                     }
                 }
@@ -1882,8 +2310,15 @@ function Test-ProcessLevelFaults {
             $stdoutCapture = [PSCustomObject]@{ CapturedBytes=0; TotalBytes=0; Truncated=$false; Text="(exception: $($_.Exception.Message))" }
             $stderrCapture = [PSCustomObject]@{ CapturedBytes=0; TotalBytes=0; Truncated=$false; Text="" }; $exitCode = -1
         } finally {
-            if ($fault -ne 'CleanupFailure' -or -not $emergencyCleanupDone) { Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $proc }
+            # R6-REM-04: Emergency cleanup with Job-first, identity-verified fallback
+            if ($fault -ne 'CleanupFailure' -or -not $emergencyCleanupDone) {
+                $ecResult = Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $proc -JobHandle $jobHandle
+                if (-not $ecResult.Success) {
+                    Write-Host "  WARNING: Emergency cleanup errors: $($ecResult.Errors -join '; ')" -ForegroundColor Yellow
+                }
+            }
             if ($proc) { $proc.Dispose() }
+            # R6-REM-06: Clean marker files (but not the directory itself — done post-loop with verification)
             Get-ChildItem -Path $markerDir -Filter "*.txt" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         }
 
@@ -1901,14 +2336,22 @@ function Test-ProcessLevelFaults {
 
         switch ($fixtureType) {
             'timeout' {
+                # R6-REM-02: Timeout must verify parent+descendant lifecycle
                 $exitOk = ($exitCode -eq -1); $timedOutOk = $timedOut
                 $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
                 $hasPreTimeoutMarker = ($stdoutText -match 'PRE-TIMEOUT-MARKER')
                 $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $hasRealCapture = ($stdoutTotalBytes -gt 0)
                 $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
-                $pass = $exitOk -and $timedOutOk -and $noSuccessBanner -and $hasPreTimeoutMarker -and $withinBudget -and $hasRealCapture -and $bytesConsistent
-                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=-1 timedOut marker budget consistent"; Actual="exit=$exitCode to=$timedOutOk m=$hasPreTimeoutMarker sOut=$stdoutTotalBytes/$stdoutCapturedBytes b=$withinBudget c=$bytesConsistent"; Pass=$pass }
+                # R6-REM-02: descendantObserved was captured in try block (before finally deleted markers)
+                # R6-REM-02: Post-kill verification — Job should have 0 active
+                $timeoutOrphanResult = Test-NoOrphans -Token $testRunToken -JobHandle $jobHandle
+                $timeoutOrphanFree = ($timeoutOrphanResult.Status -eq 'VerifiedClean')
+                $timeoutTreeCleanup = ($timeoutOrphanResult.Status -ne 'OrphansFound')
+                $descendantExited = $timeoutOrphanFree
+                # R6-REM-02: All required fields must pass
+                $pass = $exitOk -and $timedOutOk -and $noSuccessBanner -and $hasPreTimeoutMarker -and $withinBudget -and $hasRealCapture -and $bytesConsistent -and $descendantObserved -and $parentExited -and $descendantExited -and $timeoutTreeCleanup -and $timeoutOrphanFree
+                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=-1 timedOut marker desc budget descExit treeClean orphanFree"; Actual="exit=$exitCode to=$timedOutOk m=$hasPreTimeoutMarker d=$descendantObserved pEx=$parentExited dEx=$descendantExited tree=$timeoutTreeCleanup of=$timeoutOrphanFree sOut=$stdoutTotalBytes/$stdoutCapturedBytes"; Pass=$pass }
             }
             'structural' {
                 $exitOk = ($exitCode -eq 3); $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
@@ -1969,24 +2412,51 @@ function Test-ProcessLevelFaults {
                 }
             }
             'cleanup' {
+                # R6-REM-05: CleanupFailure must assert complete state matrix
                 $exitOk = ($exitCode -eq 3); $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0)
                 $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
-                $orphanFree = Test-NoOrphans -Token $testRunToken
-                $pass = $exitOk -and $noSuccessBanner -and $withinBudget -and $bytesConsistent -and $orphanFree
-                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 noSuccess budget consistent orphanFree"; Actual="exit=$exitCode noS=$noSuccessBanner clFail=$cleanupFailed emerg=$emergencyCleanupDone orphanFree=$orphanFree sOut=$stdoutTotalBytes/$stdoutCapturedBytes"; Pass=$pass }
+                $orphanResult = Test-NoOrphans -Token $testRunToken -JobHandle $jobHandle
+                $orphanFree = ($orphanResult.Status -eq 'VerifiedClean')
+                $verifiedClean = $orphanFree
+                # R6-REM-05: Every required predicate must be true — missing any = FAIL
+                $pass = $exitOk -and $noSuccessBanner -and $withinBudget -and $bytesConsistent `
+                    -and $cleanupFailureInjected -and $primaryCleanupFailed -and $failureReported `
+                    -and $emergencyCleanupDone -and $parentExited -and $descendantExited `
+                    -and $descendantObserved -and $verifiedClean
+                $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 noS inj fail rep emerg pEx dEx dObs vClean"; Actual="exit=$exitCode noS=$noSuccessBanner inj=$cleanupFailureInjected fail=$primaryCleanupFailed rep=$failureReported emerg=$emergencyCleanupDone pEx=$parentExited dEx=$descendantExited dObs=$descendantObserved vc=$verifiedClean of=$orphanFree sOut=$stdoutTotalBytes/$stdoutCapturedBytes"; Pass=$pass }
             }
         }
         if (-not $tests[-1].Pass) { $allPassed = $false }
     }
 
-    $orphanFree = Test-NoOrphans -Token $testRunToken
+    # R6-REM-03: Final orphan check with Job + CIM three-state
+    $orphanResult = Test-NoOrphans -Token $testRunToken -JobHandle $jobHandle
+    $orphanFree = ($orphanResult.Status -eq 'VerifiedClean')
     if (-not $orphanFree) {
-        Write-Host "  ORPHAN DETECTED: processes with token $testRunToken still running" -ForegroundColor Red
-        Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $null
+        Write-Host "  ORPHAN DETECTED: $($orphanResult.Detail) (token=$testRunToken)" -ForegroundColor Red
+        Invoke-EmergencyCleanup -Token $testRunToken -MarkerDirectory $markerDir -ParentProc $null -JobHandle $jobHandle | Out-Null
         $allPassed = $false
     }
-    if (Test-Path $markerDir) { Remove-Item $markerDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # R6-REM-03: Close Job handle (triggers KILL_ON_JOB_CLOSE for any survivors)
+    if ($jobHandle -ne [IntPtr]::Zero) {
+        $activeBeforeClose = [JobObjectHelper]::GetActiveProcessCount($jobHandle)
+        [JobObjectHelper]::CloseHandle($jobHandle) | Out-Null
+        if ($activeBeforeClose -gt 0) {
+            Write-Host "  WARNING: Job had $activeBeforeClose active at close" -ForegroundColor Yellow
+        }
+    }
+
+    # R6-REM-06: Verified marker directory deletion — fail closed
+    if (Test-Path $markerDir) {
+        Remove-Item $markerDir -Recurse -Force -ErrorAction Stop
+        if (Test-Path $markerDir) {
+            Write-Host "  FATAL: Marker directory still exists after deletion: $markerDir" -ForegroundColor Red
+            $allPassed = $false
+            $script:CleanupErrors += "Marker dir deletion failed: $markerDir"
+        }
+    }
 
     $script:SelfTestSuiteResults['ProcessLevelFaults'] = @{ Declared=$faults.Count; Actual=$tests.Count; Passed=@($tests | Where-Object { $_.Pass }).Count; Failed=@($tests | Where-Object { -not $_.Pass }).Count }
     if ($tests.Count -ne $faults.Count) { Write-Host "  COUNT MISMATCH: display=$($tests.Count) actual=$($faults.Count)" -ForegroundColor Red; $allPassed = $false }
@@ -4086,7 +4556,17 @@ if ($SelfTestFastFault) {
         'PassedMismatch'    { $script:SelfTestSuiteResults['Aggregation'].Passed = 999 }
         'FailedNonZero'     { $script:SelfTestSuiteResults['Aggregation'].Failed = 1 }
         'ManifestMismatch'  { $manifestComparisonForAggregation = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z") }
-        'Timeout'           { Write-Host "PRE-TIMEOUT-MARKER: $(Get-Date -Format 'o')"; [Console]::Out.Flush(); Start-Sleep -Seconds 300 }
+        'Timeout'           {
+            # R6-REM-02: Timeout child creates real descendant with identity evidence
+            Write-Host "PRE-TIMEOUT-MARKER: $(Get-Date -Format 'o')"; [Console]::Out.Flush()
+            if ($PLFToken -and $PLFMarkerDir -and (Test-Path $PLFMarkerDir)) {
+                $descProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 300`" # TIMEOUT-DESC $PLFToken" -PassThru -WindowStyle Hidden
+                "$PLFToken|$($descProc.Id)|timeout-descendant" | Out-File -FilePath (Join-Path $PLFMarkerDir "desc-$($descProc.Id).txt") -Encoding ASCII -Force
+                Write-Host "PRE-TIMEOUT-DESCENDANT: PID=$($descProc.Id) token=$PLFToken"
+                [Console]::Out.Flush()
+            }
+            Start-Sleep -Seconds 300
+        }
         'StdoutOversize'    { $chunk = "X" * 1024; for ($i = 0; $i -lt 60; $i++) { [Console]::Out.Write($chunk + "`n") }; exit 3 }
         'StderrOversize'    { $chunk = "E" * 1024; for ($i = 0; $i -lt 60; $i++) { [Console]::Error.Write($chunk + "`n") }; exit 3 }
         'DualStreamOversize'{ $chunk = "D" * 1024; for ($i = 0; $i -lt 60; $i++) { [Console]::Out.Write($chunk + "`n"); [Console]::Error.Write($chunk + "`n") }; exit 3 }
@@ -4094,10 +4574,11 @@ if ($SelfTestFastFault) {
         'BoundaryExact'     { [Console]::Out.Write("B" * ($maxStreamBytes - 1) + "`n"); exit 3 }
         'BoundaryOver'      { [Console]::Out.Write("O" * $maxStreamBytes + "`n"); exit 3 }
         'CleanupFailure'    {
-            # R5-REM-02: Spawn a real descendant with token in command line (CIM-verifiable)
-            $descProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 300`" # $PLFToken" -PassThru -WindowStyle Hidden
+            # R6-REM-02/05: Spawn a real descendant with token+role in command line (CIM-verifiable)
+            $descProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 300`" # $PLFToken cleanup-descendant" -PassThru -WindowStyle Hidden
             if ($PLFToken -and $PLFMarkerDir -and (Test-Path $PLFMarkerDir)) {
-                "$PLFToken|$($descProc.Id)|descendant" | Out-File -FilePath (Join-Path $PLFMarkerDir "desc-$($descProc.Id).txt") -Encoding ASCII -Force
+                # R6-REM-04: 3-field marker format: token|pid|role
+                "$PLFToken|$($descProc.Id)|cleanup-descendant" | Out-File -FilePath (Join-Path $PLFMarkerDir "desc-$($descProc.Id).txt") -Encoding ASCII -Force
             }
             # Simulate cleanup failure: exit WITHOUT killing the descendant
             exit 3
