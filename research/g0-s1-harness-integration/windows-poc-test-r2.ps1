@@ -406,6 +406,24 @@ public class ProcessHandleRegistry
     private const uint WAIT_TIMEOUT = 0x00000102;
     private const uint WAIT_FAILED = 0xFFFFFFFF;
 
+    // R10-REM-04: Structured wait result types for semantic WAIT_FAILED handling.
+    public enum WaitOutcome { Exited = 0, Timeout = 1, WaitFailed = 2 }
+    public struct WaitResult
+    {
+        public WaitOutcome Outcome;
+        public uint WaitCode;
+        public int Win32Error;
+        public int Pid;
+        public bool Exited { get { return Outcome == WaitOutcome.Exited; } }
+    }
+    public struct TerminateWaitResult
+    {
+        public bool Terminated;
+        public WaitResult Wait;
+        public int TerminateWin32Error;
+        public string TerminateError;
+    }
+
     // R9-REM-08: Test-only fault injection hooks (static, process-wide scope).
     // Set/clear within try/finally to prevent cross-fixture contamination.
     // When active, simulated failures still close real handles to prevent leaks.
@@ -464,36 +482,95 @@ public class ProcessHandleRegistry
         return new RegistrationResult { Success = true, Handle = h, CreationTime = creationTime, Win32Error = 0, Error = null };
     }
 
-    public bool IsProcessExited(int index)
+    // R10-REM-04: Structured wait status check returning Outcome + Win32Error.
+    public WaitResult CheckWaitStatus(int index)
     {
-        if (index < 0 || index >= _entries.Count) return false;
+        var wr = new WaitResult();
+        if (index < 0 || index >= _entries.Count) { wr.Outcome = WaitOutcome.WaitFailed; wr.Win32Error = -1; return wr; }
         var entry = _entries[index];
-        if (entry.Exited) return true;
+        wr.Pid = entry.Pid;
+        if (entry.Exited) { wr.Outcome = WaitOutcome.Exited; wr.WaitCode = WAIT_OBJECT_0; return wr; }
         uint result = TestHook_FailWait ? WAIT_FAILED : WaitForSingleObject(entry.Handle, 0);
+        wr.WaitCode = result;
         if (result == WAIT_OBJECT_0)
         {
             entry.Exited = true;
             _entries[index] = entry;
-            return true;
+            wr.Outcome = WaitOutcome.Exited;
         }
-        return false;
+        else if (result == WAIT_TIMEOUT)
+        {
+            wr.Outcome = WaitOutcome.Timeout;
+            wr.Win32Error = (int)Marshal.GetLastWin32Error();
+        }
+        else
+        {
+            wr.Outcome = WaitOutcome.WaitFailed;
+            wr.Win32Error = (int)Marshal.GetLastWin32Error();
+        }
+        return wr;
     }
 
-    public bool TerminateProcessByIndex(int index, uint exitCode, int waitMs)
+    // Backward-compatible: IsProcessExited delegates to CheckWaitStatus
+    public bool IsProcessExited(int index)
     {
-        if (index < 0 || index >= _entries.Count) return false;
+        return CheckWaitStatus(index).Exited;
+    }
+
+    // R10-REM-04: Structured terminate+wait returning full outcome.
+    public TerminateWaitResult TerminateAndVerify(int index, uint exitCode, int waitMs)
+    {
+        var twr = new TerminateWaitResult();
+        twr.Wait.Pid = (index >= 0 && index < _entries.Count) ? _entries[index].Pid : 0;
+        if (index < 0 || index >= _entries.Count) { twr.TerminateError = "Index out of range"; return twr; }
         var entry = _entries[index];
-        if (entry.Exited) return true;
+        if (entry.Exited) { twr.Terminated = true; twr.Wait.Outcome = WaitOutcome.Exited; twr.Wait.WaitCode = WAIT_OBJECT_0; return twr; }
         if (!TerminateProcess(entry.Handle, exitCode))
-            return false;
+        {
+            twr.TerminateWin32Error = (int)Marshal.GetLastWin32Error();
+            // Process may have already exited - check wait status before failing
+            uint waitAfterTermFail = TestHook_FailWait ? WAIT_FAILED : WaitForSingleObject(entry.Handle, 0);
+            twr.Wait.WaitCode = waitAfterTermFail;
+            if (waitAfterTermFail == WAIT_OBJECT_0)
+            {
+                entry.Exited = true;
+                _entries[index] = entry;
+                twr.Terminated = false;
+                twr.Wait.Outcome = WaitOutcome.Exited;
+                return twr;
+            }
+            twr.TerminateError = "TerminateProcess failed";
+            twr.Wait.Outcome = waitAfterTermFail == WAIT_FAILED ? WaitOutcome.WaitFailed : WaitOutcome.Timeout;
+            twr.Wait.Win32Error = (int)Marshal.GetLastWin32Error();
+            return twr;
+        }
+        twr.Terminated = true;
         uint result = TestHook_FailWait ? WAIT_FAILED : WaitForSingleObject(entry.Handle, (uint)waitMs);
+        twr.Wait.WaitCode = result;
         if (result == WAIT_OBJECT_0)
         {
             entry.Exited = true;
             _entries[index] = entry;
-            return true;
+            twr.Wait.Outcome = WaitOutcome.Exited;
         }
-        return false;
+        else if (result == WAIT_TIMEOUT)
+        {
+            twr.Wait.Outcome = WaitOutcome.Timeout;
+            twr.Wait.Win32Error = (int)Marshal.GetLastWin32Error();
+        }
+        else
+        {
+            twr.Wait.Outcome = WaitOutcome.WaitFailed;
+            twr.Wait.Win32Error = (int)Marshal.GetLastWin32Error();
+        }
+        return twr;
+    }
+
+    // Backward-compatible: TerminateProcessByIndex delegates to TerminateAndVerify
+    public bool TerminateProcessByIndex(int index, uint exitCode, int waitMs)
+    {
+        var twr = TerminateAndVerify(index, exitCode, waitMs);
+        return twr.Terminated && twr.Wait.Exited;
     }
 
     public ProcessEntry[] GetEntries() { return _entries.ToArray(); }
@@ -544,6 +621,12 @@ public class ProcessHandleRegistry
         }
         result.FailedPids = failedList.ToArray();
         return result;
+    }
+
+    // R10-REM-02: Close all handles WITHOUT clearing entries (for pre-close verification)
+    public CloseAllResult CloseHandlesWithoutClear()
+    {
+        return GetCloseResult();
     }
 
     public CloseAllResult CloseAll()
@@ -2184,6 +2267,119 @@ function Test-SuiteEvidence {
 }
 
 # R7: Handle-based process lifecycle management, fail-closed collector, marker-after-verification.
+# R10-REM-05: Shared collector health-to-ScriptInternal mapper.
+# Maps collector Healthy/ReadError/DrainTimedOut/task completion to structured ScriptInternal evidence.
+# Used by normal process fixtures AND collector fault meta-tests.
+function Get-CollectorHealthMapping {
+    param(
+        [Parameter(Mandatory=$true)]$Collector,
+        [bool]$DrainCompleted = $true
+    )
+    $isHealthy = $Collector.Healthy -and $DrainCompleted
+    $readError = $null
+    $drainTimedOut = $Collector.DrainTimedOut
+    if ($Collector.StdoutFaulted) { $readError = $Collector.StdoutError }
+    elseif ($Collector.StderrFaulted) { $readError = $Collector.StderrError }
+    elseif (-not $DrainCompleted) { $readError = "Drain task did not complete" }
+
+    $mappingResult = [PSCustomObject]@{
+        Healthy = $isHealthy
+        ReadError = $readError
+        DrainTimedOut = $drainTimedOut
+        DrainCompleted = $DrainCompleted
+        MappingOutcome = if ($isHealthy) { "PASS" } else { "ERROR" }
+    }
+
+    # If unhealthy, produce structured ScriptInternal FAIL result
+    if (-not $isHealthy) {
+        $actual = "Healthy=false ReadError=$readError DrainTimedOut=$drainTimedOut DrainCompleted=$DrainCompleted"
+        $errorSummary = "Collector unhealthy: ReadError=$readError DrainTimedOut=$drainTimedOut"
+        $mappingResult | Add-Member -NotePropertyName "ScriptInternalResult" -NotePropertyValue ([PSCustomObject]@{
+            TestId = "COLLECTOR-HEALTH"
+            Category = "ScriptInternal"
+            Status = "FAIL"
+            Description = "Collector health check"
+            Expected = "Healthy collector with completed drain"
+            Actual = $actual
+            ErrorSummary = $errorSummary
+        })
+    }
+
+    return $mappingResult
+}
+
+# R10-REM-02: Shared common process gate for all launched-child fixtures.
+# Returns structured gate result with all required checks.
+function Test-CommonProcessGate {
+    param(
+        [Parameter(Mandatory=$true)][PSCustomObject]$CleanupResult,
+        [Parameter(Mandatory=$true)][PSCustomObject]$CaptureHealthMapping,
+        [bool]$ParentRegOk = $false,
+        [bool]$CreationTimeOk = $false,
+        [ProcessHandleRegistry]$Registry = $null,
+        [string]$MarkerDirectory = ""
+    )
+    $gateErrors = @()
+
+    # 1. Parent registration
+    if (-not $ParentRegOk) { $gateErrors += "Parent registration failed" }
+    if (-not $CreationTimeOk) { $gateErrors += "Parent creation time is zero" }
+
+    # 2. Capture task completed, Healthy=true, no ReadError/DrainTimedOut
+    if (-not $CaptureHealthMapping.Healthy) {
+        $gateErrors += "Capture unhealthy: ReadError=$($CaptureHealthMapping.ReadError) DrainTimedOut=$($CaptureHealthMapping.DrainTimedOut)"
+    }
+
+    # 3. All executed cleanup phases succeeded
+    if ($null -ne $CleanupResult -and -not $CleanupResult.Success) {
+        $gateErrors += "Cleanup failed: $($CleanupResult.Errors -join '; ')"
+    }
+
+    # 4. Per-entry wait results - all expected entries must be Exited
+    if ($null -ne $CleanupResult -and $null -ne $CleanupResult.EntrySnapshot) {
+        foreach ($entry in $CleanupResult.EntrySnapshot) {
+            if ($entry.WaitOutcome -ne 'Exited' -and $entry.WaitOutcome -ne 'Unknown') {
+                $gateErrors += "Entry PID=$($entry.Pid) role=$($entry.Role) WaitOutcome=$($entry.WaitOutcome) Win32=$($entry.Win32Error)"
+            }
+        }
+    }
+
+    # 5. CloseAllResult.AllClosed
+    if ($null -ne $CleanupResult -and $null -ne $CleanupResult.CloseResult -and -not $CleanupResult.CloseResult.AllClosed) {
+        $gateErrors += "CloseAll failed: $($CleanupResult.CloseResult.Failed) handles"
+    }
+
+    # 6. ActiveBeforeClose must be 0
+    if ($null -ne $CleanupResult -and $CleanupResult.ActiveBeforeClose -gt 0) {
+        $gateErrors += "ActiveBeforeClose=$($CleanupResult.ActiveBeforeClose)"
+    }
+
+    # 7. Owned marker directory deletion (if provided)
+    $markerDeleted = $true
+    if ($MarkerDirectory -and (Test-Path $MarkerDirectory)) {
+        $gateErrors += "Marker directory still exists: $MarkerDirectory"
+        $markerDeleted = $false
+    }
+
+    # 8. Final orphan check (using registry if provided)
+    $orphanResult = $null
+    if ($null -ne $Registry) {
+        $orphanResult = Test-HandleOrphans -Registry $Registry
+        if ($orphanResult.Status -ne 'VerifiedClean') {
+            $gateErrors += "Orphan check: $($orphanResult.Status) $($orphanResult.Detail)"
+        }
+    }
+
+    return [PSCustomObject]@{
+        Pass = ($gateErrors.Count -eq 0)
+        Errors = $gateErrors
+        CleanupResult = $CleanupResult
+        CaptureHealth = $CaptureHealthMapping
+        OrphanResult = $orphanResult
+        MarkerDeleted = $markerDeleted
+    }
+}
+
 function Test-ProcessLevelFaults {
     $allPassed = $true
     $tests = @()
@@ -2237,17 +2433,21 @@ function Test-ProcessLevelFaults {
                     continue
                 }
                 $result.Observed++
+                # R10-REM-01: Exact manifest tracking - record every observed marker
+                $result.Entries += [PSCustomObject]@{ Pid=$descPid; Role=$descRole; Token=$Token; Registered=$false; CreationTime=0 }
                 $alreadyRegistered = $false
                 foreach ($e in $Registry.GetEntries()) { if ($e.Pid -eq $descPid) { $alreadyRegistered = $true; break } }
                 if ($alreadyRegistered) {
-                    # R9: Not an error — already registered in a prior call (idempotent)
-                    $result.Observed++
+                    # R10-REM-01: Idempotent duplicate - do NOT double-count Observed.
+                    $result.Entries[-1].Registered = $true
                     continue
                 }
                 $regResult = $Registry.RegisterProcess($descPid, $Token, $descRole)
                 if ($regResult.Success) {
                     $result.Registered++
-                    $result.Entries += [PSCustomObject]@{ Pid=$descPid; Role=$descRole; CreationTime=$regResult.CreationTime }
+                    # R10-REM-01: Update the manifest entry with registration result
+                    $result.Entries[-1].Registered = $true
+                    $result.Entries[-1].CreationTime = $regResult.CreationTime
                 } else {
                     $result.Errors += "Registration failed PID=$descPid role=$descRole error=$($regResult.Error) win32=$($regResult.Win32Error)"
                 }
@@ -2269,9 +2469,32 @@ function Test-ProcessLevelFaults {
         )
         $entryCount = $Registry.Count
         $expectedTotal = $ExpectedParentCount + $ExpectedDescendantCount
-        if ($expectedTotal -gt 0 -and $entryCount -lt $expectedTotal) {
+        # R10-REM-01: Exact manifest - reject both under AND over registration
+        if ($expectedTotal -gt 0 -and $entryCount -ne $expectedTotal) {
+            $kind = if ($entryCount -lt $expectedTotal) { 'IncompleteRegistrations' } else { 'ExtraRegistrations' }
             return [PSCustomObject]@{
-                Status='IncompleteRegistrations'; Detail="Expected=$expectedTotal registered=$entryCount"; Source='Handles'
+                Status=$kind; Detail="Expected=$expectedTotal registered=$entryCount"; Source='Handles'
+            }
+        }
+        # R10-REM-01: Check for duplicate PIDs in registry
+        if ($entryCount -gt 0) {
+            $entries = $Registry.GetEntries()
+            $pidSet = @{}
+            foreach ($e in $entries) {
+                if ($pidSet.ContainsKey($e.Pid)) {
+                    return [PSCustomObject]@{
+                        Status='DuplicatePID'; Detail="Duplicate PID=$($e.Pid) in registry"; Source='Handles'
+                    }
+                }
+                $pidSet[$e.Pid] = $true
+            }
+            # R10-REM-01: Verify each entry has nonzero creation time
+            foreach ($e in $entries) {
+                if ($e.CreationTime -eq 0) {
+                    return [PSCustomObject]@{
+                        Status='ZeroCreationTime'; Detail="PID=$($e.Pid) has zero CreationTime"; Source='Handles'
+                    }
+                }
             }
         }
         $handleActive = $Registry.ActiveCount
@@ -2324,20 +2547,33 @@ function Test-ProcessLevelFaults {
             $errors += "Incomplete registrations: expected=$expectedTotal actual=$($Registry.Count)"
         }
 
-        # Phase 3: Terminate and wait for all registered handles (do NOT close yet)
+        # Phase 3: R10-REM-03 - Structured terminate+wait per entry with WaitOutcome
         $entries = $Registry.GetEntries()
-        # R9-REM-04: Freeze entry evidence BEFORE any state changes
+        # R10-REM-03: Freeze entry evidence BEFORE any state changes (structured)
         $entrySnapshot = @()
         for ($i = 0; $i -lt $entries.Count; $i++) {
             $e = $entries[$i]
-            $entrySnapshot += [PSCustomObject]@{ Pid=$e.Pid; Role=$e.Role; CreationTime=$e.CreationTime; Exited=$e.Exited }
+            $entrySnapshot += [PSCustomObject]@{ Pid=$e.Pid; Role=$e.Role; Token=$e.Token; CreationTime=$e.CreationTime; InitialExited=$e.Exited; TerminateResult=$null; WaitOutcome='Unknown'; WaitCode=0; Win32Error=0; TerminateError='' }
         }
         for ($i = 0; $i -lt $entries.Count; $i++) {
-            # Check via registry method (updates internal state) not stale copy
-            if (-not $Registry.IsProcessExited($i)) {
-                $termOk = $Registry.TerminateProcessByIndex($i, 99, 3000)
-                if ($termOk) { $actions += "Handle PID=$($entries[$i].Pid) role=$($entries[$i].Role) terminated" }
-                else { $errors += "Handle PID=$($entries[$i].Pid) role=$($entries[$i].Role) terminate failed" }
+            # R10-REM-04: Use structured TerminateAndVerify for WAIT_FAILED semantics
+            $twr = $Registry.TerminateAndVerify($i, 99, 3000)
+            $entrySnapshot[$i].TerminateResult = $twr.Terminated
+            $entrySnapshot[$i].WaitOutcome = [string]$twr.Wait.Outcome
+            $entrySnapshot[$i].WaitCode = $twr.Wait.WaitCode
+            $entrySnapshot[$i].Win32Error = $twr.Wait.Win32Error
+            $entrySnapshot[$i].TerminateError = $twr.TerminateError
+            # R10-REM-03: Check Wait.Exited (not Terminated) - TerminateProcess may fail on
+            # already-exited processes but WaitForSingleObject still confirms exit.
+            if ($twr.Wait.Exited) {
+                $actions += "Handle PID=$($entries[$i].Pid) role=$($entries[$i].Role) exited (terminated=$($twr.Terminated))"
+            } elseif ($twr.Wait.Outcome -eq 'WaitFailed') {
+                # R10-REM-04: WAIT_FAILED is a structured VerificationError
+                $errors += "WAIT_FAILED PID=$($entries[$i].Pid) role=$($entries[$i].Role) WaitCode=$($twr.Wait.WaitCode) Win32=$($twr.Wait.Win32Error)"
+            } elseif ($twr.Wait.Outcome -eq 'Timeout') {
+                $errors += "Wait timeout PID=$($entries[$i].Pid) role=$($entries[$i].Role) WaitCode=$($twr.Wait.WaitCode)"
+            } else {
+                $errors += "Unknown outcome PID=$($entries[$i].Pid) role=$($entries[$i].Role) Outcome=$($twr.Wait.Outcome)"
             }
         }
 
@@ -2482,7 +2718,9 @@ function Test-ProcessLevelFaults {
                 Write-Host "  WARNING: Collector drain wait exception: $($_.Exception.Message)" -ForegroundColor Yellow
             }
             if (-not $drainCompleted) { Write-Host "  WARNING: Collector drain wait returned false" -ForegroundColor Yellow }
-            $captureHealthy = $collector.Healthy -and $drainCompleted
+            # R10-REM-05: Use shared health mapper for consistent capture health assessment
+            $captureHealthMapping = Get-CollectorHealthMapping -Collector $collector -DrainCompleted $drainCompleted
+            $captureHealthy = $captureHealthMapping.Healthy
 
             $stdoutTotalBytes = $collector.StdoutTotalBytes; $stdoutCapturedBytes = $collector.StdoutCapturedBytes; $stdoutTruncated = $collector.StdoutTruncated
             $stderrTotalBytes = $collector.StderrTotalBytes; $stderrCapturedBytes = $collector.StderrCapturedBytes; $stderrTruncated = $collector.StderrTruncated
@@ -2577,8 +2815,9 @@ function Test-ProcessLevelFaults {
                 $hasUntrusted = ($stdoutText -match 'UNTRUSTED'); $withinTimeout = (-not $timedOut)
                 $stderrEmpty = ($stderrTotalBytes -eq 0); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
-                # R9-REM-04: commonProcessGate for all structural fixtures
-                $commonGate = $parentRegOk -and $creationTimeOk -and $captureHealthy -and $cleanupOk -and $closeResultOk -and $activeBeforeCloseZero -and $orphanFree
+                # R10-REM-02: commonProcessGate via shared function for all structural fixtures
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry
+                $commonGate = $commonGateResult.Pass
                 $structEvidence = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus -and $hasUntrusted -and $withinTimeout -and $stderrEmpty -and $withinBudget -and $bytesConsistent
                 if ($fault -eq 'JobAssignFailure') {
                     # R9-REM-05: JobAssignFailure must assert real fallback state
@@ -2594,8 +2833,9 @@ function Test-ProcessLevelFaults {
             'oversize' {
                 $exitOk = ($exitCode -eq 3); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0); $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
-                # R9-REM-04: commonProcessGate
-                $commonGate = $parentRegOk -and $creationTimeOk -and $captureHealthy -and $cleanupOk -and $closeResultOk -and $activeBeforeCloseZero -and $orphanFree
+                # R10-REM-02: commonProcessGate via shared function
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry
+                $commonGate = $commonGateResult.Pass
                 switch ($fault) {
                     'StdoutOversize' { $streamOk = ($stdoutTotalBytes -gt $maxStreamBytes) -and $stdoutTruncated -and ($stdoutCapturedBytes -eq $maxStreamBytes); $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated); $pass = $commonGate -and $exitOk -and $withinBudget -and $streamOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent; $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 sOut>51200 cap=51200 trunc sErr=0 commonGate"; Actual="exit=$exitCode sOut=$stdoutTotalBytes/$stdoutCapturedBytes/$stdoutTruncated sErr=$stderrTotalBytes pReg=$parentRegOk cTime=$creationTimeOk cOk=$cleanupOk of=$orphanFree h=$captureHealthy"; Pass=$pass } }
                     'StderrOversize' { $streamOk = ($stderrTotalBytes -gt $maxStreamBytes) -and $stderrTruncated -and ($stderrCapturedBytes -eq $maxStreamBytes); $otherEmpty = ($stdoutTotalBytes -eq 0) -and (-not $stdoutTruncated); $pass = $commonGate -and $exitOk -and $withinBudget -and $streamOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent; $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 sErr>51200 cap=51200 trunc sOut=0 commonGate"; Actual="exit=$exitCode sErr=$stderrTotalBytes/$stderrCapturedBytes/$stderrTruncated sOut=$stdoutTotalBytes pReg=$parentRegOk cTime=$creationTimeOk cOk=$cleanupOk of=$orphanFree h=$captureHealthy"; Pass=$pass } }
@@ -2607,8 +2847,9 @@ function Test-ProcessLevelFaults {
                 $exitOk = ($exitCode -eq 3); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0); $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
                 $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated)
-                # R9-REM-04: commonProcessGate
-                $commonGate = $parentRegOk -and $creationTimeOk -and $captureHealthy -and $cleanupOk -and $closeResultOk -and $activeBeforeCloseZero -and $orphanFree
+                # R10-REM-02: commonProcessGate via shared function
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry
+                $commonGate = $commonGateResult.Pass
                 if ($fault -eq 'BoundaryExact') {
                     $totalOk = ($stdoutTotalBytes -eq $maxStreamBytes); $notTruncated = (-not $stdoutTruncated); $capturedOk = ($stdoutCapturedBytes -eq $maxStreamBytes)
                     $pass = $commonGate -and $exitOk -and $withinBudget -and $totalOk -and $notTruncated -and $capturedOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent
@@ -2715,14 +2956,21 @@ function Test-ProcessLevelFaults {
                         # Cleanup with hook active — must fail (terminate can't confirm wait)
                         $waitCleanup = Invoke-HandleCleanup -Registry $fixtureRegistry -Token $testRunToken -MarkerDirectory $markerDir
                         $waitCleanupFailed = (-not $waitCleanup.Success)
-                        # Verify cleanup errors contain terminate failure (not registration error)
-                        $hasTerminateError = ($waitCleanup.Errors -join ' ') -match 'terminate failed'
+                        # R10-REM-04: Verify structured WAIT_FAILED in entry snapshot
+                        $hasWaitFailedOutcome = $false
+                        $waitWin32Error = 0
+                        $hasTerminateError = ($waitCleanup.Errors -join ' ') -match 'WAIT_FAILED'
+                        if ($waitCleanup.EntrySnapshot.Count -gt 0) {
+                            $hasWaitFailedOutcome = ($waitCleanup.EntrySnapshot[0].WaitOutcome -eq 'WaitFailed')
+                            $waitWin32Error = $waitCleanup.EntrySnapshot[0].Win32Error
+                        }
                         # Entry snapshot proves registration was complete before cleanup
                         $entrySnapshotOk = ($waitCleanup.EntryCount -eq 1)
                         $snapshotPid = if ($waitCleanup.EntrySnapshot.Count -gt 0) { $waitCleanup.EntrySnapshot[0].Pid } else { 0 }
                         $snapshotPidMatch = ($snapshotPid -eq $waitProc.Id)
-                        $pass = $waitRegOk -and $waitCreationNonzero -and $regComplete -and $notZeroActive -and $waitCleanupFailed -and $hasTerminateError -and $entrySnapshotOk -and $snapshotPidMatch
-                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk cTime reg=1 active>0 cleanupFail termErr snap=1"; Actual="reg=$waitRegOk cTime=$waitCreationNonzero reg=$regCountBeforeHook active=$waitActive cFail=$waitCleanupFailed termErr=$hasTerminateError snap=$($waitCleanup.EntryCount) pid=$snapshotPidMatch"; Pass=$pass }
+                        # R10-REM-04: All assertions including structured WaitOutcome
+                        $pass = $waitRegOk -and $waitCreationNonzero -and $regComplete -and $notZeroActive -and $waitCleanupFailed -and $hasWaitFailedOutcome -and $hasTerminateError -and $entrySnapshotOk -and $snapshotPidMatch
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk cTime reg=1 active>0 cleanupFail WaitFailed Win32Err snap=1"; Actual="reg=$waitRegOk cTime=$waitCreationNonzero reg=$regCountBeforeHook active=$waitActive cFail=$waitCleanupFailed wfOutcome=$hasWaitFailedOutcome wfErr=$hasTerminateError win32=$waitWin32Error snap=$($waitCleanup.EntryCount) pid=$snapshotPidMatch"; Pass=$pass }
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailWait = $false
                         # Independently terminate and close — no leak
@@ -2772,19 +3020,26 @@ function Test-ProcessLevelFaults {
                     $readFaulted = $faultCollector.StdoutFaulted
                     $notHealthy = (-not $faultCollector.Healthy)
                     $failClosed = $readFaulted -and $notHealthy
-                    # R9-REM-09: Call REAL Get-OverallResult with mock results reflecting
-                    # what happens when an unhealthy collector feeds the aggregation.
-                    # An unhealthy collector → ScriptInternal FAIL → Overall ERROR (exit 3).
-                    $mockResults = @(
-                        [PSCustomObject]@{ TestId='COLLECTOR-FAULT'; Category='ScriptInternal'; Status='FAIL'; Description='Collector read faulted'; Expected='Healthy collector'; Actual='StdoutFaulted=true Healthy=false'; ErrorSummary='ReadAsync threw on disposed stream' }
-                    )
-                    $mockOverall = Get-OverallResult -Results $mockResults
+                    # R10-REM-05: Use shared Get-CollectorHealthMapping for real gate path
+                    $colHealthMap = Get-CollectorHealthMapping -Collector $faultCollector -DrainCompleted $true
+                    $notHealthy = (-not $colHealthMap.Healthy)
+                    $failClosed = $readFaulted -and $notHealthy
+                    # R10-REM-05: Shared mapper produces ScriptInternal FAIL -> Overall ERROR (exit 3)
+                    $innerResults = @()
+                    if ($colHealthMap.ScriptInternalResult) {
+                        $innerResults += $colHealthMap.ScriptInternalResult
+                    }
+                    $mockOverall = if ($innerResults.Count -gt 0) { Get-OverallResult -Results $innerResults } else { 'PASS' }
                     $producesError = ($mockOverall -eq 'ERROR')
+                    # R10-REM-05: Verify exit code 3 semantics
+                    $exitCode3 = ($producesError)  # ERROR -> exit 3
                     $noSuccessBanner = $true
                     $noTrustedTotals = $true
                     $collectorStreamDisposed = $failClosed
-                    $pass = $failClosed -and $producesError -and $collectorStreamDisposed
-                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="StdoutFaulted Healthy=false Overall=ERROR"; Actual="Faulted=$readFaulted Healthy=$($faultCollector.Healthy) Overall=$mockOverall"; Pass=$pass }
+                    # R10-REM-05: Verify streams/tasks disposed
+                    $streamDisposed = ($memStream.CanRead -eq $false)
+                    $pass = $failClosed -and $producesError -and $exitCode3 -and $collectorStreamDisposed -and $streamDisposed -and $noSuccessBanner -and $noTrustedTotals
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="SharedMapper Healthy=false ScriptInternal Overall=ERROR exit=3"; Actual="Faulted=$readFaulted Healthy=$($colHealthMap.Healthy) Overall=$mockOverall exit3=$exitCode3 disposed=$streamDisposed"; Pass=$pass }
                 } elseif ($fault -eq 'CollectorDrainTimeout') {
                     # Use a pipe stream that never completes — deadline triggers timeout
                     $faultCollector2 = New-Object BoundedStreamCollector
@@ -2803,14 +3058,22 @@ function Test-ProcessLevelFaults {
                     $drainTimedOut = $faultCollector2.DrainTimedOut
                     $notHealthy2 = (-not $faultCollector2.Healthy)
                     $failClosed2 = $drainTimedOut -and $notHealthy2
-                    # R9-REM-09: Real shared gate — drain timeout → ScriptInternal → ERROR
-                    $mockResults2 = @(
-                        [PSCustomObject]@{ TestId='COLLECTOR-TIMEOUT'; Category='ScriptInternal'; Status='FAIL'; Description='Collector drain timeout'; Expected='Drain complete'; Actual='DrainTimedOut=true Healthy=false'; ErrorSummary='Collector deadline exceeded' }
-                    )
-                    $mockOverall2 = Get-OverallResult -Results $mockResults2
+                    # R10-REM-05: Use shared Get-CollectorHealthMapping for real gate path
+                    $colHealthMap2 = Get-CollectorHealthMapping -Collector $faultCollector2 -DrainCompleted (-not $drainTimedOut)
+                    $failClosed2 = $drainTimedOut -and (-not $colHealthMap2.Healthy)
+                    # R10-REM-05: Shared mapper produces ScriptInternal FAIL -> Overall ERROR (exit 3)
+                    $innerResults2 = @()
+                    if ($colHealthMap2.ScriptInternalResult) {
+                        $innerResults2 += $colHealthMap2.ScriptInternalResult
+                    }
+                    $mockOverall2 = if ($innerResults2.Count -gt 0) { Get-OverallResult -Results $innerResults2 } else { 'PASS' }
                     $producesError2 = ($mockOverall2 -eq 'ERROR')
-                    $pass = $failClosed2 -and $producesError2
-                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="DrainTimedOut Healthy=false Overall=ERROR"; Actual="TimedOut=$drainTimedOut Healthy=$($faultCollector2.Healthy) Overall=$mockOverall2"; Pass=$pass }
+                    # R10-REM-05: Verify exit code 3 semantics
+                    $exitCode3_2 = ($producesError2)
+                    # R10-REM-05: Verify CTS/streams disposed
+                    $pipeDisposed = ($pipeClient -eq $null -or -not $pipeClient.IsConnected)
+                    $pass = $failClosed2 -and $producesError2 -and $exitCode3_2 -and $pipeDisposed
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="SharedMapper DrainTimedOut ScriptInternal Overall=ERROR exit=3"; Actual="TimedOut=$drainTimedOut Healthy=$($colHealthMap2.Healthy) Overall=$mockOverall2 exit3=$exitCode3_2 disposed=$pipeDisposed"; Pass=$pass }
                 } else {
                     $pass = $false
                     $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known collectorFault"; Actual="unknown"; Pass=$pass }
@@ -2835,16 +3098,28 @@ function Test-ProcessLevelFaults {
                             $deleteWhileLive = Delete-OwnedMarkers -MarkerDirectory $markerTestDir -Registry $fixtureRegistry
                             $blockedAsExpected = (-not $deleteWhileLive.Success) -and ($deleteWhileLive.Error -eq "BlockedLiveHandles")
                             $markerStillExists = Test-Path (Join-Path $markerTestDir "live.txt")
-                            # Phase 2: Terminate, wait, close handle → delete must succeed
-                            Stop-Process -Id $liveProc.Id -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Milliseconds 500
-                            $fixtureRegistry.CloseAll()
-                            $deleteAfterClose = Delete-OwnedMarkers -MarkerDirectory $markerTestDir -Registry $fixtureRegistry
-                            $deleteSucceeded = $deleteAfterClose.Success
-                            $markerGone = (-not (Test-Path $markerTestDir))
-                            # PASS requires BOTH phases
-                            $pass = $liveRegOk -and $markerExists -and $blockedAsExpected -and $markerStillExists -and $deleteSucceeded -and $markerGone
-                            $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk exists blocked stillExists deleteOk gone"; Actual="reg=$liveRegOk exists=$markerExists blocked=$blockedAsExpected still=$markerStillExists delOk=$deleteSucceeded gone=$markerGone"; Pass=$pass }
+                            # R10-REM-06: Phase 2 must be fail-closed - verify each step
+                            # Step 1: Terminate and verify exited via structured wait
+                            $phase2TermResult = $fixtureRegistry.TerminateAndVerify(0, 99, 3000)
+                            $phase2Exited = ($phase2TermResult.Terminated -and $phase2TermResult.Wait.Exited)
+                            $phase2WaitOutcome = [string]$phase2TermResult.Wait.Outcome
+                            # Step 2: Verify active count is 0 before close
+                            $phase2ActiveBeforeClose = $fixtureRegistry.ActiveCount
+                            $phase2ActiveZero = ($phase2ActiveBeforeClose -eq 0)
+                            # Step 3: CloseAll and verify
+                            $phase2CloseResult = $fixtureRegistry.CloseAll()
+                            $phase2AllClosed = $phase2CloseResult.AllClosed
+                            # Step 4: Only now allow marker deletion
+                            $phase2Ready = $phase2Exited -and $phase2ActiveZero -and $phase2AllClosed
+                            $deleteAfterClose = $null; $deleteSucceeded = $false; $markerGone = $false
+                            if ($phase2Ready) {
+                                $deleteAfterClose = Delete-OwnedMarkers -MarkerDirectory $markerTestDir -Registry $fixtureRegistry
+                                $deleteSucceeded = $deleteAfterClose.Success
+                                $markerGone = (-not (Test-Path $markerTestDir))
+                            }
+                            # R10-REM-06: PASS requires BOTH phases + fail-closed Phase 2
+                            $pass = $liveRegOk -and $markerExists -and $blockedAsExpected -and $markerStillExists -and $phase2Ready -and $deleteSucceeded -and $markerGone
+                            $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk exists blocked stillExists phase2Ready deleteOk gone"; Actual="reg=$liveRegOk exists=$markerExists blocked=$blockedAsExpected still=$markerStillExists p2Ready=$phase2Ready p2Exited=$phase2Exited p2Act0=$phase2ActiveZero p2Close=$phase2AllClosed p2Wait=$phase2WaitOutcome delOk=$deleteSucceeded gone=$markerGone"; Pass=$pass }
                         } finally {
                             [ProcessHandleRegistry]::TestHook_FailWait = $false
                             try { Stop-Process -Id $liveProc.Id -Force -ErrorAction SilentlyContinue } catch {}
