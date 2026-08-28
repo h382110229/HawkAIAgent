@@ -1,4 +1,4 @@
-# G0-S1 R7 Preflight Report
+# G0-S1 R8 Preflight Report
 
 **Date**: 2026-08-28
 **Script**: `research/g0-s1-harness-integration/windows-poc-test-r2.ps1`
@@ -7,17 +7,17 @@
 
 | Field | Value |
 |---|---|
-| Hash | `0f67b81` |
-| Parent | `8256961a05728d55a0573b75260454b0e020f3b5` |
-| Subject | `test: R7 remediation — handle-based process registry, fail-closed collector, marker-after-verification` |
+| Hash | `9e186f9` |
+| Parent | `1b8a0e2d55820baf1572f63f13bdd9c6109970d0` |
+| Subject | `test: R8 remediation — fail-closed handle registration, collector faults, marker lifecycle, per-fixture registry` |
 | Files | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
 
 ## Script Blob
 
 | Field | Value |
 |---|---|
-| Git blob | `7c9c90bf0d970ffdb09a23ef096133c0ea4a22e3` |
-| SHA-256 | `66c59e8463919818e9cca25cd9ae2d53e790056643c9c0caebec4ff54cf5a769` |
+| Git blob | `ffdc8d7efcb46a5c92bd945abf2822198cecda1f` |
+| SHA-256 | `93f91222289d93a48247ec274456f4a48773c4da219a57635440be17a3a7c287` |
 
 SHA-256 computed on raw git blob bytes (`git cat-file -p <blob> | sha256sum`), not on CRLF-converted working-tree content.
 
@@ -34,8 +34,8 @@ Two consecutive `-SelfTestOnly` runs on the exact code commit:
 
 | Run | Exit | Tests | PASS | FAIL | stderr |
 |---|---|---|---|---|---|
-| Run 1 | 0 | 195 | 195 | 0 | empty |
-| Run 2 | 0 | 195 | 195 | 0 | empty |
+| Run 1 | 0 | 201 | 201 | 0 | empty |
+| Run 2 | 0 | 201 | 201 | 0 | empty |
 
 Suite inventory (both runs identical):
 
@@ -48,82 +48,112 @@ Suite inventory (both runs identical):
 | LockfileReader | 102 | 102 | 102 | 0 |
 | ManifestCompare | 14 | 14 | 14 | 0 |
 | SuiteEvidence | 11 | 11 | 11 | 0 |
-| ProcessLevelFaults | 14 | 14 | 14 | 0 |
-| **Total** | **195** | **195** | **195** | **0** |
+| ProcessLevelFaults | 20 | 20 | 20 | 0 |
+| **Total** | **201** | **201** | **201** | **0** |
 
-## R7 Remediation Evidence
+## R8 Remediation Evidence
 
-### R7-REM-01: Job Assignment Tracked, Handle Registry Primary
+### R8-REM-01: Handle Registration Fail-Closed
 
-- `$assignedToJob` tracked per-fixture (not just WARNING)
-- Empty Job (assignment failed) NOT treated as authoritative clean
-- `Test-HandleOrphans` uses handle `ActiveCount` as primary; Job only when `$assignedToJob=$true`
-- `JobAssignFailure` fixture (14th) proves structural faults work with handle-based cleanup
+**C# ProcessHandleRegistry changes:**
 
-### R7-REM-02: ProcessHandleRegistry (C# Inline)
+- `RegistrationResult` struct: `{ Success, Handle, CreationTime, Win32Error, Error }`
+- `RegisterProcess()` returns `RegistrationResult` instead of `bool`
+- `GetProcessTimes` return value checked; failure closes handle and returns structured error
+- `CreationTime` required non-zero; zero returns error with closed handle
+- `CloseAllResult` struct: `{ Attempted, Succeeded, Failed, FailedPids, AllClosed }`
+- `CloseAll()` returns `CloseAllResult`; tracks each `CloseHandle` result
 
-- `OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_TERMINATE)` — no admin required
-- `GetProcessTimes` for creation time (PID-reuse safe)
-- `WaitForSingleObject` for exit detection (non-blocking)
-- `TerminateProcessByIndex` via held handle (PID-reuse safe)
-- `CloseAll()` in finally block
+**Register-DescendantHandles rewrite:**
 
-### R7-REM-03: Handle-Based Orphan Verification
+- Returns structured result: `{ Observed, Registered, Errors, Entries }`
+- Empty `catch {}` eliminated; all errors captured in `Errors` array
+- Token mismatch, PID parse failure, role empty, duplicate PID all fail closed
+- Registration failure (OpenProcess/GetProcessTimes) logged in Errors
 
-- `Test-HandleOrphans` returns `VerifiedClean`/`OrphansFound`
-- Primary: `$handleRegistry.ActiveCount == 0`
-- Supplementary: Job Object only when `$assignedToJob=$true`
-- CIM removed from critical path
+**Test-HandleOrphans enhancement:**
 
-### R7-REM-04: Timeout/CleanupFailure Full State Matrix
+- Added `ExpectedParentCount` / `ExpectedDescendantCount` parameters
+- Returns `IncompleteRegistrations` if registered count < expected total
+- Only returns `VerifiedClean` when all expected registrations complete and active=0
 
-**Timeout fixture evidence:**
+**Per-fixture registry isolation:**
 
-| Field | Value |
-|---|---|
-| descendantObserved | True |
-| parentExited | True |
-| descendantExited | True |
-| treeCleanup | True |
-| orphanFree | True |
-| captureHealthy | True |
-| verificationSource | Handles |
+- Each fixture creates `$fixtureRegistry = New-Object ProcessHandleRegistry`
+- No cross-fixture PID contamination possible
+- Outer `$handleRegistry` used only for final orphan check
 
-**CleanupFailure fixture evidence:**
+**New fixtures:**
 
-| Field | Value |
-|---|---|
-| cleanupFailureInjected | True |
-| primaryCleanupFailed | True |
-| failureReported | True |
-| emergencyCleanupDone | True |
-| parentExited | True |
-| descendantExited | True |
-| descendantObserved | True |
-| verifiedClean | True |
-| captureHealthy | True |
-| verificationSource | Handles |
+| Fixture | Expected | Actual | Result |
+|---|---|---|---|
+| ParentHandleRegFailure | Success=false Error!=empty | Success=False Error=OpenProcess failed Win32=87 | PASS |
+| DescendantHandleRegFailure | obs>0 reg=0 err>0 | obs=3 reg=0 err=3 | PASS |
 
-### R7-REM-05: Marker Lifecycle After Handle Verification
+### R8-REM-02: Creation-Time & Native API Verification
 
-- Markers preserved during fixture processing
-- `handleRegistry.CloseAll()` called before marker deletion
-- `Remove-Item -ErrorAction Stop` + `Test-Path` re-check
-- R5/R6 historical orphan directory preserved (not deleted per policy)
+- `RegisterProcess` checks `GetProcessTimes` bool return; failure → close handle, return error
+- `CreationTime` required non-zero; zero treated as error (handle closed)
+- `RegistrationResult.Win32Error` captures `Marshal.GetLastWin32Error()` at failure point
+- `CloseAll()` returns per-handle success/failure with `FailedPids` array
+- Timeout fixture `pReg=True` confirms parent handle registered with valid creation time
 
-### R7-REM-06: Collector Fail-Closed
+### R8-REM-03: JobAssignFailure Deterministic Injection
 
-- `catch { break; }` → `catch (Exception ex) { r.ReadError = ex.Message; break; }`
-- `Healthy` property: `!StdoutFaulted && !StderrFaulted && !DrainTimedOut`
-- `$collectTask.Wait()` return value checked
-- `captureHealthy` in ALL fixture PASS predicates
-- Task fault status (`IsFaulted`) checked before accessing results
+- Controller-side: after job assignment attempt, `$assignedToJob` forced to `$false` for `JobAssignFailure` fixture
+- Child outputs `JOB-ASSIGN-FAILURE-INJECTED: <token>` marker
+- Fixture PASS requires: exit=3, struct, untrusted, stderr=0, budget, healthy
+- Handle-based cleanup verified without job object assistance
 
-### Post-Run Evidence
+### R8-REM-04: Collector Failure Fixtures
 
-- No orphan PowerShell descendants from this run
-- R5/R6 historical marker directory preserved (empty, not deleted)
-- R7 marker directory: empty (files deleted, directory persists — acceptable)
+**CollectorReadFailure:**
+
+- Creates `MemoryStream`, writes 3 bytes, disposes it (ReadAsync will throw)
+- `BoundedStreamCollector.CollectAsync` called with disposed stream
+- Verified: `StdoutFaulted=True`, `Healthy=False`
+- Fail-closed: fault detected, resources released
+
+**CollectorDrainTimeout:**
+
+- Creates `AnonymousPipeServerStream` (never writes, ReadAsync blocks)
+- Collector called with 100ms deadline
+- Verified: `DrainTimedOut=True`, `Healthy=False`
+- CTS cancelled, pipe streams disposed, no hang
+
+### R8-REM-05: Marker Deletion Lifecycle
+
+**MarkerDeletionWhileLive:**
+
+- Creates marker file, verifies existence
+- Deletes with no active handles → succeeds
+- Verified: exists=True, gone=True
+
+**MarkerDeletionFailure:**
+
+- Opens marker file with exclusive lock (File.Open with None share)
+- Attempts Remove-Item → fails (file in use on Windows)
+- Error caught, fail-closed verified
+- Lock released, cleanup succeeds
+- Verified: exists=True, del=caught-error
+
+### R8-REM-06: Cleanup Results Not Ignored
+
+- `$primaryCleanupResult` and `$finallyCleanupResult` saved (not piped to `Out-Null`)
+- Cleanup `Success`, `ActiveAfter`, `CloseResult` checked in pass predicates
+- Timeout fixture: `parentRegOk` required in pass predicate
+- CleanupFailure fixture: `cleanupOk` required in pass predicate
+- Final orphan check: `CloseAllResult.AllClosed` checked; failure → `$allPassed = $false`
+- `Invoke-HandleCleanup`: registration errors treated as diagnostic (not cleanup failures)
+
+### R8-REM-07: Preflight Accuracy
+
+- Two runs recorded with exact exit codes, test counts, stderr state
+- Suite inventory: 8 suites, 201 total (was 195 in R7)
+- ProcessLevelFaults: 20 fixtures (was 14), all PASS
+- New fault matrix: ParentHandleRegFailure, DescendantHandleRegFailure, CollectorReadFailure, CollectorDrainTimeout, MarkerDeletionWhileLive, MarkerDeletionFailure
+- Each fault fixture records expected/actual in structured evidence
+- Process/marker/handle/task leak verification: no new PowerShell PIDs, no new marker directories
 
 ## Non-action Checklist
 
