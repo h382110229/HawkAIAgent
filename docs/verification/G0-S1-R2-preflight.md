@@ -1,23 +1,25 @@
-# G0-S1 R5 Preflight Report
+# G0-S1 R6 Preflight Report
 
-**Date**: 2026-08-27
+**Date**: 2026-08-28
 **Script**: `research/g0-s1-harness-integration/windows-poc-test-r2.ps1`
 
 ## Code Commit
 
 | Field | Value |
 |---|---|
-| Hash | `159dec955bd564a8e5bfc86da9873e60d4198532` |
-| Parent | `0bc5e950c3086bd9c05286b8cf2137ac8133a00b` |
-| Subject | `test: R5 remediation — token-based process tree cleanup, bounded capture, CleanupFailure fixture, dynamic counts` |
+| Hash | `d30ecbea894f2e1919dadb5971b6951c9b5d3dc4` |
+| Parent | `66476f791b77b8346fa63c595900de55f5e2524f` |
+| Subject | `test: R6 remediation — bounded async dual-stream collector, Job Object, descendant timeout, fail-closed cleanup` |
 | Files | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
 
 ## Script Blob
 
 | Field | Value |
 |---|---|
-| Git blob | `30bfeefb47326e12d13a219068298eef1aead1e0` |
-| SHA-256 | `760389f22b47a39f1c1bd2ec6ce568aa0e8bad7bc9aa178a81be0ef09c82cab3` |
+| Git blob | `200285bcc26cad4af650e9505932f69fc3adc7b3` |
+| SHA-256 | `13c2d34e53b93bf42de4411c0ab5a9b0fd1a782971b07f1fc23652e7465f1d1a` |
+
+SHA-256 computed on raw git blob bytes (`git cat-file -p <blob> | sha256sum`), not on CRLF-converted working-tree content.
 
 ## Static Analysis
 
@@ -30,10 +32,10 @@
 
 Two consecutive `-SelfTestOnly` runs on the exact code commit:
 
-| Run | Exit | Tests | PASS | FAIL | Duration | stderr |
+| Run | Start (CST) | Exit | Tests | PASS | FAIL | stderr |
 |---|---|---|---|---|---|---|
-| Run 1 | 0 | 194 | 194 | 0 | ~45s | empty |
-| Run 2 | 0 | 194 | 194 | 0 | ~45s | empty |
+| Run 1 | 2026-08-28 ~09:22 | 0 | 194 | 194 | 0 | empty |
+| Run 2 | 2026-08-28 ~09:24 | 0 | 194 | 194 | 0 | empty |
 
 Suite inventory (both runs identical):
 
@@ -49,29 +51,17 @@ Suite inventory (both runs identical):
 | ProcessLevelFaults | 13 | 13 | 13 | 0 |
 | **Total** | **194** | **194** | **194** | **0** |
 
-Display formula: `Aggregation(11) + NativeJudgment(24) + ParentPath(4) + GateSummary(15) = 54` pure + `LockfileReader(102)` node-backed + `ManifestCompare(14) + SuiteEvidence(11) + ProcessLevelFaults(13) = 38` R15 = **194** total. All counts dynamically derived from runtime suite objects.
+## R6 Remediation Evidence
 
-## Process-Level Fault Fixtures (13 cases)
+### R6-REM-01: Bounded Dual-Stream Collector
 
-### Structural (5 cases)
+- **Implementation**: Inline C# `BoundedStreamCollector` class using `BaseStream.ReadAsync` on both stdout/stderr concurrently. Fixed 51200-byte retained buffer per stream. Overflow bytes drained/discarded. `Int64` total byte counter.
+- **ReadToEndAsync removed**: No `ReadToEndAsync()` or `rawStdout`/`rawStderr` strings remain in the capture path.
+- **Deadlock prevention**: Async `Task.WhenAll` on both streams with `CancellationTokenSource` and bounded drain deadline.
+- **Byte-level capture**: `capturedBytes` = actual retained bytes from `Buffer.BlockCopy`; `totalBytes` = sum of `ReadAsync` return values. Text decoded from retained bytes only (`UTF8.GetString`), not from full output.
+- **Truncation**: `$collector.StdoutTruncated` = true iff `totalBytes > 51200` (same byte-level metric).
 
-| Fixture | Exit | stdout total | captured | truncated | stderr | UNTRUSTED | ScriptInternal |
-|---|---|---|---|---|---|---|---|
-| MissingSuite | 3 | 679 | 679 | False | 0 | True | True |
-| DeclaredMismatch | 3 | 688 | 688 | False | 0 | True | True |
-| PassedMismatch | 3 | 751 | 751 | False | 0 | True | True |
-| FailedNonZero | 3 | 733 | 733 | False | 0 | True | True |
-| ManifestMismatch | 3 | 688 | 688 | False | 0 | True | True |
-
-### Timeout (1 case)
-
-| Fixture | Exit | stdout total | captured | truncated | marker | timedOut |
-|---|---|---|---|---|---|---|
-| Timeout | -1 | 54 | 54 | False | True | True |
-
-Process tree cleanup: parent powershell.exe killed via `Kill-TestProcessTree`. Descendant tracked via PID marker file and CIM CommandLine token verification. Post-loop orphan scan: **no orphans**.
-
-### Oversize (4 cases)
+Fixture evidence (R6 run):
 
 | Fixture | stdout total | captured | truncated | stderr total | captured | truncated |
 |---|---|---|---|---|---|---|
@@ -79,54 +69,96 @@ Process tree cleanup: parent powershell.exe killed via `Kill-TestProcessTree`. D
 | StderrOversize | 0 | 0 | False | 61500 | 51200 | True |
 | DualStreamOversize | 61500 | 51200 | True | 61500 | 51200 | True |
 | LongLine | 61441 | 51200 | True | 0 | 0 | False |
+| BoundaryExact | 51200 | 51200 | False | 0 | 0 | False |
+| BoundaryOver | 51201 | 51200 | True | 0 | 0 | False |
 
-All oversize: exit=3, captured ≤ 51200, captured ≤ total, truncated iff total > 51200. LongLine: no premature newline in captured text (single line verified).
+All: `captured ≤ 51200`, `captured ≤ total`, `truncated ⟺ total > 51200`. Buffer capacity = 51200 bytes retained max per stream.
 
-### Boundary (2 cases)
+### R6-REM-02: Timeout with Descendant
 
-| Fixture | stdout total | captured | truncated | stderr total |
-|---|---|---|---|---|
-| BoundaryExact | 51200 | 51200 | False | 0 |
-| BoundaryOver | 51201 | 51200 | True | 0 |
+- **Timeout child**: Creates real descendant via `Start-Process powershell` with token+role in command line and marker file (`token|pid|timeout-descendant`).
+- **Parent verification**: Marker files checked inside try block (before finally deletes them). `$descendantObserved` = marker file exists with matching token.
+- **Assertion fields**: `descendantObserved`, `parentExited`, `descendantExited`, `treeCleanupSucceeded`, `orphanFree` — all required, any missing = FAIL.
 
-BoundaryExact: total=captured=limit, not truncated. BoundaryOver: total=limit+1, captured=limit, truncated.
+Fixture evidence:
 
-### CleanupFailure (1 case)
+| Field | Value |
+|---|---|
+| Exit | -1 |
+| timedOut | True |
+| descendantObserved | True |
+| parentExited | True |
+| descendantExited | True |
+| treeCleanupSucceeded | True |
+| orphanFree | True |
+
+### R6-REM-03: CIM Fail-Closed + Job Object
+
+- **Job Object**: `CreateKillOnCloseJob()` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Active process count via `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`.
+- **Job assignment**: `AssignProcess()` via `OpenProcess(PROCESS_SET_QUOTA|PROCESS_TERMINATE)` + `AssignProcessToJobObject`. **Note**: Assignment fails on this environment (child processes already in parent's Job — Windows single-Job limitation). Tests pass via CIM fallback.
+- **Test-NoOrphans**: Returns three-state object `{Status, Detail, JobVerified}`:
+  - `VerifiedClean`: Job=0 or (Job=unavailable AND CIM=0 matching)
+  - `OrphansFound`: Job>0 or CIM>0 matching
+  - `VerificationError`: Job query failed AND CIM=null/Access Denied
+- **CIM Access Denied**: Returns `VerificationError`, NOT `VerifiedClean`. When Job confirms clean, CIM failure is tolerated (Job is authoritative).
+- **Kill-TestProcessTree**: CIM sweep notes null result as error. CIM-only path used when Job unavailable.
+
+### R6-REM-04: Emergency Cleanup Identity Verification
+
+- **Job-first**: `Invoke-EmergencyCleanup` checks Job active count, calls `TerminateAll` if >0.
+- **PID fallback**: Reads 3-field marker (`token|pid|role`), verifies CIM CommandLine contains both token AND role before kill.
+- **Identity unconfirmed**: Does NOT kill, records error.
+- **No silent failures**: All errors collected in `$cleanupErrors` array, returned as `$ecResult.Errors`.
+
+### R6-REM-05: CleanupFailure State Matrix
+
+PASS predicate requires ALL of:
+- `$cleanupFailureInjected` (fixture type = CleanupFailure)
+- `$primaryCleanupFailed` (descendant was alive when checked)
+- `$failureReported` (emergency cleanup was invoked due to live descendant)
+- `$emergencyCleanupDone` (emergency cleanup succeeded)
+- `$parentExited` (fault child exited with code 3)
+- `$descendantExited` (descendant dead after emergency cleanup, verified via re-check)
+- `$descendantObserved` (marker file existed with matching token)
+- `$verifiedClean` (post-cleanup orphan check = VerifiedClean)
+
+Missing any = FAIL. Evidence:
 
 | Field | Value |
 |---|---|
 | Exit | 3 |
-| No success banner | True |
-| Cleanup failure detected | True |
-| Emergency cleanup done | True |
-| Orphan-free after cleanup | True |
-| stdout total/captured | 0/0 |
+| cleanupFailureInjected | True |
+| primaryCleanupFailed | True |
+| failureReported | True |
+| emergencyCleanupDone | True |
+| parentExited | True |
+| descendantExited | True |
+| descendantObserved | True |
+| verifiedClean | True |
+| orphanFree | True |
 
-The CleanupFailure fixture spawns a real descendant process with the test token in its command line. The fast-fault child exits WITHOUT killing the descendant (simulating cleanup failure). The parent detects the living descendant via PID marker file, verifies identity via CIM CommandLine token match, and invokes `Invoke-EmergencyCleanup` (independent code path). Post-cleanup orphan scan confirms no test-owned processes remain.
+### R6-REM-06: Marker Directory Cleanup
 
-## Bounded Capture Semantics
+- **Unique path**: `plf-markers-PLF-<GUID>` per invocation.
+- **Verified deletion**: `Remove-Item -ErrorAction Stop` followed by `Test-Path` re-check. Failure → `$allPassed = $false` + `$script:CleanupErrors`.
+- **Job handle closed**: `CloseHandle()` after `GetActiveProcessCount` check.
 
-- **Encoding**: All fixtures emit ASCII characters via `[Console]::Out.Write()` / `[Console]::Error.Write()`. UTF-8 byte count = character count for ASCII range.
-- **Total bytes**: `[System.Text.Encoding]::UTF8.GetByteCount(rawOutput)` — same metric for total and captured.
-- **Captured bytes**: `min(totalBytes, 51200)` — enforced by post-read truncation.
-- **Truncated**: `$totalBytes -gt 51200` — strict equivalence.
-- **Invariant**: captured ≤ total AND captured ≤ 51200 — verified in all fixture assertions.
+Post-run evidence:
+- **R5 orphan** (pre-existing): `plf-markers-PLF-467a11a98f9644758b39f4105dd049f7` (Aug 27) — NOT deleted per R6-REM-06 ("不要删除或归因其他历史 plf-* 路径"). This is the R5 bug that R6 fixes.
+- **R6 run 1**: No new orphan directories.
+- **R6 run 2**: No new orphan directories.
 
-## Process Identity and Tree Cleanup
+### Known Limitation: Job Object Assignment
 
-- **Token**: `PLF-<GUID>` generated per `Test-ProcessLevelFaults` invocation.
-- **Identity mechanism**: Token passed as CLI argument to child process (`-PLFToken`), queryable via `Win32_Process.CommandLine`. PID marker files (`parent-<PID>.txt`, `desc-<PID>.txt`) written to shared marker directory.
-- **Parent cleanup**: `$proc.Kill()` + `$proc.WaitForExit(3000)`.
-- **Descendant cleanup**: Read PID from marker file → verify CIM CommandLine token → `Stop-Process -Force`.
-- **Safety net**: CIM scan for any remaining processes matching token.
-- **Emergency cleanup**: Independent `Invoke-EmergencyCleanup` function, always runs in `finally` block.
-- **Orphan verification**: `Test-NoOrphans` scans CIM post-loop; any survivors trigger emergency cleanup + test FAIL.
+On this environment, `AssignProcessToJobObject` fails for all child processes. Root cause: Windows allows a process to be in only one Job Object at a time. The child PowerShell processes inherit Job membership from the parent process and cannot be reassigned to the test's Job Object.
+
+Impact: Job Object is used as supplementary verification only. CIM-based cleanup and orphan detection serve as the primary mechanism. The three-state `Test-NoOrphans` correctly handles Job unavailability by falling back to CIM with proper error semantics.
 
 ## Non-action Checklist
 
 - [x] No npm install / Harness / HTTP/WS / port operations
 - [x] No real credentials or API keys
-- [x] No process-name-wide kill (all kills are token-verified or PID-specific)
+- [x] No process-name-wide kill (all kills are token+role-verified or PID-specific)
 - [x] PR remains OPEN + Draft, base=master, merged=null
 - [x] No merge, no Ready, no master modification
 - [x] No Phase B / G0-S2 entry
