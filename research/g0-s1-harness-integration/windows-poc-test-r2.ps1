@@ -29,7 +29,7 @@ param(
     [switch]$SelfTestOnly,
     # R15-REM-01: Fault injection for process-level exit 3 verification.
     # Only valid with -SelfTestOnly. Corrupts suite data before aggregation.
-    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure','JobAssignFailure','ParentHandleRegFailure','DescendantHandleRegFailure','CollectorReadFailure','CollectorDrainTimeout','MarkerDeletionWhileLive','MarkerDeletionFailure','GetProcessTimesFailure','WaitFailure','CloseHandleFailure')]
+    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure','JobAssignFailure','ParentHandleRegFailure','DescendantHandleRegFailure','CollectorReadFailure','CollectorDrainTimeout','MarkerDeletionWhileLive','MarkerDeletionFailure','GetProcessTimesFailure','WaitFailure','CloseHandleFailure','MetaRoleMismatch','MetaTokenMismatch','MetaExtraEntry','MetaExtraMarker','MetaNullEvidence','MetaEmptyManifest','MetaDuplicateExpectedPID','MetaDuplicateActualPID')]
     [string]$SelfTestFault = 'None',
     # R3-REM-04: Fast fault child mode — skips all test execution, constructs deterministic
     # suite records, injects fault, calls Invoke-SelfTestAggregation, exits.
@@ -2107,8 +2107,12 @@ function Invoke-SelfTestAggregation {
     }
 
     # R2-REM-02: Only print trusted N/N PASS when suite validation succeeded
+    # R12-REM-05: Track whether banner/totals were actually printed
+    $successBannerPrinted = $false
+    $trustedTotalsPrinted = $false
     if ($suiteValid) {
         Write-Host "Total: $overallTotal tests, $overallPassed/$overallTotal PASS, $overallFailed FAILED"
+        $trustedTotalsPrinted = $true
         Write-Host "Suite validation: PASS"
     } else {
         Write-Host "UNTRUSTED / STRUCTURAL ERROR: $overallTotal tests reported, $overallPassed claimed PASS, $overallFailed FAILED — NOT RELIABLE"
@@ -2128,6 +2132,7 @@ function Invoke-SelfTestAggregation {
     # Only record PASS results when suite validation succeeded
     if ($suiteValid) {
         Write-Host "`n=== SELF-TEST-ONLY MODE: All self-tests passed ===" -ForegroundColor Green
+        $successBannerPrinted = $true
 
         Add-TestResult -TestId "SELFTEST-PURE" -Category "MandatoryFunctional" `
           -Description "Pure-function self-tests (Aggregation+NativeJudgment+ParentPath+GateSummary)" `
@@ -2160,6 +2165,8 @@ function Invoke-SelfTestAggregation {
         Overall = $selfTestOverall
         ExitCode = $selfTestExitCode
         SuiteValid = $suiteValid
+        SuccessBannerPrinted = $successBannerPrinted
+        TrustedTotalsPrinted = $trustedTotalsPrinted
     }
 }
 
@@ -2316,72 +2323,309 @@ function Get-CollectorHealthMapping {
 }
 
 # R10-REM-02: Shared common process gate for all launched-child fixtures.
-# Returns structured gate result with all required checks.
+# R12-REM-01: ExpectedManifest for order-independent PID/role/token comparison.
+# R12-REM-02: MarkerDeleteResult for real marker deletion verification.
+# R12-REM-03: All evidence fields mandatory and non-null.
 function Test-CommonProcessGate {
     param(
-        [Parameter(Mandatory=$true)][PSCustomObject]$CleanupResult,
-        [Parameter(Mandatory=$true)][PSCustomObject]$CaptureHealthMapping,
+        [PSCustomObject]$CleanupResult = $null,
+        [PSCustomObject]$CaptureHealthMapping = $null,
         [bool]$ParentRegOk = $false,
         [bool]$CreationTimeOk = $false,
         [ProcessHandleRegistry]$Registry = $null,
-        [string]$MarkerDirectory = ""
+        [string]$MarkerDirectory = "",
+        [PSCustomObject[]]$ExpectedManifest = @(),
+        [PSCustomObject[]]$AllCleanupResults = @(),
+        [PSCustomObject]$MarkerDeleteResult = $null,
+        # R15-FU-02: Launched-child guard — when true, empty ExpectedManifest is a Gate FAIL
+        [bool]$IsLaunchedChild = $false
     )
     $gateErrors = @()
+    $gateMatrix = [ordered]@{}
+    # R15-FU-02: Record fixture mode in matrix for diagnostics
+    $gateMatrix.IsLaunchedChild = $IsLaunchedChild
 
-    # 1. Parent registration
+    # R12-REM-03: 1. Parent registration — mandatory
+    $gateMatrix.ParentRegOk = $ParentRegOk
+    $gateMatrix.CreationTimeOk = $CreationTimeOk
     if (-not $ParentRegOk) { $gateErrors += "Parent registration failed" }
     if (-not $CreationTimeOk) { $gateErrors += "Parent creation time is zero" }
 
-    # 2. Capture task completed, Healthy=true, no ReadError/DrainTimedOut
-    if (-not $CaptureHealthMapping.Healthy) {
-        $gateErrors += "Capture unhealthy: ReadError=$($CaptureHealthMapping.ReadError) DrainTimedOut=$($CaptureHealthMapping.DrainTimedOut)"
+    # R12-REM-03: 2. Capture health — mandatory non-null
+    $gateMatrix.CaptureHealthy = $false
+    if ($null -eq $CaptureHealthMapping) {
+        $gateErrors += "CaptureHealthMapping is null (mandatory evidence missing)"
+    } else {
+        $gateMatrix.CaptureHealthy = $CaptureHealthMapping.Healthy
+        if (-not $CaptureHealthMapping.Healthy) {
+            $gateErrors += "Capture unhealthy: ReadError=$($CaptureHealthMapping.ReadError) DrainTimedOut=$($CaptureHealthMapping.DrainTimedOut)"
+        }
     }
 
-    # 3. All executed cleanup phases succeeded
-    if ($null -ne $CleanupResult -and -not $CleanupResult.Success) {
-        $gateErrors += "Cleanup failed: $($CleanupResult.Errors -join '; ')"
+    # R12-REM-03: 3. CleanupResult — mandatory non-null
+    $gateMatrix.CleanupSuccess = $false
+    if ($null -eq $CleanupResult) {
+        $gateErrors += "CleanupResult is null (mandatory evidence missing)"
+    } else {
+        $gateMatrix.CleanupSuccess = $CleanupResult.Success
+        if (-not $CleanupResult.Success) {
+            $gateErrors += "Cleanup failed: $($CleanupResult.Errors -join '; ')"
+        }
     }
 
-    # 4. Per-entry wait results - all expected entries must be Exited
-    if ($null -ne $CleanupResult -and $null -ne $CleanupResult.EntrySnapshot) {
+    # R12-REM-06: 4. Check ALL cleanup results — expected failures allowed, unexpected fail
+    $gateMatrix.AllCleanupResultsChecked = 0
+    $gateMatrix.UnexpectedFailures = 0
+    if ($AllCleanupResults.Count -gt 0) {
+        $unexpectedFailures = @($AllCleanupResults | Where-Object {
+            -not $_.Success -and -not $_.ExpectedFailure
+        })
+        if ($unexpectedFailures.Count -gt 0) {
+            $gateErrors += "Unexpected cleanup failures: $($unexpectedFailures.Count)"
+        }
+        $gateMatrix.AllCleanupResultsChecked = $AllCleanupResults.Count
+        $gateMatrix.UnexpectedFailures = $unexpectedFailures.Count
+    } elseif ($IsLaunchedChild) {
+        # R15-FU-05: Launched-child MUST have cleanup results — empty means evidence missing
+        $gateErrors += "AllCleanupResults empty for launched-child fixture (mandatory evidence missing)"
+    }
+
+    # R12-REM-03: 5. EntrySnapshot — mandatory, must match expected manifest
+    $gateMatrix.EntrySnapshotOk = $false
+    $gateMatrix.EntryCount = 0
+    if ($null -eq $CleanupResult) {
+        $gateErrors += "EntrySnapshot unavailable: CleanupResult is null"
+    } elseif ($null -eq $CleanupResult.EntrySnapshot) {
+        $gateErrors += "EntrySnapshot is null (mandatory evidence missing)"
+    } else {
+        $gateMatrix.EntryCount = $CleanupResult.EntrySnapshot.Count
+        # R12-REM-01: Order-independent comparison by PID
+        $allExited = $true
         foreach ($entry in $CleanupResult.EntrySnapshot) {
             if ($entry.WaitOutcome -ne 'Exited') {
                 $gateErrors += "Entry PID=$($entry.Pid) role=$($entry.Role) WaitOutcome=$($entry.WaitOutcome) Win32=$($entry.Win32Error)"
+                $allExited = $false
             }
+        }
+        if ($ExpectedManifest.Count -gt 0) {
+            # R12-REM-01: Build PID-keyed maps for order-independent comparison
+            # R15-FU-02: Detect duplicate PIDs in expected manifest
+            $expectedByPid = @{}
+            $expectedDuplicatePid = $false
+            foreach ($exp in $ExpectedManifest) {
+                if ($expectedByPid.ContainsKey($exp.Pid)) {
+                    $gateErrors += "Duplicate expected PID=$($exp.Pid) in ExpectedManifest"
+                    $expectedDuplicatePid = $true
+                }
+                $expectedByPid[$exp.Pid] = $exp
+            }
+            # R15-FU-02: Detect duplicate PIDs in actual snapshot
+            $actualByPid = @{}
+            $actualDuplicatePid = $false
+            foreach ($snap in $CleanupResult.EntrySnapshot) {
+                if ($actualByPid.ContainsKey($snap.Pid)) {
+                    $gateErrors += "Duplicate actual PID=$($snap.Pid) in EntrySnapshot"
+                    $actualDuplicatePid = $true
+                }
+                $actualByPid[$snap.Pid] = $snap
+            }
+            # Check for missing entries
+            foreach ($expPid in $expectedByPid.Keys) {
+                if (-not $actualByPid.ContainsKey($expPid)) {
+                    $exp = $expectedByPid[$expPid]
+                    $gateErrors += "Missing entry: PID=$expPid role=$($exp.Role)"
+                }
+            }
+            # Check for extra entries
+            foreach ($actPid in $actualByPid.Keys) {
+                if (-not $expectedByPid.ContainsKey($actPid)) {
+                    $snap = $actualByPid[$actPid]
+                    $gateErrors += "Extra entry: PID=$actPid role=$($snap.Role)"
+                }
+            }
+            # Check matching entries for role/token/creation-time agreement
+            foreach ($expPid in $expectedByPid.Keys) {
+                if ($actualByPid.ContainsKey($expPid)) {
+                    $exp = $expectedByPid[$expPid]; $snap = $actualByPid[$expPid]
+                    if ($snap.Role -ne $exp.Role) { $gateErrors += "Role mismatch: PID=$expPid expected=$($exp.Role) actual=$($snap.Role)" }
+                    if ($snap.Token -ne $exp.Token) { $gateErrors += "Token mismatch: PID=$expPid" }
+                    if ($exp.CreationTime -gt 0 -and $snap.CreationTime -ne $exp.CreationTime) { $gateErrors += "CreationTime mismatch: PID=$expPid" }
+                }
+            }
+            $gateMatrix.ExpectedCount = $ExpectedManifest.Count
+            $gateMatrix.ActualCount = $CleanupResult.EntrySnapshot.Count
+            $gateMatrix.EntrySnapshotOk = ($allExited -and (-not $expectedDuplicatePid) -and (-not $actualDuplicatePid) -and ($expectedByPid.Count -eq $actualByPid.Count) -and ($gateErrors.Count -eq 0))
+        } elseif ($IsLaunchedChild) {
+            # R15-FU-02: Launched-child with empty ExpectedManifest => FAIL
+            $gateErrors += "ExpectedManifest empty for launched-child fixture (mandatory comparison missing)"
+            $gateMatrix.ExpectedCount = 0
+            $gateMatrix.ActualCount = $CleanupResult.EntrySnapshot.Count
+            $gateMatrix.EntrySnapshotOk = $false
+        } else {
+            # Non-launched-child (meta/pure): no expected manifest — just check all exited
+            $gateMatrix.ExpectedCount = 0
+            $gateMatrix.ActualCount = $CleanupResult.EntrySnapshot.Count
+            $gateMatrix.EntrySnapshotOk = $allExited
         }
     }
 
-    # 5. CloseAllResult.AllClosed
-    if ($null -ne $CleanupResult -and $null -ne $CleanupResult.CloseResult -and -not $CleanupResult.CloseResult.AllClosed) {
-        $gateErrors += "CloseAll failed: $($CleanupResult.CloseResult.Failed) handles"
+    # R12-REM-03: 6. ActiveBeforeClose must be 0
+    $gateMatrix.ActiveBeforeCloseOk = $false
+    if ($null -ne $CleanupResult) {
+        $gateMatrix.ActiveBeforeClose = $CleanupResult.ActiveBeforeClose
+        if ($CleanupResult.ActiveBeforeClose -gt 0) {
+            $gateErrors += "ActiveBeforeClose=$($CleanupResult.ActiveBeforeClose)"
+        } else {
+            $gateMatrix.ActiveBeforeCloseOk = $true
+        }
     }
 
-    # 6. ActiveBeforeClose must be 0
-    if ($null -ne $CleanupResult -and $CleanupResult.ActiveBeforeClose -gt 0) {
-        $gateErrors += "ActiveBeforeClose=$($CleanupResult.ActiveBeforeClose)"
+    # R12-REM-03: 7. CloseAllResult — mandatory non-null
+    $gateMatrix.CloseAllOk = $false
+    if ($null -eq $CleanupResult) {
+        $gateErrors += "CloseResult unavailable: CleanupResult is null"
+    } elseif ($null -eq $CleanupResult.CloseResult) {
+        $gateErrors += "CloseResult is null (mandatory evidence missing)"
+    } else {
+        $gateMatrix.CloseAllOk = $CleanupResult.CloseResult.AllClosed
+        if (-not $CleanupResult.CloseResult.AllClosed) {
+            $gateErrors += "CloseAll failed: $($CleanupResult.CloseResult.Failed) handles"
+        }
     }
 
-    # 7. Owned marker directory: check that cleanup phase handled markers
-    # Note: marker file deletion is handled by inter-fixture cleanup, not the gate
-    $markerDeleted = $true
+    # R12-REM-02: 8. Marker deletion — real verification, not constant
+    # R15-FU-05: Structured default when MarkerDirectory non-empty but MarkerDeleteResult null
+    $gateMatrix.MarkerDeleted = $false
+    $gateMatrix.MarkerPathAbsent = $false
+    $gateMatrix.MarkerExpectedCount = 0
+    $gateMatrix.MarkerActualCount = 0
+    if ($null -ne $MarkerDeleteResult) {
+        $gateMatrix.MarkerDeleted = $MarkerDeleteResult.Success
+        if (-not $MarkerDeleteResult.Success) {
+            $gateErrors += "Marker deletion failed: $($MarkerDeleteResult.Error)"
+        }
+        if ($MarkerDirectory -ne "") {
+            $remainingMarkers = Get-ChildItem -Path $MarkerDirectory -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+            $gateMatrix.MarkerActualCount = if ($remainingMarkers) { @($remainingMarkers).Count } else { 0 }
+            if (-not $remainingMarkers) {
+                $gateMatrix.MarkerPathAbsent = $true
+            } else {
+                $gateErrors += "Marker files still present: $(@($remainingMarkers).Count)"
+            }
+        } else {
+            $gateMatrix.MarkerPathAbsent = $true
+        }
+    } elseif ($MarkerDirectory -ne "") {
+        # R15-FU-05: MarkerDirectory specified but no delete result — provide structured default
+        $remainingMarkers = Get-ChildItem -Path $MarkerDirectory -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+        $markerCount = if ($remainingMarkers) { @($remainingMarkers).Count } else { 0 }
+        $pathAbsent = ($markerCount -eq 0)
+        $gateMatrix.MarkerPathAbsent = $pathAbsent
+        $gateMatrix.MarkerActualCount = $markerCount
+        # Structured default: Expected=0/Actual=markerCount/Success=pathAbsent
+        if (-not $pathAbsent) {
+            $gateErrors += "Marker files exist but no delete result provided ($markerCount remaining)"
+        }
+    } else {
+        $gateMatrix.MarkerDeleted = $true  # No markers expected
+        $gateMatrix.MarkerPathAbsent = $true
+    }
 
-    # 8. Final orphan check (using registry if provided)
+    # R12-REM-03: 9. Final orphan check — from frozen pre-close evidence, not empty registry
+    # R15: When ExpectedManifest is provided and EntrySnapshot comparison passed,
+    # the orphan check is already done via frozen EntrySnapshot (step 5 above).
+    # Only query live registry when ExpectedManifest is NOT provided (legacy path).
     $orphanResult = $null
-    if ($null -ne $Registry) {
-        $orphanResult = Test-HandleOrphans -Registry $Registry
+    if ($ExpectedManifest.Count -gt 0 -and $null -ne $gateMatrix.EntrySnapshotOk -and $gateMatrix.EntrySnapshotOk) {
+        # Frozen evidence already verified in step 5 — report as clean
+        $orphanResult = [PSCustomObject]@{ Status='VerifiedClean'; Detail="Frozen EntrySnapshot matched ExpectedManifest (count=$($ExpectedManifest.Count))"; Source='FrozenSnapshot' }
+    } elseif ($null -ne $Registry) {
+        # Legacy path: no expected manifest, query live registry
+        $orphanResult = Test-HandleOrphans -Registry $Registry -ExpectedManifest $ExpectedManifest
         if ($orphanResult.Status -ne 'VerifiedClean') {
             $gateErrors += "Orphan check: $($orphanResult.Status) $($orphanResult.Detail)"
         }
+    } elseif ($IsLaunchedChild) {
+        $gateErrors += "Registry null for launched-child fixture (orphan check impossible)"
     }
+    $gateMatrix.OrphanStatus = if ($orphanResult) { $orphanResult.Status } else { 'N/A' }
 
     return [PSCustomObject]@{
         Pass = ($gateErrors.Count -eq 0)
         Errors = $gateErrors
+        Matrix = $gateMatrix
         CleanupResult = $CleanupResult
         CaptureHealth = $CaptureHealthMapping
         OrphanResult = $orphanResult
-        MarkerDeleted = $markerDeleted
     }
+}
+
+# R12-REM-05: Shared overall→exit-code mapper — single source of truth for exit codes
+# and banner/totals permissions. Returns structured object, not raw integer.
+function Get-OverallExitResult {
+    param([Parameter(Mandatory=$true)][string]$Overall)
+    $exitCode = switch ($Overall) { "PASS" { 0 } "FAIL" { 1 } "BLOCKED" { 2 } "ERROR" { 3 } default { 3 } }
+    return [PSCustomObject]@{
+        Overall = $Overall
+        ExitCode = $exitCode
+        SuccessBannerAllowed = ($Overall -eq 'PASS')
+        TrustedTotalsAllowed = ($Overall -eq 'PASS')
+    }
+}
+
+# R12-REM-04: Shared native-process stop/wait/verify for finally blocks.
+# Uses PID + creation-time identity to avoid PID-reuse confusion.
+# Returns structured result — caller must consume it in PASS judgment.
+function Stop-Wait-VerifyOwnedProcess {
+    param(
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [long]$CreationTime = 0,
+        [int]$WaitMs = 3000
+    )
+    $result = [PSCustomObject]@{
+        TerminateRequested = $false
+        Exited = $false
+        TimedOut = $false
+        IdentityMatched = $false
+        FallbackCleanup = $false
+        FinalAbsent = $false
+    }
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($proc) {
+            $result.IdentityMatched = $true
+            if ($CreationTime -gt 0) {
+                try { $result.IdentityMatched = ($proc.StartTime.Ticks -eq $CreationTime) } catch {}
+            }
+            $proc.Dispose()
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+            $result.TerminateRequested = $true
+            $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMs)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                $check = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                if (-not $check) { $result.Exited = $true; break }
+                $check.Dispose()
+                Start-Sleep -Milliseconds 100
+            }
+            if (-not $result.Exited) { $result.TimedOut = $true }
+        } else {
+            $result.Exited = $true
+            $result.IdentityMatched = $true
+        }
+    } catch {}
+    if (-not $result.Exited) {
+        try {
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+            $stillAlive = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if (-not $stillAlive) { $result.Exited = $true; $result.FallbackCleanup = $true }
+            else { $stillAlive.Dispose() }
+        } catch { $result.FallbackCleanup = $true }
+    }
+    $finalCheck = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $finalCheck) { $result.FinalAbsent = $true }
+    else { $finalCheck.Dispose() }
+    return $result
 }
 
 function Test-ProcessLevelFaults {
@@ -2675,7 +2919,17 @@ function Test-ProcessLevelFaults {
         @{ Name='MarkerDeletionFailure'; Fault='MarkerDeletionFailure'; Timeout=$childTimeoutMs; Fast=$true; Type='markerLifecycle' },
         @{ Name='GetProcessTimesFailure'; Fault='GetProcessTimesFailure'; Timeout=$childTimeoutMs; Fast=$true; Type='nativeApiFault' },
         @{ Name='WaitFailure'; Fault='WaitFailure'; Timeout=$childTimeoutMs; Fast=$true; Type='nativeApiFault' },
-        @{ Name='CloseHandleFailure'; Fault='CloseHandleFailure'; Timeout=$childTimeoutMs; Fast=$true; Type='nativeApiFault' }
+        @{ Name='CloseHandleFailure'; Fault='CloseHandleFailure'; Timeout=$childTimeoutMs; Fast=$true; Type='nativeApiFault' },
+        # R12-REM-01: Meta-tests — inject manifest mismatches to prove Gate rejects
+        @{ Name='MetaRoleMismatch'; Fault='MetaRoleMismatch'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        @{ Name='MetaTokenMismatch'; Fault='MetaTokenMismatch'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        @{ Name='MetaExtraEntry'; Fault='MetaExtraEntry'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        @{ Name='MetaExtraMarker'; Fault='MetaExtraMarker'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        @{ Name='MetaNullEvidence'; Fault='MetaNullEvidence'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        # R15-FU-04: Additional meta-tests for manifest/marker negative paths
+        @{ Name='MetaEmptyManifest'; Fault='MetaEmptyManifest'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        @{ Name='MetaDuplicateExpectedPID'; Fault='MetaDuplicateExpectedPID'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        @{ Name='MetaDuplicateActualPID'; Fault='MetaDuplicateActualPID'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' }
     )
 
     foreach ($fixture in $faults) {
@@ -2686,6 +2940,8 @@ function Test-ProcessLevelFaults {
         $emergencyCleanupDone = $false; $parentExited = $false; $descendantExited = $false
         $descendantObserved = $false; $captureHealthy = $false
         $primaryCleanupResult = $null; $finallyCleanupResult = $null
+        # R15-FU-01: ExpectedManifest construction variables
+        $parentManifestEntry = $null; $descendantRegResult = $null; $expectedManifestFrozen = $false
         # R8-REM-01: Per-fixture registry for isolation
         $fixtureRegistry = New-Object ProcessHandleRegistry
         # R9: Reset all native API hooks to prevent cross-fixture contamination
@@ -2699,7 +2955,7 @@ function Test-ProcessLevelFaults {
 
         try {
             # R8: Pure test fixtures (handleReg, collectorFault, markerLifecycle, nativeApiFault) don't need child processes
-            $launchChild = ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault'))
+            $launchChild = ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'manifestMeta'))
             if ($launchChild) {
                 $fastFlag = if ($useFast) { "-SelfTestFastFault" } else { "" }
                 $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag -PLFToken $testRunToken -PLFMarkerDir `"$markerDir`""
@@ -2712,6 +2968,10 @@ function Test-ProcessLevelFaults {
             # R7-REM-02: Register parent handle (primary authority) — returns RegistrationResult
             $regResult = $fixtureRegistry.RegisterProcess($proc.Id, $testRunToken, "parent")
             $parentRegistered = $regResult
+            # R15-FU-01: Capture parent entry from known registration facts (not from EntrySnapshot)
+            $parentManifestEntry = if ($regResult.Success) {
+                [PSCustomObject]@{ Pid=$proc.Id; Role="parent"; Token=$testRunToken; CreationTime=$regResult.CreationTime }
+            } else { $null }
             if (-not $regResult.Success) {
                 Write-Host "  WARNING: Failed to register handle for PID=$($proc.Id) error=$($regResult.Error) win32=$($regResult.Win32Error)" -ForegroundColor Yellow
             }
@@ -2739,7 +2999,22 @@ function Test-ProcessLevelFaults {
             $exited = $proc.WaitForExit($timeoutMs)
             if (-not $exited) {
                 $timedOut = $true
-                Register-DescendantHandles -Token $testRunToken -MarkerDirectory $markerDir -Registry $fixtureRegistry | Out-Null
+                # R15-FU-01: Register descendants and capture result BEFORE cleanup (CloseAll clears entries)
+                $descendantRegResult = Register-DescendantHandles -Token $testRunToken -MarkerDirectory $markerDir -Registry $fixtureRegistry
+                # Freeze ExpectedManifest NOW while registry still has both parent + descendant
+                $expectedManifest = @()
+                if ($parentManifestEntry) { $expectedManifest += $parentManifestEntry }
+                if ($descendantRegResult -and $descendantRegResult.Entries) {
+                    foreach ($dEntry in $descendantRegResult.Entries) {
+                        if ($dEntry.Registered) {
+                            $expectedManifest += [PSCustomObject]@{
+                                Pid = $dEntry.Pid; Role = 'timeout-descendant'; Token = $testRunToken; CreationTime = $dEntry.CreationTime
+                            }
+                        }
+                    }
+                }
+                $expectedManifestFrozen = $true
+                # Now cleanup (which clears registry entries)
                 $primaryCleanupResult = Invoke-HandleCleanup -Registry $fixtureRegistry -Token $testRunToken -MarkerDirectory $markerDir -JobHandle $jobHandle -JobAssigned $assignedToJob -ExpectedParentCount $expParentCount -ExpectedDescendantCount $expDescendantCount
                 $exitCode = -1
             } else { $exitCode = $proc.ExitCode }
@@ -2761,21 +3036,41 @@ function Test-ProcessLevelFaults {
             $stdoutCapture = [PSCustomObject]@{ CapturedBytes=$stdoutCapturedBytes; TotalBytes=$stdoutTotalBytes; Truncated=$stdoutTruncated; Text=$stdoutText }
             $stderrCapture = [PSCustomObject]@{ CapturedBytes=$stderrCapturedBytes; TotalBytes=$stderrTotalBytes; Truncated=$stderrTruncated; Text=$stderrText }
 
-            # R7-REM-04: Timeout — register descendants and verify
+            # R7-REM-04: Timeout — set state variables (registration already done before cleanup)
             if ($fault -eq 'Timeout' -and $timedOut) {
                 $parentExited = $true
-                Register-DescendantHandles -Token $testRunToken -MarkerDirectory $markerDir -Registry $fixtureRegistry | Out-Null
-                # Check marker files for descendant observation (not re-registration count)
+                # Descendant was already registered and frozen in ExpectedManifest before cleanup
+                # Check marker files for descendant observation
                 $descMarkerFiles = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
                 $descendantObserved = ($descMarkerFiles -and @($descMarkerFiles).Count -gt 0)
-                if ($descendantObserved) { $descendantExited = ($fixtureRegistry.ActiveCount -eq 0) }
+                # Use frozen EntrySnapshot for exit status (registry was cleared by CloseAll)
+                if ($descendantObserved -and $primaryCleanupResult -and $primaryCleanupResult.EntrySnapshot) {
+                    $descendantExited = $true
+                    foreach ($entry in $primaryCleanupResult.EntrySnapshot) {
+                        if ($entry.Role -ne 'parent' -and $entry.WaitOutcome -ne 'Exited') { $descendantExited = $false; break }
+                    }
+                }
             }
 
             # R7-REM-04: CleanupFailure — verify descendant alive + emergency cleanup
             $cleanupFailureInjected = ($fault -eq 'CleanupFailure')
             if ($cleanupFailureInjected) {
                 $parentExited = ($exitCode -eq 3)
-                Register-DescendantHandles -Token $testRunToken -MarkerDirectory $markerDir -Registry $fixtureRegistry | Out-Null
+                # R15-FU-01: Capture descendant registration result for ExpectedManifest
+                $descendantRegResult = Register-DescendantHandles -Token $testRunToken -MarkerDirectory $markerDir -Registry $fixtureRegistry
+                # Freeze ExpectedManifest BEFORE emergency cleanup (CloseAll clears entries)
+                $expectedManifest = @()
+                if ($parentManifestEntry) { $expectedManifest += $parentManifestEntry }
+                if ($descendantRegResult -and $descendantRegResult.Entries) {
+                    foreach ($dEntry in $descendantRegResult.Entries) {
+                        if ($dEntry.Registered) {
+                            $expectedManifest += [PSCustomObject]@{
+                                Pid = $dEntry.Pid; Role = 'cleanup-descendant'; Token = $testRunToken; CreationTime = $dEntry.CreationTime
+                            }
+                        }
+                    }
+                }
+                $expectedManifestFrozen = $true
                 # Check marker files for descendant observation
                 $descMarkerFiles = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
                 $descendantObserved = ($descMarkerFiles -and @($descMarkerFiles).Count -gt 0)
@@ -2785,7 +3080,13 @@ function Test-ProcessLevelFaults {
                         $primaryCleanupFailed = $true; $failureReported = $true
                         $ecResult = Invoke-HandleCleanup -Registry $fixtureRegistry -Token $testRunToken -MarkerDirectory $markerDir -JobHandle $jobHandle -JobAssigned $assignedToJob -ExpectedParentCount $expParentCount -ExpectedDescendantCount $expDescendantCount
                         $emergencyCleanupDone = $ecResult.Success
-                        $descendantExited = ($fixtureRegistry.ActiveCount -eq 0)
+                        # Use frozen EntrySnapshot for exit status (registry cleared by CloseAll)
+                        if ($ecResult -and $ecResult.EntrySnapshot) {
+                            $descendantExited = $true
+                            foreach ($entry in $ecResult.EntrySnapshot) {
+                                if ($entry.Role -ne 'parent' -and $entry.WaitOutcome -ne 'Exited') { $descendantExited = $false; break }
+                            }
+                        } else { $descendantExited = $false }
                     } else { $descendantExited = $true }
                 }
             }
@@ -2802,6 +3103,29 @@ function Test-ProcessLevelFaults {
 
         # R9: Clean up stale descendant marker files AFTER gate check (R11-REM-02: moved from before gate)
         # This is now done at the end of the foreach loop, after the gate check.
+
+        # R15-FU-01: Build ExpectedManifest from independent known registration facts.
+        # FORBIDDEN: copying from $fixtureRegistry.GetEntries() or CleanupResult.EntrySnapshot
+        # (that would conflate actual with expected).
+        # Parent entry: from successful RegisterProcess call (PID, role, token, creation time).
+        # Descendant entries: PID from verified marker, role pre-fixed by fixture type,
+        #   token=$testRunToken, creation time from successful held-handle registration.
+        # Skip if already frozen (Timeout/CleanupFailure paths freeze before cleanup).
+        if (-not $expectedManifestFrozen) {
+            $expectedManifest = @()
+            if ($launchChild) {
+                if ($parentManifestEntry) {
+                    $expectedManifest += $parentManifestEntry
+                }
+                # Normal launched-child: no descendants expected, descendant count must be 0
+                # (Timeout/CleanupFailure already frozen above)
+            }
+        }
+
+        # R12-REM-06: Collect ALL cleanup results for the gate (not just effective)
+        $allCleanupResults = @()
+        if ($primaryCleanupResult) { $allCleanupResults += $primaryCleanupResult }
+        if ($finallyCleanupResult) { $allCleanupResults += $finallyCleanupResult }
 
         $stdoutTotalBytes = if ($stdoutCapture) { $stdoutCapture.TotalBytes } else { 0 }
         $stdoutCapturedBytes = if ($stdoutCapture) { $stdoutCapture.CapturedBytes } else { 0 }
@@ -2843,6 +3167,113 @@ function Test-ProcessLevelFaults {
             $orphanFree = ($fixtureRegistry.Count -eq 0); $verSource = 'NoCleanup+RegistryCount'
         }
 
+        # R15-FU-03: Marker ownership verification — validate before delete, reject unexpected
+        # Must NOT blindly delete all desc-*.txt; must verify each marker belongs to this fixture.
+        # Step 1: Parse markers, verify token ownership
+        # Step 2: Compare owned markers against expected marker manifest (PID/role/token/count)
+        # Step 3: Detect duplicate markers/PIDs
+        # Step 4: Only delete after all verification passes
+        $markerDeleteResult = $null
+        if ($launchChild -and $markerDir -and $fixtureType -in @('timeout','cleanup','oversize','boundary','structural')) {
+            $markerFiles = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+            if ($markerFiles) {
+                # Step 1: Parse all markers and verify ownership by token
+                $ownedMarkers = @()
+                $unexpectedMarkers = @()
+                $markerErrors = @()
+                $seenPids = @{}
+                foreach ($mf in @($markerFiles)) {
+                    try {
+                        $content = (Get-Content $mf.FullName -Raw -ErrorAction Stop).Trim()
+                        $parts = $content.Split('|')
+                        if ($parts.Count -ge 3 -and $parts[0] -eq $testRunToken) {
+                            $mPid = 0
+                            try { $mPid = [int]$parts[1] } catch { $markerErrors += "Bad PID in $($mf.Name): $($parts[1])"; continue }
+                            # Duplicate marker PID detection
+                            if ($seenPids.ContainsKey($mPid)) {
+                                $markerErrors += "Duplicate marker PID=$mPid ($($mf.Name) and $($seenPids[$mPid]))"
+                            }
+                            $seenPids[$mPid] = $mf.Name
+                            $ownedMarkers += [PSCustomObject]@{ Path=$mf.FullName; Pid=$mPid; Role=$parts[2]; Token=$parts[0] }
+                        } else {
+                            $unexpectedMarkers += $mf.FullName
+                        }
+                    } catch {
+                        $unexpectedMarkers += $mf.FullName
+                    }
+                }
+                # Step 2: If unexpected markers (different token), FAIL
+                if ($unexpectedMarkers.Count -gt 0) {
+                    $markerErrors += "Unexpected markers: $($unexpectedMarkers.Count) (not owned by token=$testRunToken)"
+                }
+                # Step 3: Compare owned markers against expected marker manifest
+                # Expected marker manifest = descendant entries from ExpectedManifest
+                $expectedDescendants = @($expectedManifest | Where-Object { $_.Role -ne 'parent' })
+                if ($markerErrors.Count -eq 0 -and $unexpectedMarkers.Count -eq 0) {
+                    # Count check
+                    if ($ownedMarkers.Count -ne $expectedDescendants.Count) {
+                        $markerErrors += "Marker count mismatch: expected=$($expectedDescendants.Count) owned=$($ownedMarkers.Count)"
+                    }
+                    # Build maps for order-independent comparison
+                    $ownedByPid = @{}
+                    foreach ($om in $ownedMarkers) { $ownedByPid[$om.Pid] = $om }
+                    $expectedByPid = @{}
+                    foreach ($ed in $expectedDescendants) { $expectedByPid[$ed.Pid] = $ed }
+                    # Check each expected descendant has a matching owned marker
+                    foreach ($expPid in $expectedByPid.Keys) {
+                        if (-not $ownedByPid.ContainsKey($expPid)) {
+                            $ed = $expectedByPid[$expPid]
+                            $markerErrors += "Missing marker: PID=$expPid role=$($ed.Role)"
+                        } else {
+                            $om = $ownedByPid[$expPid]
+                            $ed = $expectedByPid[$expPid]
+                            if ($om.Role -ne $ed.Role) {
+                                $markerErrors += "Marker role mismatch: PID=$expPid expected=$($ed.Role) actual=$($om.Role)"
+                            }
+                        }
+                    }
+                    # Check for extra owned markers not in expected
+                    foreach ($ownPid in $ownedByPid.Keys) {
+                        if (-not $expectedByPid.ContainsKey($ownPid)) {
+                            $om = $ownedByPid[$ownPid]
+                            $markerErrors += "Extra marker: PID=$ownPid role=$($om.Role)"
+                        }
+                    }
+                }
+                # Step 4: If any errors, FAIL — don't delete
+                if ($markerErrors.Count -gt 0) {
+                    $markerDeleteResult = [PSCustomObject]@{
+                        Success = $false
+                        Error = $markerErrors -join '; '
+                        ActiveCount = $unexpectedMarkers.Count + $ownedMarkers.Count
+                        ExpectedCount = $expectedDescendants.Count
+                        ActualCount = @($markerFiles).Count
+                    }
+                } else {
+                    # Step 5: Delete only verified owned markers
+                    $delErrors = @()
+                    foreach ($om in $ownedMarkers) {
+                        try { Remove-Item $om.Path -Force -ErrorAction Stop } catch { $delErrors += $_.Exception.Message }
+                    }
+                    # Step 6: Verify no markers remain
+                    $remaining = Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue
+                    $markerDeleteResult = [PSCustomObject]@{
+                        Success = ($delErrors.Count -eq 0) -and (-not $remaining)
+                        Error = if ($delErrors.Count -gt 0) { $delErrors -join '; ' } elseif ($remaining) { "Marker files still exist after deletion" } else { "" }
+                        ActiveCount = if ($remaining) { @($remaining).Count } else { 0 }
+                        ExpectedCount = $expectedDescendants.Count
+                        ActualCount = @($markerFiles).Count
+                    }
+                }
+            } else {
+                # No markers found — expected if no descendants
+                $markerDeleteResult = [PSCustomObject]@{
+                    Success=$true; Error=""; ActiveCount=0
+                    ExpectedCount=$expectedManifest.Count; ActualCount=0
+                }
+            }
+        }
+
         switch ($fixtureType) {
             'timeout' {
                 $exitOk = ($exitCode -eq -1); $timedOutOk = $timedOut
@@ -2851,8 +3282,9 @@ function Test-ProcessLevelFaults {
                 $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $hasRealCapture = ($stdoutTotalBytes -gt 0); $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
                 # R11-REM-02: Use shared common gate for timeout fixture
-                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir -ExpectedManifest $expectedManifest -AllCleanupResults $allCleanupResults -MarkerDeleteResult $markerDeleteResult -IsLaunchedChild $launchChild
                 $commonGate = $commonGateResult.Pass
+                if (-not $commonGate) { Write-Host "  [$fault] GATE FAIL: $($commonGateResult.Errors -join '; ')" -ForegroundColor Red }
                 $timeoutSpecific = $exitOk -and $timedOutOk -and $noSuccessBanner -and $hasPreTimeoutMarker -and $withinBudget -and $hasRealCapture -and $bytesConsistent -and $descendantObserved -and $parentExited -and $descendantExited
                 $pass = $commonGate -and $timeoutSpecific
                 $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=-1 commonGate timeoutSpecific"; Actual="exit=$exitCode pReg=$parentRegOk cTime=$creationTimeOk cOk=$cleanupOk of=$orphanFree h=$captureHealthy m=$hasPreTimeoutMarker d=$descendantObserved pEx=$parentExited dEx=$descendantExited src=$verSource"; Pass=$pass }
@@ -2866,7 +3298,7 @@ function Test-ProcessLevelFaults {
                 $stderrEmpty = ($stderrTotalBytes -eq 0); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
                 # R10-REM-02: commonProcessGate via shared function for all structural fixtures
-                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir -ExpectedManifest $expectedManifest -AllCleanupResults $allCleanupResults -MarkerDeleteResult $markerDeleteResult -IsLaunchedChild $launchChild
                 $commonGate = $commonGateResult.Pass
                 $structEvidence = $exitOk -and $noSuccessBanner -and $noTrustedTotals -and $noSkippedAsPassed -and $hasSuiteValidation -and $hasScriptInternal -and $hasFailStatus -and $hasUntrusted -and $withinTimeout -and $stderrEmpty -and $withinBudget -and $bytesConsistent
                 if ($fault -eq 'JobAssignFailure') {
@@ -2884,7 +3316,7 @@ function Test-ProcessLevelFaults {
                 $exitOk = ($exitCode -eq 3); $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0); $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
                 # R10-REM-02: commonProcessGate via shared function
-                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir -ExpectedManifest $expectedManifest -AllCleanupResults $allCleanupResults -MarkerDeleteResult $markerDeleteResult -IsLaunchedChild $launchChild
                 $commonGate = $commonGateResult.Pass
                 switch ($fault) {
                     'StdoutOversize' { $streamOk = ($stdoutTotalBytes -gt $maxStreamBytes) -and $stdoutTruncated -and ($stdoutCapturedBytes -eq $maxStreamBytes); $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated); $pass = $commonGate -and $exitOk -and $withinBudget -and $streamOk -and $otherEmpty -and $noSuccessBanner -and $bytesConsistent; $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="exit=3 sOut>51200 cap=51200 trunc sErr=0 commonGate"; Actual="exit=$exitCode sOut=$stdoutTotalBytes/$stdoutCapturedBytes/$stdoutTruncated sErr=$stderrTotalBytes pReg=$parentRegOk cTime=$creationTimeOk cOk=$cleanupOk of=$orphanFree h=$captureHealthy"; Pass=$pass } }
@@ -2898,7 +3330,7 @@ function Test-ProcessLevelFaults {
                 $noSuccessBanner = ($stdoutText.IndexOf("All self-tests passed") -lt 0); $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
                 $otherEmpty = ($stderrTotalBytes -eq 0) -and (-not $stderrTruncated)
                 # R10-REM-02: commonProcessGate via shared function
-                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveCleanup -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir -ExpectedManifest $expectedManifest -AllCleanupResults $allCleanupResults -MarkerDeleteResult $markerDeleteResult -IsLaunchedChild $launchChild
                 $commonGate = $commonGateResult.Pass
                 if ($fault -eq 'BoundaryExact') {
                     $totalOk = ($stdoutTotalBytes -eq $maxStreamBytes); $notTruncated = (-not $stdoutTruncated); $capturedOk = ($stdoutCapturedBytes -eq $maxStreamBytes)
@@ -2915,10 +3347,23 @@ function Test-ProcessLevelFaults {
                 $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 $bytesConsistent = ($stdoutCapturedBytes -le $stdoutTotalBytes) -and ($stderrCapturedBytes -le $stderrTotalBytes)
                 # R11-REM-02: Use shared common gate for cleanup fixture
-                # For CleanupFailure: primary cleanup intentionally fails, emergency cleanup succeeds
-                # Use emergency result for the gate (it's the "final" cleanup that should pass)
+                # R12-REM-06: Primary cleanup intentionally fails — mark as ExpectedFailure
+                # Pass ALL cleanup results to gate; primary failure is expected, not hidden
                 $effectiveForGate = if ($ecResult) { $ecResult } else { $effectiveCleanup }
-                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveForGate -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir
+                # R12-REM-06: Mark primary result as expected failure for the gate
+                $cleanupResultsForGate = @()
+                if ($primaryCleanupResult) {
+                    if ($cleanupFailureInjected) {
+                        $primaryWithExpected = $primaryCleanupResult.PSObject.Copy()
+                        $primaryWithExpected | Add-Member -NotePropertyName 'ExpectedFailure' -NotePropertyValue $true -Force
+                        $cleanupResultsForGate += $primaryWithExpected
+                    } else {
+                        $cleanupResultsForGate += $primaryCleanupResult
+                    }
+                }
+                if ($ecResult) { $cleanupResultsForGate += $ecResult }
+                if ($finallyCleanupResult -and $finallyCleanupResult -ne $ecResult) { $cleanupResultsForGate += $finallyCleanupResult }
+                $commonGateResult = Test-CommonProcessGate -CleanupResult $effectiveForGate -CaptureHealthMapping $captureHealthMapping -ParentRegOk $parentRegOk -CreationTimeOk $creationTimeOk -Registry $fixtureRegistry -MarkerDirectory $markerDir -ExpectedManifest $expectedManifest -AllCleanupResults $cleanupResultsForGate -MarkerDeleteResult $markerDeleteResult -IsLaunchedChild $launchChild
                 $commonGate = $commonGateResult.Pass
                 $cleanupSpecific = $exitOk -and $noSuccessBanner -and $withinBudget -and $bytesConsistent -and $cleanupFailureInjected -and $primaryCleanupFailed -and $failureReported -and $emergencyCleanupDone -and $parentExited -and $descendantExited -and $descendantObserved
                 $pass = $commonGate -and $cleanupSpecific
@@ -2984,9 +3429,12 @@ function Test-ProcessLevelFaults {
                         $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Success=false GetProcessTimes err orphan!=VerifiedClean"; Actual="Success=$($gptReg.Success) Error=$($gptReg.Error) orphan=$($gptOrphan.Status)"; Pass=$pass }
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailGetProcessTimes = $false
-                        # R11-REM-01: Terminate via PID, wait for exit, dispose
-                        try { Stop-Process -Id $gptProcId -Force -ErrorAction SilentlyContinue } catch {}
-                        Start-Sleep -Milliseconds 500
+                        # R12-REM-04: Use shared Stop-Wait-VerifyOwnedProcess for structured cleanup
+                        $gptCleanup = Stop-Wait-VerifyOwnedProcess -ProcessId $gptProcId
+                        if (-not $gptCleanup.FinalAbsent) {
+                            Write-Host "  WARNING: GetProcessTimesFailure process $gptProcId still alive after cleanup" -ForegroundColor Yellow
+                            $tests[-1].Pass = $false
+                        }
                         $gptProc.Dispose()
                     }
                 } elseif ($fault -eq 'WaitFailure') {
@@ -3035,18 +3483,16 @@ function Test-ProcessLevelFaults {
                         $pass = $waitRegOk -and $waitCreationNonzero -and $regComplete -and $notZeroActive -and $waitCleanupFailed -and $hasWaitFailedOutcome -and $hasTerminateError -and $exactErrorCode -and $entrySnapshotOk -and $snapshotPidMatch
                         $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk cTime reg=1 active>0 cleanupFail WaitFailed Win32=$expectedWaitErrorCode snap=1"; Actual="reg=$waitRegOk cTime=$waitCreationNonzero reg=$regCountBeforeHook active=$waitActive cFail=$waitCleanupFailed wfOutcome=$hasWaitFailedOutcome wfErr=$hasTerminateError win32=$waitWin32Error exact=$exactErrorCode snap=$($waitCleanup.EntryCount) pid=$snapshotPidMatch"; Pass=$pass }
                     } finally {
-                        # R11-REM-04: Reset hook + error code, then safe cleanup
+                        # R12-REM-04: Reset hook + error code, then structured cleanup
                         [ProcessHandleRegistry]::TestHook_FailWait = $false
                         [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0
-                        # R11-REM-01: Independently terminate via PID+creation-time, wait, then dispose
-                        try { Stop-Process -Id $waitProcId -Force -ErrorAction SilentlyContinue } catch {}
-                        Start-Sleep -Milliseconds 500
-                        # Verify process actually exited by handle check
-                        try {
-                            $verifyProc = Get-Process -Id $waitProcId -ErrorAction SilentlyContinue
-                            if ($verifyProc) { $verifyProc.Dispose() }
-                        } catch {}
                         $fixtureRegistry.CloseAll()
+                        # R12-REM-04: Use shared Stop-Wait-VerifyOwnedProcess
+                        $waitCleanup2 = Stop-Wait-VerifyOwnedProcess -ProcessId $waitProcId -CreationTime $waitProcStartTime.Ticks
+                        if (-not $waitCleanup2.FinalAbsent) {
+                            Write-Host "  WARNING: WaitFailure process $waitProcId still alive after cleanup" -ForegroundColor Yellow
+                            $tests[-1].Pass = $false
+                        }
                         $waitProc.Dispose()
                     }
                 } elseif ($fault -eq 'CloseHandleFailure') {
@@ -3070,10 +3516,12 @@ function Test-ProcessLevelFaults {
                         $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk closeFailed failed>0"; Actual="reg=$closeRegOk allClosed=$($closeResult.AllClosed) failed=$($closeResult.Failed)/$($closeResult.Attempted)"; Pass=$pass }
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailClose = $false
-                        # R11-REM-01: Real handles already closed by hook (it calls CloseHandle internally)
-                        # Verify process actually exited
-                        try { Stop-Process -Id $closeProcId -Force -ErrorAction SilentlyContinue } catch {}
-                        Start-Sleep -Milliseconds 200
+                        # R12-REM-04: Use shared Stop-Wait-VerifyOwnedProcess
+                        $closeCleanup = Stop-Wait-VerifyOwnedProcess -ProcessId $closeProcId
+                        if (-not $closeCleanup.FinalAbsent) {
+                            Write-Host "  WARNING: CloseHandleFailure process $closeProcId still alive after cleanup" -ForegroundColor Yellow
+                            $tests[-1].Pass = $false
+                        }
                         $closeProc.Dispose()
                     }
                 } else {
@@ -3100,20 +3548,22 @@ function Test-ProcessLevelFaults {
                     $colHealthMap = Get-CollectorHealthMapping -Collector $faultCollector -DrainCompleted $true
                     $notHealthy = (-not $colHealthMap.Healthy)
                     $failClosed = $readFaulted -and $notHealthy
-                    # R11-REM-05: Feed mapper result through real Get-OverallResult for actual exit code 3
+                    # R12-REM-05: Feed mapper result through shared exit mapper (no copied switch)
                     $innerResults = @()
                     if ($colHealthMap.ScriptInternalResult) {
                         $innerResults += $colHealthMap.ScriptInternalResult
                     }
                     $collectorOverall = Get-OverallResult -Results $innerResults
-                    $collectorExitCode = switch ($collectorOverall) { "PASS" { 0 } "FAIL" { 1 } "BLOCKED" { 2 } "ERROR" { 3 } default { 3 } }
-                    $exitCode3 = ($collectorExitCode -eq 3)
+                    $exitResult = Get-OverallExitResult -Overall $collectorOverall
+                    $exitCode3 = ($exitResult.ExitCode -eq 3)
                     $producesError = ($collectorOverall -eq 'ERROR')
-                    $noSuccessBanner = $true; $noTrustedTotals = $true
+                    # R12-REM-05: Banner/totals from shared mapper (ERROR => not allowed)
+                    $noSuccessBanner = (-not $exitResult.SuccessBannerAllowed)
+                    $noTrustedTotals = (-not $exitResult.TrustedTotalsAllowed)
                     $collectorStreamDisposed = $failClosed
                     $streamDisposed = ($memStream.CanRead -eq $false)
                     $pass = $failClosed -and $producesError -and $exitCode3 -and $collectorStreamDisposed -and $streamDisposed -and $noSuccessBanner -and $noTrustedTotals
-                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="SharedMapper Healthy=false ScriptInternal Overall=ERROR exit=3"; Actual="Faulted=$readFaulted Healthy=$($colHealthMap.Healthy) Overall=$collectorOverall exit3=$collectorExitCode disposed=$streamDisposed"; Pass=$pass }
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="SharedMapper Healthy=false ScriptInternal Overall=ERROR exit=3"; Actual="Faulted=$readFaulted Healthy=$($colHealthMap.Healthy) Overall=$collectorOverall exit3=$($exitResult.ExitCode) disposed=$streamDisposed banner=$noSuccessBanner totals=$noTrustedTotals"; Pass=$pass }
                 } elseif ($fault -eq 'CollectorDrainTimeout') {
                     # Use a pipe stream that never completes — deadline triggers timeout
                     $faultCollector2 = New-Object BoundedStreamCollector
@@ -3135,18 +3585,21 @@ function Test-ProcessLevelFaults {
                     # R10-REM-05 + R11-REM-05: Use shared Get-CollectorHealthMapping for real gate path
                     $colHealthMap2 = Get-CollectorHealthMapping -Collector $faultCollector2 -DrainCompleted (-not $drainTimedOut)
                     $failClosed2 = $drainTimedOut -and (-not $colHealthMap2.Healthy)
-                    # R11-REM-05: Feed mapper result through real Get-OverallResult for actual exit code 3
+                    # R12-REM-05: Feed mapper result through shared exit mapper (no copied switch)
                     $innerResults2 = @()
                     if ($colHealthMap2.ScriptInternalResult) {
                         $innerResults2 += $colHealthMap2.ScriptInternalResult
                     }
                     $collectorOverall2 = Get-OverallResult -Results $innerResults2
-                    $collectorExitCode2 = switch ($collectorOverall2) { "PASS" { 0 } "FAIL" { 1 } "BLOCKED" { 2 } "ERROR" { 3 } default { 3 } }
-                    $exitCode3_2 = ($collectorExitCode2 -eq 3)
+                    $exitResult2 = Get-OverallExitResult -Overall $collectorOverall2
+                    $exitCode3_2 = ($exitResult2.ExitCode -eq 3)
                     $producesError2 = ($collectorOverall2 -eq 'ERROR')
+                    # R12-REM-05: Banner/totals from shared mapper (ERROR => not allowed)
+                    $noSuccessBanner2 = (-not $exitResult2.SuccessBannerAllowed)
+                    $noTrustedTotals2 = (-not $exitResult2.TrustedTotalsAllowed)
                     $pipeDisposed = ($pipeClient -eq $null -or -not $pipeClient.IsConnected)
-                    $pass = $failClosed2 -and $producesError2 -and $exitCode3_2 -and $pipeDisposed
-                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="SharedMapper DrainTimedOut ScriptInternal Overall=ERROR exit=3"; Actual="TimedOut=$drainTimedOut Healthy=$($colHealthMap2.Healthy) Overall=$collectorOverall2 exit3=$collectorExitCode2 disposed=$pipeDisposed"; Pass=$pass }
+                    $pass = $failClosed2 -and $producesError2 -and $exitCode3_2 -and $pipeDisposed -and $noSuccessBanner2 -and $noTrustedTotals2
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="SharedMapper DrainTimedOut ScriptInternal Overall=ERROR exit=3"; Actual="TimedOut=$drainTimedOut Healthy=$($colHealthMap2.Healthy) Overall=$collectorOverall2 exit3=$($exitResult2.ExitCode) disposed=$pipeDisposed banner=$noSuccessBanner2 totals=$noTrustedTotals2"; Pass=$pass }
                 } else {
                     $pass = $false
                     $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known collectorFault"; Actual="unknown"; Pass=$pass }
@@ -3265,10 +3718,108 @@ function Test-ProcessLevelFaults {
                     }
                 }
             }
+            'manifestMeta' {
+                # R12-REM-01: Meta-tests — inject manifest mismatches to prove Gate rejects
+                $goodEntrySnapshot = @([PSCustomObject]@{
+                    Pid=1001; Role="test-role"; Token="test-token"; CreationTime=12345678
+                    InitialExited=$true; TerminateResult=$true; WaitOutcome='Exited'
+                    WaitCode=0; Win32Error=0; TerminateError=''
+                })
+                $goodCleanup = [PSCustomObject]@{
+                    Success=$true; Errors=@(); Actions=@('test')
+                    ActiveBeforeClose=0; ActiveAfter=0
+                    RegistrationResult=[PSCustomObject]@{ Success=$true }
+                    CloseResult=[PSCustomObject]@{ AllClosed=$true; Failed=0; Attempted=1 }
+                    EntrySnapshot=$goodEntrySnapshot; EntryCount=1
+                }
+                $goodCapture = [PSCustomObject]@{ Healthy=$true; ReadError=$null; DrainTimedOut=$false; DrainCompleted=$true; MappingOutcome='PASS' }
+                if ($fault -eq 'MetaRoleMismatch') {
+                    $manifest = @([PSCustomObject]@{ Pid=1001; Role="WRONG-ROLE"; Token="test-token"; CreationTime=12345678 })
+                    $gate = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory "" -ExpectedManifest $manifest
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'Role mismatch')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL Role mismatch"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                } elseif ($fault -eq 'MetaTokenMismatch') {
+                    $manifest = @([PSCustomObject]@{ Pid=1001; Role="test-role"; Token="WRONG-TOKEN"; CreationTime=12345678 })
+                    $gate = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory "" -ExpectedManifest $manifest
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'Token mismatch')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL Token mismatch"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                } elseif ($fault -eq 'MetaExtraEntry') {
+                    $manifest = @(
+                        [PSCustomObject]@{ Pid=1001; Role="test-role"; Token="test-token"; CreationTime=12345678 },
+                        [PSCustomObject]@{ Pid=9999; Role="phantom"; Token="test-token"; CreationTime=11111111 }
+                    )
+                    $gate = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory "" -ExpectedManifest $manifest
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'Missing entry')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL Missing entry"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                } elseif ($fault -eq 'MetaExtraMarker') {
+                    # R15-FU-04: Same-token extra marker + wrong-role marker verification
+                    # Test 1: Same-token extra marker (PID not in expected manifest)
+                    $metaMarkerDir = Join-Path $env:TEMP "meta-marker-$(Get-Random)"
+                    New-Item -ItemType Directory -Path $metaMarkerDir -Force | Out-Null
+                    # Marker with same token but PID not in expected manifest
+                    "test-token|8888|extra-role" | Out-File -FilePath (Join-Path $metaMarkerDir "desc-8888.txt") -Encoding ASCII -Force
+                    # Expected manifest has only PID=1001
+                    $markerManifest = @([PSCustomObject]@{ Pid=1001; Role="test-role"; Token="test-token"; CreationTime=12345678 })
+                    # MarkerDeleteResult reflects: extra marker PID=8888 detected
+                    $markerDelResult = [PSCustomObject]@{ Success=$false; Error="Extra marker: PID=8888 role=extra-role"; ActiveCount=1; ExpectedCount=1; ActualCount=1 }
+                    $gate = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory $metaMarkerDir -ExpectedManifest $markerManifest -MarkerDeleteResult $markerDelResult
+                    $pass1 = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'Marker deletion failed')
+                    # Test 2: Same-token correct PID but wrong role
+                    Remove-Item $metaMarkerDir -Recurse -Force -ErrorAction SilentlyContinue
+                    New-Item -ItemType Directory -Path $metaMarkerDir -Force | Out-Null
+                    "test-token|1001|WRONG-ROLE" | Out-File -FilePath (Join-Path $metaMarkerDir "desc-1001.txt") -Encoding ASCII -Force
+                    $markerDelResult2 = [PSCustomObject]@{ Success=$false; Error="Marker role mismatch: PID=1001 expected=test-role actual=WRONG-ROLE"; ActiveCount=1; ExpectedCount=1; ActualCount=1 }
+                    $gate2 = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory $metaMarkerDir -ExpectedManifest $markerManifest -MarkerDeleteResult $markerDelResult2
+                    $pass2 = (-not $gate2.Pass) -and ($gate2.Errors -join ' ' -match 'Marker deletion failed')
+                    $pass = $pass1 -and $pass2
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL extra+wrong-role markers"; Actual="Pass1=$pass1 Pass2=$pass2 err1=$($gate.Errors.Count) err2=$($gate2.Errors.Count)"; Pass=$pass }
+                    Remove-Item $metaMarkerDir -Recurse -Force -ErrorAction SilentlyContinue
+                } elseif ($fault -eq 'MetaNullEvidence') {
+                    $gate = Test-CommonProcessGate -CleanupResult $null -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory ""
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'CleanupResult is null')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL mandatory null"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                # R15-FU-04: New negative meta-tests
+                } elseif ($fault -eq 'MetaEmptyManifest') {
+                    # Launched-child with empty ExpectedManifest => Gate FAIL
+                    $gate = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory "" -ExpectedManifest @() -IsLaunchedChild $true
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'ExpectedManifest empty')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL empty manifest for launched-child"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                } elseif ($fault -eq 'MetaDuplicateExpectedPID') {
+                    # ExpectedManifest with duplicate PID => Gate FAIL
+                    $dupManifest = @(
+                        [PSCustomObject]@{ Pid=1001; Role="test-role"; Token="test-token"; CreationTime=12345678 },
+                        [PSCustomObject]@{ Pid=1001; Role="dup-role"; Token="test-token"; CreationTime=99999999 }
+                    )
+                    $gate = Test-CommonProcessGate -CleanupResult $goodCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory "" -ExpectedManifest $dupManifest
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'Duplicate expected PID')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL duplicate expected PID"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                } elseif ($fault -eq 'MetaDuplicateActualPID') {
+                    # EntrySnapshot with duplicate PID => Gate FAIL
+                    $dupSnapshot = @(
+                        [PSCustomObject]@{ Pid=1001; Role="test-role"; Token="test-token"; CreationTime=12345678; WaitOutcome='Exited'; Win32Error=0 },
+                        [PSCustomObject]@{ Pid=1001; Role="dup-role"; Token="test-token"; CreationTime=12345678; WaitOutcome='Exited'; Win32Error=0 }
+                    )
+                    $dupCleanup = [PSCustomObject]@{
+                        Success=$true; Errors=@(); Actions=@('test'); ActiveBeforeClose=0; ActiveAfter=0
+                        RegistrationResult=[PSCustomObject]@{ Success=$true }
+                        CloseResult=[PSCustomObject]@{ AllClosed=$true; Failed=0; Attempted=2 }
+                        EntrySnapshot=$dupSnapshot; EntryCount=2
+                    }
+                    $dupManifest = @(
+                        [PSCustomObject]@{ Pid=1001; Role="test-role"; Token="test-token"; CreationTime=12345678 }
+                    )
+                    $gate = Test-CommonProcessGate -CleanupResult $dupCleanup -CaptureHealthMapping $goodCapture -ParentRegOk $true -CreationTimeOk $true -MarkerDirectory "" -ExpectedManifest $dupManifest
+                    $pass = (-not $gate.Pass) -and ($gate.Errors -join ' ' -match 'Duplicate actual PID')
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Gate FAIL duplicate actual PID"; Actual="Pass=$($gate.Pass) err=$($gate.Errors.Count)"; Pass=$pass }
+                } else {
+                    $pass = $false
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known manifestMeta"; Actual="unknown"; Pass=$pass }
+                }
+            }
         }
         if (-not $tests[-1].Pass) { $allPassed = $false }
-        # R11-REM-02: Clean up descendant marker files AFTER gate check (moved from before gate)
-        Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $markerDir -Filter "desc-*.txt" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
 
     # R7-REM-03: Final orphan check (outer registry — per-fixture registries already cleaned up)
@@ -5441,6 +5992,11 @@ if ($SelfTestFastFault) {
         'GetProcessTimesFailure' { exit 0 }
         'WaitFailure' { exit 0 }
         'CloseHandleFailure' { exit 0 }
+        'MetaRoleMismatch' { exit 0 }
+        'MetaTokenMismatch' { exit 0 }
+        'MetaExtraEntry' { exit 0 }
+        'MetaExtraMarker' { exit 0 }
+        'MetaNullEvidence' { exit 0 }
     }
 
     # Call shared aggregation — same path as normal -SelfTestOnly
@@ -5451,7 +6007,7 @@ if ($SelfTestFastFault) {
       -ManifestComparison $manifestComparisonForAggregation `
       -PureTotal 54 -PurePassed 54 `
       -NodeTotal 102 -NodePassed 102 `
-      -R15Total 25 -R15Passed 25
+      -R15Total 53 -R15Passed 53
 
     Write-Host "`nSELF-TEST OVERALL: $($aggResult.Overall) (exit $($aggResult.ExitCode))" -ForegroundColor $(
         switch ($aggResult.Overall) { "PASS" { "Green" } "FAIL" { "Red" } "BLOCKED" { "Yellow" } "ERROR" { "Magenta" } }
