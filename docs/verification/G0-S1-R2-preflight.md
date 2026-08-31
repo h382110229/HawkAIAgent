@@ -1,4 +1,4 @@
-# G0-S1 R13 Preflight Report
+# G0-S1 R14 Follow-up Preflight Report
 
 **Date:** 2026-08-31
 **Branch:** research/g0-s1-windows-poc
@@ -15,9 +15,11 @@
 | R12 code | `d5ba1f6a68a3aeaafc17ed0be5832259ed442fa7` | `32382427c6453187cf858506431d2b6ec069d0e9` (R11 docs) | `test: R12 remediation - ExpectedManifest gate integration, real marker deletion, mandatory evidence checks, shared collector exit mapper, Stop-Wait-VerifyOwnedProcess, manifest mismatch meta-tests` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
 | R12 docs (corrected) | `fba863b08e95cff0a4ce1cc7b8e03c575e400776` | `d5ba1f6a68a3aeaafc17ed0be5832259ed442fa7` (R12 code) | `docs: R12 preflight report - 31 PLF fixtures, 212/212 PASS, frozen ExpectedManifest lifecycle` | `docs/verification/G0-S1-R2-preflight.md` |
 | R13 code | `0d631ebca398c6edccf4eb06d9333703c6fd17af` | `fba863b08e95cff0a4ce1cc7b8e03c575e400776` (R12 docs) | `test: R13 remediation - Get-OverallExitResult shared mapper, PID-reuse-safe Stop-Wait-VerifyOwnedProcess, CleanupIdentityMatch/Mismatch fixtures, fail-closed banner/totals permissions` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
-| R13 docs | *(this commit)* | `0d631ebca398c6edccf4eb06d9333703c6fd17af` (R13 code) | `docs: R13 preflight report - shared exit mapper, PID-reuse-safe cleanup, 33 PLF, 214/214 PASS` | `docs/verification/G0-S1-R2-preflight.md` |
+| R13 docs | `9393f343b6cf5322f5d9a102901c5863397dec6a` | `0d631ebca398c6edccf4eb06d9333703c6fd17af` (R13 code) | `docs: R13 preflight report - shared exit mapper, PID-reuse-safe cleanup, 33 PLF, 214/214 PASS` | `docs/verification/G0-S1-R2-preflight.md` |
+| R14 code | `b4a4fcd` (abbreviated; full hash verified post-push) | `9393f343b6cf5322f5d9a102901c5863397dec6a` (R13 docs) | `test: R14 follow-up - handle-based Stop-Wait-VerifyOwnedProcess, pre-acquired cleanup handles for all native API and cleanup identity fixtures` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
+| R14 docs | *(this commit)* | R14 code | `docs: R14 follow-up preflight - handle-based cleanup, non-self-referential hashes` | `docs/verification/G0-S1-R2-preflight.md` |
 
-Parent chain: R11 docs → R12 code → R12 docs (corrected) → R13 code → R13 docs (this)
+Parent chain: R11 docs → R12 code → R12 docs (corrected) → R13 code → R13 docs → R14 code → R14 docs (this)
 
 ---
 
@@ -25,11 +27,13 @@ Parent chain: R11 docs → R12 code → R12 docs (corrected) → R13 code → R1
 
 ### Script: `research/g0-s1-harness-integration/windows-poc-test-r2.ps1`
 
+The R14 docs-only commit does not change the script. Final script hashes are:
+
 | Field | Value |
 |-------|-------|
-| Git blob object ID | `df4e8df644e579ff7f1b309307f40f1a78de6dd4` |
-| SHA-256 of raw Git blob bytes | `4f21204116b80b1d06031a29981e606c7b06c17dad4907f740584818c8f8d8e8` |
-| SHA-256 of checked-out Windows file | `4f6cd95c570a2e22f3a878cef2396302bfe2c48e715fab73fb0971228ac5ca60` |
+| Git blob object ID | *(verified post-push via `git ls-tree HEAD -- research/g0-s1-harness-integration/windows-poc-test-r2.ps1`)* |
+| SHA-256 of raw Git blob bytes | *(verified post-push via `git cat-file blob <blob> \| sha256sum`)* |
+| SHA-256 of checked-out Windows file | *(verified post-push via `sha256sum research/g0-s1-harness-integration/windows-poc-test-r2.ps1`)* |
 
 SHA-256 of raw Git blob bytes computed via: `git cat-file blob <blob> > tmp.bin && sha256sum tmp.bin`.
 SHA-256 of checked-out file computed via: `sha256sum <file>`.
@@ -37,22 +41,42 @@ CRLF conversion causes these to differ.
 
 ### Preflight: `docs/verification/G0-S1-R2-preflight.md`
 
+The preflight's own blob and hash values CANNOT be reliably embedded in the same document — editing the values changes the blob, creating a self-referential cycle. This was the R13 error (stale values `4403a23c...` / `7bdd6138...` / `508931b9...` were committed as "final" but became stale when the document was amended).
+
+**Strategy:** Final docs commit/blob/raw-hash/checkout-hash are recorded in the external post-push publication report, NOT in this document. The post-push report is generated after the docs commit exists and contains the actual final values.
+
+**Supersedes:** The R13 preflight's claim "These preflight blob hashes are from the final R13 docs commit" was incorrect — the embedded values were stale. The actual final R13 values are:
+
 | Field | Value |
 |-------|-------|
-| Git blob object ID | `4403a23ca6bd8c81f31c610f413aa137985bc557` |
-| SHA-256 of raw Git blob bytes | `7bdd6138ed58e089589175bca65e28473fef3272e1f4f3762d3e9232988c4ddc` |
-| SHA-256 of checked-out Windows file | `508931b9f67b105611003a62686bcf015d08a9ba4caf5b247a1385c970b63eda` |
+| R13 docs commit | `9393f343b6cf5322f5d9a102901c5863397dec6a` |
+| R13 preflight blob | `3ddd1a9870914be1ddfb7025c7531bca032cf198` |
+| R13 preflight raw SHA-256 | `98b949ceb7cb4d8176cfb4e91453a6818301dbce36a5f129537bdff3e4a695b3` |
+| R13 preflight checkout SHA-256 | `bf139b80299208110602ebbbec575c5d9c09abfb0e7a2dc888c4b3b0b1883ce5` |
 
-Note: These preflight blob hashes are from the final R13 docs commit. Amending this document again would create a new blob.
+**Reproducible post-commit verification commands:**
+```bash
+# Docs commit hash (run after docs commit exists)
+git log --oneline -1 -- docs/verification/G0-S1-R2-preflight.md
+
+# Preflight blob object ID
+git ls-tree HEAD -- docs/verification/G0-S1-R2-preflight.md
+
+# Raw Git-blob SHA-256
+git cat-file blob <BLOB_ID> | sha256sum
+
+# Checkout SHA-256
+sha256sum docs/verification/G0-S1-R2-preflight.md
+```
 
 ---
 
 ## Static Analysis
 
-| Tool | Result |
-|------|--------|
-| PowerShell Parser | **0 errors** |
-| PSScriptAnalyzer Severity Error | **0 findings** |
+| Tool | Version | Result |
+|------|---------|--------|
+| PowerShell Parser | (built-in) | **0 errors**, 46572 tokens |
+| PSScriptAnalyzer Severity Error | **v1.25.0** | **0 findings** |
 
 ---
 
@@ -96,7 +120,6 @@ Full total: 54 (pure) + 102 (node) + 58 (R15) = **214**
 |-------|-------|
 | Exit code | **0** |
 | Stderr bytes | **0** |
-| Elapsed | **00:01:03.5370126** |
 | Total tests | **214** |
 | Passed | **214/214** |
 | Failed | **0** |
@@ -117,7 +140,6 @@ R15 helper tests: ManifestCompare(14) + SuiteEvidence(11) + ProcessLevelFaults(3
 |-------|-------|
 | Exit code | **0** |
 | Stderr bytes | **0** |
-| Elapsed | **00:01:10.3297309** |
 | Total tests | **214** |
 | Passed | **214/214** |
 | Failed | **0** |
@@ -136,12 +158,10 @@ R15 helper tests: ManifestCompare(14) + SuiteEvidence(11) + ProcessLevelFaults(3
 
 ## 5-Second Settling Hygiene
 
-| Check | Run 1 Pre | Run 1 Post | Run 1 Delta | Run 2 Pre | Run 2 Post | Run 2 Delta |
-|-------|-----------|------------|-------------|-----------|------------|-------------|
-| PowerShell PID | 51928 | 51928 | **0** | 40580 | 40580 | **0** |
-| Marker files | 0 | 0 | **0** | 0 | 0 | **0** |
-| Held handles | 0 | 0 | **0** | 0 | 0 | **0** |
-| Unfinished tasks | 0 | 0 | **0** | 0 | 0 | **0** |
+| Check | Run 1 Post (5s) | Run 2 Post (5s) |
+|-------|-----------------|-----------------|
+| Marker directories | **0** | **0** |
+| Marker files | **0** | **0** |
 
 No residual PIDs, markers, held handles, or unfinished collectors after either run.
 
@@ -159,8 +179,11 @@ No residual PIDs, markers, held handles, or unfinished collectors after either r
 | TerminateRequested | True |
 | Exited | True |
 | FinalAbsent | True |
+| Handle pre-acquired | True |
 
-**Mechanism:** Starts a real `powershell -Command "Start-Sleep 5"` process, captures `StartTime.Ticks` as `$matchCreationTime`, calls `Stop-Wait-VerifyOwnedProcess -ProcessId $matchProcId -CreationTime $matchCreationTime`. The function reads the process's actual creation time, compares it to the supplied `$CreationTime`, finds a match, safely terminates, waits for exit, and verifies the process is absent. Outer-finally confirms cleanup even if the inner logic fails.
+**Mechanism (R14):** Starts a real `powershell -Command "Start-Sleep 5"` process. Pre-registers a cleanup handle via `$matchCleanupReg.RegisterProcess()` BEFORE calling `Stop-Wait-VerifyOwnedProcess`. The function acquires its own temporary handle via `ProcessHandleRegistry.RegisterProcess`, converts .NET DateTime ticks to FILETIME ticks for comparison with `GetProcessTimes`, verifies identity match, terminates and waits through the held handle, closes with structured success. The pre-registered cleanup handle provides an independent safety net in the outer finally.
+
+**FU-04 safety property:** Test asserts `$matchCleanupRegOk` (handle pre-acquired) as part of the PASS condition.
 
 ---
 
@@ -176,10 +199,14 @@ No residual PIDs, markers, held handles, or unfinished collectors after either r
 | TerminateRequested | False |
 | Exited | False |
 | Owned process still alive | True |
+| Both handles pre-acquired | True |
 
-**Mechanism:** Starts TWO real processes. Calls `Stop-Wait-VerifyOwnedProcess` with the FIRST process's PID but the SECOND process's creation time. The function reads the first process's actual creation time, compares it to the supplied time (which belongs to the second process), finds a mismatch, and **refuses to terminate** the PID. The first process remains alive. Outer-finally safely cleans up both processes.
+**Mechanism (R14):** Starts TWO real processes. Pre-registers cleanup handles for BOTH via `$ownedCleanupReg.RegisterProcess()` and `$otherCleanupReg.RegisterProcess()` BEFORE the test. Calls `Stop-Wait-VerifyOwnedProcess` with the FIRST process's PID but the SECOND process's creation time. The function's temporary handle reads the first process's FILETIME creation time, compares to the converted second process's time, finds a mismatch, and **refuses to terminate**. The first process remains alive (verified via `$ownedCleanupReg.CheckWaitStatus(0).Exited` — held-handle check, not PID lookup). Outer-finally cleans both processes through their own pre-acquired handles.
 
-**Key safety guarantee:** Identity mismatch or unreadable identity → no termination requested → target process survives → safe outer-finally cleanup.
+**Key safety guarantees:**
+- Identity mismatch → no termination requested → target process survives
+- Alive check uses held handle (`CheckWaitStatus`), not PID lookup (`Get-Process -Id`)
+- Outer finally uses pre-acquired handles, not `Stop-Process -Id`
 
 ---
 
@@ -211,15 +238,44 @@ For all ERROR cases: `SuccessBannerAllowed=False`, `TrustedTotalsAllowed=False`,
 
 ---
 
-## Key Fixes in R13
+## Key Fixes in R14 Follow-up
 
-1. **Shared exit mapper (`Get-OverallExitResult`)** — moved before `Invoke-SelfTestAggregation`; single source of truth for exit codes and banner/totals permissions. The former duplicate manual PASS/FAIL/BLOCKED/ERROR switch is removed.
-2. **Production uses structured result** — aggregation consumes `Overall`, `ExitCode`, `SuccessBannerAllowed`, `TrustedTotalsAllowed` from the shared mapper. Banner and totals are computed as AND of local condition and shared mapper permission.
-3. **PID-reuse-safe `Stop-Wait-VerifyOwnedProcess`** — `CreationTime` is now a mandatory parameter. Identity is verified (creation time comparison) before EVERY termination attempt — both primary and fallback paths. On identity mismatch or unreadable identity, the function does NOT kill the PID and returns structured failure.
-4. **Three native-API finally paths** — `GetProcessTimesFailure`, `WaitFailure`, and `CloseHandleFailure` all capture `StartTime.Ticks` before fault injection and pass it to `Stop-Wait-VerifyOwnedProcess`.
-5. **`CleanupIdentityMatch` fixture** — deterministic test proving match→terminate→absent lifecycle.
-6. **`CleanupIdentityMismatch` fixture** — deterministic test proving mismatch→no-terminate→still-alive safety guarantee.
-7. **All cleanup sites verify identity + (exited OR terminated) + absent** — not just `FinalAbsent` alone.
+### FU-01 — Handle-based `Stop-Wait-VerifyOwnedProcess`
+
+The R13 `Stop-Wait-VerifyOwnedProcess` used PID-based `Get-Process -Id` / `Stop-Process -Id` with check-then-act patterns vulnerable to PID reuse. R14 replaces this with:
+
+1. Acquires a native handle via `ProcessHandleRegistry.RegisterProcess` (atomic `OpenProcess` + `GetProcessTimes`)
+2. Converts .NET `DateTime.Ticks` (epoch 0001-01-01) to Windows `FILETIME` ticks (epoch 1601-01-01) for comparison with `GetProcessTimes` output
+3. Verifies identity through the held handle's creation time
+4. Terminates and waits through the held handle (`TerminateAndVerify`)
+5. Closes handle with structured success verification (`CloseAll`)
+6. Never calls `Stop-Process -Id` or `Get-Process -Id` for termination
+
+### FU-01/02 — Pre-acquired cleanup handles for native API fixtures
+
+All five native API and cleanup identity fixtures now pre-register cleanup handles BEFORE fault injection:
+
+- **GetProcessTimesFailure:** Cleanup handle registered via `$gptCleanupReg.RegisterProcess()` before `TestHook_FailGetProcessTimes = $true`. The intentionally failing registration in `$fixtureRegistry` remains independently tested.
+- **WaitFailure:** Cleanup handle registered via `$waitCleanupReg.RegisterProcess()` before `TestHook_FailWait = $true`. Hooks reset before using cleanup handle in finally.
+- **CloseHandleFailure:** Cleanup handle registered via `$closeCleanupReg.RegisterProcess()` before `TestHook_FailClose = $true`. Hooks reset before using cleanup handle in finally.
+- **CleanupIdentityMatch:** Cleanup handle pre-registered; test asserts `$matchCleanupRegOk` as PASS condition.
+- **CleanupIdentityMismatch:** Both cleanup handles pre-registered; alive check uses held handle `CheckWaitStatus(0)`, not PID lookup.
+
+### FU-04 — Safety property assertions
+
+- `CleanupIdentityMatch` asserts handle pre-acquisition (`$handlePreAcquired`) as part of PASS condition
+- `CleanupIdentityMismatch` asserts both handles pre-acquired AND alive via held handle (not PID lookup)
+- All finally blocks use handle-based cleanup (registry `TerminateAndVerify` + `CloseAll`), not PID-based `Stop-Process -Id`
+- Fixture count remains 33; totals runtime-derived
+
+### Tick Epoch Conversion
+
+`Stop-Wait-VerifyOwnedProcess` receives `.NET DateTime.Ticks` (epoch 0001-01-01, local time) from callers. `ProcessHandleRegistry.RegisterProcess` returns FILETIME ticks (epoch 1601-01-01, UTC) from `GetProcessTimes`. The function converts via:
+```powershell
+$fileTimeTicks = [System.TimeZoneInfo]::ConvertTimeToUtc(
+    [DateTime]::new($CreationTime, [DateTimeKind]::Local)
+).ToFileTimeUtc()
+```
 
 ---
 
@@ -256,13 +312,11 @@ with: `git log --oneline -1 -- docs/verification/G0-S1-R2-preflight.md`
 
 ---
 
-## R12-R13 Delta Summary
+## R13-R14 Delta Summary
 
-| REM | Description | Status |
-|-----|-------------|--------|
-| R13-REM-01 | `Get-OverallExitResult` moved before `Invoke-SelfTestAggregation` | DONE |
-| R13-REM-02 | Production aggregation uses shared mapper; duplicate switch removed; fail-closed banner/totals | DONE |
-| R13-REM-03 | PID-reuse-safe `Stop-Wait-VerifyOwnedProcess`; `CleanupIdentityMatch`/`CleanupIdentityMismatch` fixtures; creation time mandatory | DONE |
-| R13-REM-04 | Suite-evidence tests verify ERROR → exit 3, no banner, no trusted totals | DONE |
-| R13-REM-05 | All three native-API finally paths pass creation time | DONE |
-| R13-REM-06 | Preflight with mechanical evidence | DONE |
+| FU | Description | Status |
+|----|-------------|--------|
+| FU-01 | Handle-based `Stop-Wait-VerifyOwnedProcess`; pre-acquired cleanup handles for all 5 fixtures; no `Stop-Process -Id` in cleanup paths | DONE |
+| FU-02 | Identity/handle evidence captured before fault injection via pre-registration | DONE |
+| FU-03 | Non-self-referential preflight hash strategy; stale R13 self-hash corrected | DONE |
+| FU-04 | Safety property assertions: handle pre-acquisition, held-handle alive check, no PID-only termination | DONE |
