@@ -29,7 +29,7 @@ param(
     [switch]$SelfTestOnly,
     # R15-REM-01: Fault injection for process-level exit 3 verification.
     # Only valid with -SelfTestOnly. Corrupts suite data before aggregation.
-    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure','JobAssignFailure','ParentHandleRegFailure','DescendantHandleRegFailure','CollectorReadFailure','CollectorDrainTimeout','MarkerDeletionWhileLive','MarkerDeletionFailure','GetProcessTimesFailure','WaitFailure','CloseHandleFailure','MetaRoleMismatch','MetaTokenMismatch','MetaExtraEntry','MetaExtraMarker','MetaNullEvidence','MetaEmptyManifest','MetaDuplicateExpectedPID','MetaDuplicateActualPID')]
+    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure','JobAssignFailure','ParentHandleRegFailure','DescendantHandleRegFailure','CollectorReadFailure','CollectorDrainTimeout','MarkerDeletionWhileLive','MarkerDeletionFailure','GetProcessTimesFailure','WaitFailure','CloseHandleFailure','MetaRoleMismatch','MetaTokenMismatch','MetaExtraEntry','MetaExtraMarker','MetaNullEvidence','MetaEmptyManifest','MetaDuplicateExpectedPID','MetaDuplicateActualPID','CleanupIdentityMatch','CleanupIdentityMismatch')]
     [string]$SelfTestFault = 'None',
     # R3-REM-04: Fast fault child mode — skips all test execution, constructs deterministic
     # suite records, injects fault, calls Invoke-SelfTestAggregation, exits.
@@ -2026,6 +2026,20 @@ function Test-CompareTestManifest {
 #   $NodeResolution — object with .Path property, or $null
 #   $PureTotal/$PurePassed/$NodeTotal/$NodePassed — display totals
 # Returns: [PSCustomObject]@{ Overall=[string]; ExitCode=[int]; SuiteValid=[bool] }
+# R12-REM-05 + R13-REM-02: Shared overall→exit-code mapper — single source of truth
+# for exit codes and banner/totals permissions. Returns structured object, not raw integer.
+# Defined before Invoke-SelfTestAggregation so production calls the shared function.
+function Get-OverallExitResult {
+    param([Parameter(Mandatory=$true)][string]$Overall)
+    $exitCode = switch ($Overall) { "PASS" { 0 } "FAIL" { 1 } "BLOCKED" { 2 } "ERROR" { 3 } default { 3 } }
+    return [PSCustomObject]@{
+        Overall = $Overall
+        ExitCode = $exitCode
+        SuccessBannerAllowed = ($Overall -eq 'PASS')
+        TrustedTotalsAllowed = ($Overall -eq 'PASS')
+    }
+}
+
 function Invoke-SelfTestAggregation {
     param(
         [Parameter(Mandatory=$true)]$SuiteResults,
@@ -2153,20 +2167,16 @@ function Invoke-SelfTestAggregation {
       -HasFatalInternalError $false `
       -CleanupErrorList @()
 
-    $selfTestExitCode = switch ($selfTestOverall) {
-        "PASS"    { 0 }
-        "FAIL"    { 1 }
-        "BLOCKED" { 2 }
-        "ERROR"   { 3 }
-        default   { 3 }
-    }
+    # R13-REM-02: Use shared Get-OverallExitResult — no duplicate switch mapping
+    $exitResult = Get-OverallExitResult -Overall $selfTestOverall
 
+    # R13-REM-02: Fail-closed — banner/totals only if BOTH local condition AND shared mapper allow
     return [PSCustomObject]@{
-        Overall = $selfTestOverall
-        ExitCode = $selfTestExitCode
+        Overall = $exitResult.Overall
+        ExitCode = $exitResult.ExitCode
         SuiteValid = $suiteValid
-        SuccessBannerPrinted = $successBannerPrinted
-        TrustedTotalsPrinted = $trustedTotalsPrinted
+        SuccessBannerPrinted = ($successBannerPrinted -and $exitResult.SuccessBannerAllowed)
+        TrustedTotalsPrinted = ($trustedTotalsPrinted -and $exitResult.TrustedTotalsAllowed)
     }
 }
 
@@ -2181,32 +2191,33 @@ function Test-SuiteEvidence {
     $script:TestResults = @()
     $suites1 = @{ 'Aggregation'=@{ Declared=1; Actual=1; Passed=1; Failed=0 } }
     $r1 = Invoke-SelfTestAggregation -SuiteResults $suites1 -AllSuites @('Aggregation','NativeJudgment')
-    $p1 = ($r1.Overall -eq "ERROR") -and ($r1.ExitCode -eq 3) -and (-not $r1.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T1: missing suite => ERROR/3"; Expected="ERROR/3"; Actual="$($r1.Overall)/$($r1.ExitCode)"; Pass=$p1 }
+    # R13-REM-02: Verify fail-closed banner/totals via shared Get-OverallExitResult
+    $p1 = ($r1.Overall -eq "ERROR") -and ($r1.ExitCode -eq 3) -and (-not $r1.SuiteValid) -and (-not $r1.SuccessBannerPrinted) -and (-not $r1.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T1: missing suite => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r1.Overall)/$($r1.ExitCode) banner=$($r1.SuccessBannerPrinted) totals=$($r1.TrustedTotalsPrinted)"; Pass=$p1 }
     if (-not $p1) { $allPassed = $false }
 
     # T2: Declared/actual mismatch => ScriptInternal FAIL => ERROR
     $script:TestResults = @()
     $suites2 = @{ 'Aggregation'=@{ Declared=10; Actual=11; Passed=11; Failed=0 } }
     $r2 = Invoke-SelfTestAggregation -SuiteResults $suites2 -AllSuites @('Aggregation')
-    $p2 = ($r2.Overall -eq "ERROR") -and ($r2.ExitCode -eq 3) -and (-not $r2.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T2: declared!=actual => ERROR/3"; Expected="ERROR/3"; Actual="$($r2.Overall)/$($r2.ExitCode)"; Pass=$p2 }
+    $p2 = ($r2.Overall -eq "ERROR") -and ($r2.ExitCode -eq 3) -and (-not $r2.SuiteValid) -and (-not $r2.SuccessBannerPrinted) -and (-not $r2.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T2: declared!=actual => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r2.Overall)/$($r2.ExitCode) banner=$($r2.SuccessBannerPrinted) totals=$($r2.TrustedTotalsPrinted)"; Pass=$p2 }
     if (-not $p2) { $allPassed = $false }
 
     # T3: Passed/actual mismatch => ScriptInternal FAIL => ERROR
     $script:TestResults = @()
     $suites3 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=1 } }
     $r3 = Invoke-SelfTestAggregation -SuiteResults $suites3 -AllSuites @('Aggregation')
-    $p3 = ($r3.Overall -eq "ERROR") -and ($r3.ExitCode -eq 3) -and (-not $r3.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T3: passed!=actual => ERROR/3"; Expected="ERROR/3"; Actual="$($r3.Overall)/$($r3.ExitCode)"; Pass=$p3 }
+    $p3 = ($r3.Overall -eq "ERROR") -and ($r3.ExitCode -eq 3) -and (-not $r3.SuiteValid) -and (-not $r3.SuccessBannerPrinted) -and (-not $r3.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T3: passed!=actual => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r3.Overall)/$($r3.ExitCode) banner=$($r3.SuccessBannerPrinted) totals=$($r3.TrustedTotalsPrinted)"; Pass=$p3 }
     if (-not $p3) { $allPassed = $false }
 
     # T4: Failed count > 0 => ScriptInternal FAIL => ERROR
     $script:TestResults = @()
     $suites4 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=1 } }
     $r4 = Invoke-SelfTestAggregation -SuiteResults $suites4 -AllSuites @('Aggregation')
-    $p4 = ($r4.Overall -eq "ERROR") -and ($r4.ExitCode -eq 3) -and (-not $r4.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T4: failed>0 => ERROR/3"; Expected="ERROR/3"; Actual="$($r4.Overall)/$($r4.ExitCode)"; Pass=$p4 }
+    $p4 = ($r4.Overall -eq "ERROR") -and ($r4.ExitCode -eq 3) -and (-not $r4.SuiteValid) -and (-not $r4.SuccessBannerPrinted) -and (-not $r4.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T4: failed>0 => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r4.Overall)/$($r4.ExitCode) banner=$($r4.SuccessBannerPrinted) totals=$($r4.TrustedTotalsPrinted)"; Pass=$p4 }
     if (-not $p4) { $allPassed = $false }
 
     # T5: Manifest mismatch => ScriptInternal FAIL => ERROR
@@ -2214,56 +2225,56 @@ function Test-SuiteEvidence {
     $suites5 = @{ 'Aggregation'=@{ Declared=1; Actual=1; Passed=1; Failed=0 } }
     $manifest5 = Compare-TestManifest -ExpectedNames @("A","B","C") -ActualNames @("A","B","Z")
     $r5 = Invoke-SelfTestAggregation -SuiteResults $suites5 -AllSuites @('Aggregation') -ManifestComparison $manifest5
-    $p5 = ($r5.Overall -eq "ERROR") -and ($r5.ExitCode -eq 3) -and (-not $r5.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T5: manifest mismatch => ERROR/3"; Expected="ERROR/3"; Actual="$($r5.Overall)/$($r5.ExitCode)"; Pass=$p5 }
+    $p5 = ($r5.Overall -eq "ERROR") -and ($r5.ExitCode -eq 3) -and (-not $r5.SuiteValid) -and (-not $r5.SuccessBannerPrinted) -and (-not $r5.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T5: manifest mismatch => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r5.Overall)/$($r5.ExitCode) banner=$($r5.SuccessBannerPrinted) totals=$($r5.TrustedTotalsPrinted)"; Pass=$p5 }
     if (-not $p5) { $allPassed = $false }
 
     # R4-REM-04: T6: Missing field => ERROR/3
     $script:TestResults = @()
     $suites6 = @{ 'Aggregation'=@{ Actual=11; Passed=11; Failed=0 } }  # Missing 'Declared'
     $r6 = Invoke-SelfTestAggregation -SuiteResults $suites6 -AllSuites @('Aggregation')
-    $p6 = ($r6.Overall -eq "ERROR") -and ($r6.ExitCode -eq 3) -and (-not $r6.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T6: missing field => ERROR/3"; Expected="ERROR/3"; Actual="$($r6.Overall)/$($r6.ExitCode)"; Pass=$p6 }
+    $p6 = ($r6.Overall -eq "ERROR") -and ($r6.ExitCode -eq 3) -and (-not $r6.SuiteValid) -and (-not $r6.SuccessBannerPrinted) -and (-not $r6.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T6: missing field => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r6.Overall)/$($r6.ExitCode) banner=$($r6.SuccessBannerPrinted) totals=$($r6.TrustedTotalsPrinted)"; Pass=$p6 }
     if (-not $p6) { $allPassed = $false }
 
     # R4-REM-04: T7: String value => ERROR/3
     $script:TestResults = @()
     $suites7 = @{ 'Aggregation'=@{ Declared="11"; Actual=11; Passed=11; Failed=0 } }  # String, not int
     $r7 = Invoke-SelfTestAggregation -SuiteResults $suites7 -AllSuites @('Aggregation')
-    $p7 = ($r7.Overall -eq "ERROR") -and ($r7.ExitCode -eq 3) -and (-not $r7.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T7: string value => ERROR/3"; Expected="ERROR/3"; Actual="$($r7.Overall)/$($r7.ExitCode)"; Pass=$p7 }
+    $p7 = ($r7.Overall -eq "ERROR") -and ($r7.ExitCode -eq 3) -and (-not $r7.SuiteValid) -and (-not $r7.SuccessBannerPrinted) -and (-not $r7.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T7: string value => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r7.Overall)/$($r7.ExitCode) banner=$($r7.SuccessBannerPrinted) totals=$($r7.TrustedTotalsPrinted)"; Pass=$p7 }
     if (-not $p7) { $allPassed = $false }
 
     # R4-REM-04: T8: Float value => ERROR/3
     $script:TestResults = @()
     $suites8 = @{ 'Aggregation'=@{ Declared=11.5; Actual=11; Passed=11; Failed=0 } }  # Float, not int
     $r8 = Invoke-SelfTestAggregation -SuiteResults $suites8 -AllSuites @('Aggregation')
-    $p8 = ($r8.Overall -eq "ERROR") -and ($r8.ExitCode -eq 3) -and (-not $r8.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T8: float value => ERROR/3"; Expected="ERROR/3"; Actual="$($r8.Overall)/$($r8.ExitCode)"; Pass=$p8 }
+    $p8 = ($r8.Overall -eq "ERROR") -and ($r8.ExitCode -eq 3) -and (-not $r8.SuiteValid) -and (-not $r8.SuccessBannerPrinted) -and (-not $r8.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T8: float value => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r8.Overall)/$($r8.ExitCode) banner=$($r8.SuccessBannerPrinted) totals=$($r8.TrustedTotalsPrinted)"; Pass=$p8 }
     if (-not $p8) { $allPassed = $false }
 
     # R4-REM-04: T9: Negative value => ERROR/3
     $script:TestResults = @()
     $suites9 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=11; Failed=-1 } }  # Negative
     $r9 = Invoke-SelfTestAggregation -SuiteResults $suites9 -AllSuites @('Aggregation')
-    $p9 = ($r9.Overall -eq "ERROR") -and ($r9.ExitCode -eq 3) -and (-not $r9.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T9: negative value => ERROR/3"; Expected="ERROR/3"; Actual="$($r9.Overall)/$($r9.ExitCode)"; Pass=$p9 }
+    $p9 = ($r9.Overall -eq "ERROR") -and ($r9.ExitCode -eq 3) -and (-not $r9.SuiteValid) -and (-not $r9.SuccessBannerPrinted) -and (-not $r9.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T9: negative value => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r9.Overall)/$($r9.ExitCode) banner=$($r9.SuccessBannerPrinted) totals=$($r9.TrustedTotalsPrinted)"; Pass=$p9 }
     if (-not $p9) { $allPassed = $false }
 
     # R4-REM-04: T10: Overflow/huge value => ERROR/3
     $script:TestResults = @()
     $suites10 = @{ 'Aggregation'=@{ Declared=[int]::MaxValue; Actual=[int]::MaxValue; Passed=[int]::MaxValue; Failed=1 } }  # Passed+Failed overflows
     $r10 = Invoke-SelfTestAggregation -SuiteResults $suites10 -AllSuites @('Aggregation')
-    $p10 = ($r10.Overall -eq "ERROR") -and ($r10.ExitCode -eq 3) -and (-not $r10.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T10: overflow value => ERROR/3"; Expected="ERROR/3"; Actual="$($r10.Overall)/$($r10.ExitCode)"; Pass=$p10 }
+    $p10 = ($r10.Overall -eq "ERROR") -and ($r10.ExitCode -eq 3) -and (-not $r10.SuiteValid) -and (-not $r10.SuccessBannerPrinted) -and (-not $r10.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T10: overflow value => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r10.Overall)/$($r10.ExitCode) banner=$($r10.SuccessBannerPrinted) totals=$($r10.TrustedTotalsPrinted)"; Pass=$p10 }
     if (-not $p10) { $allPassed = $false }
 
     # R4-REM-04: T11: Passed+Failed != Actual => ERROR/3
     $script:TestResults = @()
     $suites11 = @{ 'Aggregation'=@{ Declared=11; Actual=11; Passed=10; Failed=0 } }  # Passed(10)+Failed(0)=10 != Actual(11)
     $r11 = Invoke-SelfTestAggregation -SuiteResults $suites11 -AllSuites @('Aggregation')
-    $p11 = ($r11.Overall -eq "ERROR") -and ($r11.ExitCode -eq 3) -and (-not $r11.SuiteValid)
-    $tests += [PSCustomObject]@{ Name="T11: passed+failed!=actual => ERROR/3"; Expected="ERROR/3"; Actual="$($r11.Overall)/$($r11.ExitCode)"; Pass=$p11 }
+    $p11 = ($r11.Overall -eq "ERROR") -and ($r11.ExitCode -eq 3) -and (-not $r11.SuiteValid) -and (-not $r11.SuccessBannerPrinted) -and (-not $r11.TrustedTotalsPrinted)
+    $tests += [PSCustomObject]@{ Name="T11: passed+failed!=actual => ERROR/3"; Expected="ERROR/3 no-banner no-totals"; Actual="$($r11.Overall)/$($r11.ExitCode) banner=$($r11.SuccessBannerPrinted) totals=$($r11.TrustedTotalsPrinted)"; Pass=$p11 }
     if (-not $p11) { $allPassed = $false }
 
     # Restore original results
@@ -2560,26 +2571,15 @@ function Test-CommonProcessGate {
     }
 }
 
-# R12-REM-05: Shared overall→exit-code mapper — single source of truth for exit codes
-# and banner/totals permissions. Returns structured object, not raw integer.
-function Get-OverallExitResult {
-    param([Parameter(Mandatory=$true)][string]$Overall)
-    $exitCode = switch ($Overall) { "PASS" { 0 } "FAIL" { 1 } "BLOCKED" { 2 } "ERROR" { 3 } default { 3 } }
-    return [PSCustomObject]@{
-        Overall = $Overall
-        ExitCode = $exitCode
-        SuccessBannerAllowed = ($Overall -eq 'PASS')
-        TrustedTotalsAllowed = ($Overall -eq 'PASS')
-    }
-}
 
-# R12-REM-04: Shared native-process stop/wait/verify for finally blocks.
-# Uses PID + creation-time identity to avoid PID-reuse confusion.
-# Returns structured result — caller must consume it in PASS judgment.
+# R12-REM-04 + R13-REM-03: Shared native-process stop/wait/verify for finally blocks.
+# PID-reuse safe: requires nonzero creation time, verifies identity before EVERY termination.
+# On identity mismatch or inability to read identity, does NOT kill the PID.
+# Returns structured result — caller must consume IdentityMatched + TerminateRequested + FinalAbsent.
 function Stop-Wait-VerifyOwnedProcess {
     param(
         [Parameter(Mandatory=$true)][int]$ProcessId,
-        [long]$CreationTime = 0,
+        [Parameter(Mandatory=$true)][long]$CreationTime,
         [int]$WaitMs = 3000
     )
     $result = [PSCustomObject]@{
@@ -2587,17 +2587,44 @@ function Stop-Wait-VerifyOwnedProcess {
         Exited = $false
         TimedOut = $false
         IdentityMatched = $false
+        IdentityVerified = $false
         FallbackCleanup = $false
         FinalAbsent = $false
     }
+
+    # R13-REM-03: Require nonzero creation time — refuse to operate without it
+    if ($CreationTime -le 0) {
+        # Cannot verify identity — do NOT kill
+        $finalCheck = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $finalCheck) { $result.FinalAbsent = $true }
+        else { $finalCheck.Dispose() }
+        return $result
+    }
+
     try {
         $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
         if ($proc) {
-            $result.IdentityMatched = $true
-            if ($CreationTime -gt 0) {
-                try { $result.IdentityMatched = ($proc.StartTime.Ticks -eq $CreationTime) } catch {}
+            # R13-REM-03: Verify identity BEFORE any termination attempt
+            try {
+                $actualCreationTime = $proc.StartTime.Ticks
+                $result.IdentityVerified = $true
+                $result.IdentityMatched = ($actualCreationTime -eq $CreationTime)
+            } catch {
+                # Cannot read creation time — do NOT kill
+                $result.IdentityVerified = $false
+                $result.IdentityMatched = $false
             }
             $proc.Dispose()
+
+            if (-not $result.IdentityMatched) {
+                # R13-REM-03: Identity mismatch — do NOT kill this PID
+                $finalCheck = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                if (-not $finalCheck) { $result.FinalAbsent = $true }
+                else { $finalCheck.Dispose() }
+                return $result
+            }
+
+            # Identity verified — safe to terminate
             Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
             $result.TerminateRequested = $true
             $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMs)
@@ -2609,12 +2636,38 @@ function Stop-Wait-VerifyOwnedProcess {
             }
             if (-not $result.Exited) { $result.TimedOut = $true }
         } else {
+            # Process not found — already exited (no identity to verify)
             $result.Exited = $true
             $result.IdentityMatched = $true
+            $result.IdentityVerified = $true
         }
     } catch {}
+
+    # R13-REM-03: Fallback — re-verify identity before second termination attempt
     if (-not $result.Exited) {
         try {
+            $proc2 = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($proc2) {
+                try {
+                    $actualCreationTime2 = $proc2.StartTime.Ticks
+                    if ($actualCreationTime2 -ne $CreationTime) {
+                        # R13-REM-03: Identity mismatch in fallback — do NOT kill
+                        $proc2.Dispose()
+                        $finalCheck = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                        if (-not $finalCheck) { $result.FinalAbsent = $true }
+                        else { $finalCheck.Dispose() }
+                        return $result
+                    }
+                } catch {
+                    # Cannot read identity in fallback — do NOT kill
+                    $proc2.Dispose()
+                    $finalCheck = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                    if (-not $finalCheck) { $result.FinalAbsent = $true }
+                    else { $finalCheck.Dispose() }
+                    return $result
+                }
+                $proc2.Dispose()
+            }
             Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
             Start-Sleep -Milliseconds 500
             $stillAlive = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
@@ -2929,7 +2982,10 @@ function Test-ProcessLevelFaults {
         # R15-FU-04: Additional meta-tests for manifest/marker negative paths
         @{ Name='MetaEmptyManifest'; Fault='MetaEmptyManifest'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
         @{ Name='MetaDuplicateExpectedPID'; Fault='MetaDuplicateExpectedPID'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
-        @{ Name='MetaDuplicateActualPID'; Fault='MetaDuplicateActualPID'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' }
+        @{ Name='MetaDuplicateActualPID'; Fault='MetaDuplicateActualPID'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
+        # R13-REM-03: Deterministic cleanup identity tests
+        @{ Name='CleanupIdentityMatch'; Fault='CleanupIdentityMatch'; Timeout=$childTimeoutMs; Fast=$true; Type='cleanupIdentity' },
+        @{ Name='CleanupIdentityMismatch'; Fault='CleanupIdentityMismatch'; Timeout=$childTimeoutMs; Fast=$true; Type='cleanupIdentity' }
     )
 
     foreach ($fixture in $faults) {
@@ -2950,12 +3006,12 @@ function Test-ProcessLevelFaults {
         [ProcessHandleRegistry]::TestHook_FailClose = $false
         [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0
         # R9-REM-02: Expected registration counts per fixture type
-        $expParentCount = if ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault')) { 1 } else { 0 }
+        $expParentCount = if ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'cleanupIdentity')) { 1 } else { 0 }
         $expDescendantCount = if ($fault -in @('Timeout', 'CleanupFailure')) { 1 } else { 0 }
 
         try {
             # R8: Pure test fixtures (handleReg, collectorFault, markerLifecycle, nativeApiFault) don't need child processes
-            $launchChild = ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'manifestMeta'))
+            $launchChild = ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'manifestMeta', 'cleanupIdentity'))
             if ($launchChild) {
                 $fastFlag = if ($useFast) { "-SelfTestFastFault" } else { "" }
                 $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag -PLFToken $testRunToken -PLFMarkerDir `"$markerDir`""
@@ -3429,10 +3485,13 @@ function Test-ProcessLevelFaults {
                         $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Success=false GetProcessTimes err orphan!=VerifiedClean"; Actual="Success=$($gptReg.Success) Error=$($gptReg.Error) orphan=$($gptOrphan.Status)"; Pass=$pass }
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailGetProcessTimes = $false
+                        # R13-REM-03: Capture creation time before fault injection
                         # R12-REM-04: Use shared Stop-Wait-VerifyOwnedProcess for structured cleanup
-                        $gptCleanup = Stop-Wait-VerifyOwnedProcess -ProcessId $gptProcId
-                        if (-not $gptCleanup.FinalAbsent) {
-                            Write-Host "  WARNING: GetProcessTimesFailure process $gptProcId still alive after cleanup" -ForegroundColor Yellow
+                        $gptCleanup = Stop-Wait-VerifyOwnedProcess -ProcessId $gptProcId -CreationTime $gptProc.StartTime.Ticks
+                        # R13-REM-03: Verify identity + (exited OR terminated) + absent
+                        $gptCleanupOk = $gptCleanup.IdentityMatched -and ($gptCleanup.Exited -or $gptCleanup.TerminateRequested) -and $gptCleanup.FinalAbsent
+                        if (-not $gptCleanupOk) {
+                            Write-Host "  WARNING: GetProcessTimesFailure cleanup identity=$($gptCleanup.IdentityMatched) exited=$($gptCleanup.Exited) term=$($gptCleanup.TerminateRequested) absent=$($gptCleanup.FinalAbsent)" -ForegroundColor Yellow
                             $tests[-1].Pass = $false
                         }
                         $gptProc.Dispose()
@@ -3489,8 +3548,10 @@ function Test-ProcessLevelFaults {
                         $fixtureRegistry.CloseAll()
                         # R12-REM-04: Use shared Stop-Wait-VerifyOwnedProcess
                         $waitCleanup2 = Stop-Wait-VerifyOwnedProcess -ProcessId $waitProcId -CreationTime $waitProcStartTime.Ticks
-                        if (-not $waitCleanup2.FinalAbsent) {
-                            Write-Host "  WARNING: WaitFailure process $waitProcId still alive after cleanup" -ForegroundColor Yellow
+                        # R13-REM-03: Verify identity + (exited OR terminated) + absent
+                        $waitCleanupOk = $waitCleanup2.IdentityMatched -and ($waitCleanup2.Exited -or $waitCleanup2.TerminateRequested) -and $waitCleanup2.FinalAbsent
+                        if (-not $waitCleanupOk) {
+                            Write-Host "  WARNING: WaitFailure cleanup identity=$($waitCleanup2.IdentityMatched) exited=$($waitCleanup2.Exited) term=$($waitCleanup2.TerminateRequested) absent=$($waitCleanup2.FinalAbsent)" -ForegroundColor Yellow
                             $tests[-1].Pass = $false
                         }
                         $waitProc.Dispose()
@@ -3516,10 +3577,15 @@ function Test-ProcessLevelFaults {
                         $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk closeFailed failed>0"; Actual="reg=$closeRegOk allClosed=$($closeResult.AllClosed) failed=$($closeResult.Failed)/$($closeResult.Attempted)"; Pass=$pass }
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailClose = $false
+                        # R13-REM-03: Capture creation time for identity verification
                         # R12-REM-04: Use shared Stop-Wait-VerifyOwnedProcess
-                        $closeCleanup = Stop-Wait-VerifyOwnedProcess -ProcessId $closeProcId
-                        if (-not $closeCleanup.FinalAbsent) {
-                            Write-Host "  WARNING: CloseHandleFailure process $closeProcId still alive after cleanup" -ForegroundColor Yellow
+                        $closeCleanup = Stop-Wait-VerifyOwnedProcess -ProcessId $closeProcId -CreationTime $closeProc.StartTime.Ticks
+                        # R13-REM-03: Verify identity + (exited OR terminated) + absent
+                        # CloseHandleFailure terminates the process before setting the hook,
+                        # so Stop-Wait-VerifyOwnedProcess finds it already dead (Exited=true, TerminateRequested=false)
+                        $closeCleanupOk = $closeCleanup.IdentityMatched -and ($closeCleanup.Exited -or $closeCleanup.TerminateRequested) -and $closeCleanup.FinalAbsent
+                        if (-not $closeCleanupOk) {
+                            Write-Host "  WARNING: CloseHandleFailure cleanup identity=$($closeCleanup.IdentityMatched) exited=$($closeCleanup.Exited) term=$($closeCleanup.TerminateRequested) absent=$($closeCleanup.FinalAbsent)" -ForegroundColor Yellow
                             $tests[-1].Pass = $false
                         }
                         $closeProc.Dispose()
@@ -3814,6 +3880,61 @@ function Test-ProcessLevelFaults {
                 } else {
                     $pass = $false
                     $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known manifestMeta"; Actual="unknown"; Pass=$pass }
+                }
+            }
+            'cleanupIdentity' {
+                # R13-REM-03: Deterministic cleanup identity tests
+                if ($fault -eq 'CleanupIdentityMatch') {
+                    # Start a real process, capture creation time, verify Stop-Wait-VerifyOwnedProcess
+                    # correctly identifies and terminates the owned process
+                    $matchProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+                    $matchProcId = $matchProc.Id
+                    $matchCreationTime = $matchProc.StartTime.Ticks
+                    try {
+                        # Verify identity match → successful termination
+                        $matchResult = Stop-Wait-VerifyOwnedProcess -ProcessId $matchProcId -CreationTime $matchCreationTime
+                        $identityOk = $matchResult.IdentityMatched -and $matchResult.IdentityVerified
+                        $termOk = $matchResult.TerminateRequested -and $matchResult.Exited
+                        $absentOk = $matchResult.FinalAbsent
+                        $pass = $identityOk -and $termOk -and $absentOk
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="identity match + terminate + absent"; Actual="identity=$identityOk verified=$($matchResult.IdentityVerified) term=$($matchResult.TerminateRequested) exited=$($matchResult.Exited) absent=$absentOk"; Pass=$pass }
+                    } finally {
+                        # Outer finally: ensure test-owned process is cleaned up
+                        $alive = Get-Process -Id $matchProcId -ErrorAction SilentlyContinue
+                        if ($alive) { Stop-Process -Id $matchProcId -Force -ErrorAction SilentlyContinue; $alive.Dispose() }
+                        $matchProc.Dispose()
+                    }
+                } elseif ($fault -eq 'CleanupIdentityMismatch') {
+                    # Start TWO real processes. Call Stop-Wait-VerifyOwnedProcess with the first
+                    # process's PID but the second process's creation time → identity mismatch.
+                    # Prove: no termination requested, first process still alive, then clean up both.
+                    $ownedProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 10`"" -PassThru -WindowStyle Hidden
+                    $ownedProcId = $ownedProc.Id
+                    $otherProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 10`"" -PassThru -WindowStyle Hidden
+                    $otherProcId = $otherProc.Id
+                    $otherCreationTime = $otherProc.StartTime.Ticks
+                    try {
+                        # Use owned PID with OTHER process's creation time → mismatch
+                        $mismatchResult = Stop-Wait-VerifyOwnedProcess -ProcessId $ownedProcId -CreationTime $otherCreationTime
+                        # Must NOT have terminated the owned process
+                        $noTerm = (-not $mismatchResult.TerminateRequested) -and (-not $mismatchResult.Exited)
+                        $identityMismatch = $mismatchResult.IdentityVerified -and (-not $mismatchResult.IdentityMatched)
+                        # Owned process must still be alive
+                        $ownedStillAlive = $null -ne (Get-Process -Id $ownedProcId -ErrorAction SilentlyContinue)
+                        $pass = $noTerm -and $identityMismatch -and $ownedStillAlive
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="identity mismatch + no term + still alive"; Actual="noTerm=$noTerm idMismatch=$identityMismatch verified=$($mismatchResult.IdentityVerified) matched=$($mismatchResult.IdentityMatched) alive=$ownedStillAlive"; Pass=$pass }
+                    } finally {
+                        # Outer finally: safely clean up BOTH test-owned processes
+                        $alive1 = Get-Process -Id $ownedProcId -ErrorAction SilentlyContinue
+                        if ($alive1) { Stop-Process -Id $ownedProcId -Force -ErrorAction SilentlyContinue; $alive1.Dispose() }
+                        $ownedProc.Dispose()
+                        $alive2 = Get-Process -Id $otherProcId -ErrorAction SilentlyContinue
+                        if ($alive2) { Stop-Process -Id $otherProcId -Force -ErrorAction SilentlyContinue; $alive2.Dispose() }
+                        $otherProc.Dispose()
+                    }
+                } else {
+                    $pass = $false
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known cleanupIdentity"; Actual="unknown"; Pass=$pass }
                 }
             }
         }
