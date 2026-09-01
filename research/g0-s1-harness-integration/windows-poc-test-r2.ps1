@@ -29,7 +29,7 @@ param(
     [switch]$SelfTestOnly,
     # R15-REM-01: Fault injection for process-level exit 3 verification.
     # Only valid with -SelfTestOnly. Corrupts suite data before aggregation.
-    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure','JobAssignFailure','ParentHandleRegFailure','DescendantHandleRegFailure','CollectorReadFailure','CollectorDrainTimeout','MarkerDeletionWhileLive','MarkerDeletionFailure','GetProcessTimesFailure','WaitFailure','CloseHandleFailure','MetaRoleMismatch','MetaTokenMismatch','MetaExtraEntry','MetaExtraMarker','MetaNullEvidence','MetaEmptyManifest','MetaDuplicateExpectedPID','MetaDuplicateActualPID','CleanupIdentityMatch','CleanupIdentityMismatch')]
+    [ValidateSet('None','MissingSuite','DeclaredMismatch','PassedMismatch','FailedNonZero','ManifestMismatch','Timeout','StdoutOversize','StderrOversize','DualStreamOversize','LongLine','BoundaryExact','BoundaryOver','CleanupFailure','JobAssignFailure','ParentHandleRegFailure','DescendantHandleRegFailure','CollectorReadFailure','CollectorDrainTimeout','MarkerDeletionWhileLive','MarkerDeletionFailure','GetProcessTimesFailure','WaitFailure','CloseHandleFailure','MetaRoleMismatch','MetaTokenMismatch','MetaExtraEntry','MetaExtraMarker','MetaNullEvidence','MetaEmptyManifest','MetaDuplicateExpectedPID','MetaDuplicateActualPID','CleanupIdentityMatch','CleanupIdentityMismatch','CleanupRegistrationFailure')]
     [string]$SelfTestFault = 'None',
     # R3-REM-04: Fast fault child mode — skips all test execution, constructs deterministic
     # suite records, injects fault, calls Invoke-SelfTestAggregation, exits.
@@ -532,8 +532,9 @@ public class ProcessHandleRegistry
         if (!TerminateProcess(entry.Handle, exitCode))
         {
             twr.TerminateWin32Error = (int)Marshal.GetLastWin32Error();
-            // Process may have already exited - check wait status before failing
-            uint waitAfterTermFail = TestHook_FailWait ? WAIT_FAILED : WaitForSingleObject(entry.Handle, 0);
+            // R13-FU2: Use bounded wait (not zero-duration) — process may be already
+            // terminating from another handle; give it time to fully exit.
+            uint waitAfterTermFail = TestHook_FailWait ? WAIT_FAILED : WaitForSingleObject(entry.Handle, (uint)waitMs);
             twr.Wait.WaitCode = waitAfterTermFail;
             if (waitAfterTermFail == WAIT_OBJECT_0)
             {
@@ -2572,85 +2573,131 @@ function Test-CommonProcessGate {
 }
 
 
-# R14-FU-01: Handle-based stop/wait/verify — eliminates PID check-to-use races.
-# Acquires a native handle via ProcessHandleRegistry.RegisterProcess, verifies identity
-# through the held handle's creation time, terminates and waits on the held handle.
-# Never uses Stop-Process -Id or Get-Process -Id for termination.
-# Returns structured result — caller must consume IdentityMatched + TerminateRequested + FinalAbsent.
-# NOTE: CreationTime is in .NET DateTime ticks (epoch 0001-01-01). Internal conversion
-# to FILETIME ticks (epoch 1601-01-01) is performed for comparison with GetProcessTimes.
+# R15-FU2-01: Authoritative pre-acquired-handle helper.
+# Accepts a mandatory pre-acquired ProcessHandleRegistry (caller held continuously
+# since before fault injection). NEVER reopens PID. Uses try/finally so CloseAll()
+# is attempted exactly once on every path. No early return bypasses closure.
+# Returns structured result with full cleanup evidence.
+# NOTE: ExpectedCreationTime is .NET DateTime ticks (epoch 0001-01-01). Internal
+# conversion to FILETIME ticks (epoch 1601-01-01) for GetProcessTimes comparison.
 function Stop-Wait-VerifyOwnedProcess {
     param(
-        [Parameter(Mandatory=$true)][int]$ProcessId,
-        [Parameter(Mandatory=$true)][long]$CreationTime,
+        [Parameter(Mandatory=$true)][ProcessHandleRegistry]$Registry,
+        [Parameter(Mandatory=$true)][long]$ExpectedCreationTime,
+        [int]$EntryIndex = 0,
         [int]$WaitMs = 3000
     )
-    # R14-FU-01: Convert .NET DateTime ticks to FILETIME ticks for GetProcessTimes comparison
-    $fileTimeTicks = [System.TimeZoneInfo]::ConvertTimeToUtc(
-        [DateTime]::new($CreationTime, [DateTimeKind]::Local)
-    ).ToFileTimeUtc()
     $result = [PSCustomObject]@{
-        TerminateRequested = $false
-        Exited = $false
-        TimedOut = $false
-        IdentityMatched = $false
+        RegistrationSucceeded = $false
+        EntryCount = 0
+        ExpectedEntryCount = 1
         IdentityVerified = $false
-        FallbackCleanup = $false
-        FinalAbsent = $false
+        IdentityMatched = $false
+        InitialWaitOutcome = 'Unknown'
+        TerminateAttempted = $false
+        TerminateSucceeded = $false
+        FinalWaitOutcome = 'Unknown'
+        ExitedVerified = $false
+        TimedOut = $false
+        CloseAttempted = $false
+        CloseAllSucceeded = $false
+        CloseFailedCount = 0
+        Success = $false
+        Errors = @()
     }
 
-    # R14-FU-01: Require nonzero creation time — refuse to operate without it
-    if ($CreationTime -le 0) {
-        return $result
+    # R15-FU2-01: Convert .NET DateTime ticks to FILETIME ticks for GetProcessTimes comparison
+    $fileTimeTicks = 0
+    if ($ExpectedCreationTime -gt 0) {
+        try {
+            $fileTimeTicks = [System.TimeZoneInfo]::ConvertTimeToUtc(
+                [DateTime]::new($ExpectedCreationTime, [DateTimeKind]::Local)
+            ).ToFileTimeUtc()
+        } catch {
+            $result.Errors += "CreationTime conversion failed: $($_.Exception.Message)"
+        }
     }
 
-    # R14-FU-01: Acquire handle through registry — handle-bound identity, no PID reuse
-    $tempReg = $null
+    # R15-FU2-01: All paths go through finally — no early return bypasses CloseAll
     try {
-        $tempReg = New-Object ProcessHandleRegistry
-        $reg = $tempReg.RegisterProcess($ProcessId, "", "cleanup-verify")
-        if (-not $reg.Success) {
-            $result.FinalAbsent = $true
+        # Validate registry has entries at the expected index
+        $result.EntryCount = $Registry.Count
+        if ($result.EntryCount -eq 0) {
+            $result.Errors += "Registry has no entries"
+            return $result
+        }
+        if ($EntryIndex -ge $result.EntryCount) {
+            $result.Errors += "Entry index $EntryIndex out of range (count=$($result.EntryCount))"
+            return $result
+        }
+        if ($ExpectedCreationTime -le 0) {
+            $result.Errors += "ExpectedCreationTime is zero or negative"
+            return $result
+        }
+        if ($fileTimeTicks -eq 0) {
+            $result.Errors += "FILETIME conversion produced zero"
             return $result
         }
 
+        $result.RegistrationSucceeded = $true
+
+        # Identity verification through held handle (no PID lookup)
+        $entries = $Registry.GetEntries()
+        $entry = $entries[$EntryIndex]
         $result.IdentityVerified = $true
-        $result.IdentityMatched = ($reg.CreationTime -eq $fileTimeTicks)
+        $result.IdentityMatched = ($entry.CreationTime -eq $fileTimeTicks)
 
         if (-not $result.IdentityMatched) {
-            # Identity mismatch — do NOT terminate via handle
+            # Identity mismatch — do NOT terminate; finally closes handle
             return $result
         }
 
-        # Identity verified through held handle — check if already exited
-        $waitStatus = $tempReg.CheckWaitStatus(0)
+        # Check initial wait status through held handle
+        $waitStatus = $Registry.CheckWaitStatus($EntryIndex)
+        $result.InitialWaitOutcome = [string]$waitStatus.Outcome
+
         if ($waitStatus.Exited) {
-            $result.Exited = $true
-            $result.FinalAbsent = $true
+            $result.ExitedVerified = $true
+            $result.FinalWaitOutcome = 'Exited'
             return $result
         }
 
         # Terminate and wait through the held handle (not by PID)
+        $result.TerminateAttempted = $true
         try {
-            $twr = $tempReg.TerminateAndVerify(0, 99, $WaitMs)
-            $result.TerminateRequested = $twr.Terminated
-            $result.Exited = $twr.Wait.Exited
+            $twr = $Registry.TerminateAndVerify($EntryIndex, 99, $WaitMs)
+            $result.TerminateSucceeded = $twr.Terminated
+            $result.FinalWaitOutcome = [string]$twr.Wait.Outcome
+            $result.ExitedVerified = $twr.Wait.Exited
             $result.TimedOut = ($twr.Wait.Outcome -eq 'Timeout')
         } catch {
-            # TerminateAndVerify threw — process may have exited
-            $ws2 = $tempReg.CheckWaitStatus(0)
-            if ($ws2.Exited) { $result.Exited = $true }
-        }
-    } catch {}
-
-    # R14-FU-01: Close held handles and verify structured close success
-    if ($tempReg) {
-        try {
-            $closeResult = $tempReg.CloseAll()
-            if ($closeResult.AllClosed) {
-                $result.FinalAbsent = $true
+            $result.Errors += "TerminateAndVerify exception: $($_.Exception.Message)"
+            # Post-exception: check if process exited anyway
+            try {
+                $ws2 = $Registry.CheckWaitStatus($EntryIndex)
+                if ($ws2.Exited) {
+                    $result.ExitedVerified = $true
+                    $result.FinalWaitOutcome = 'Exited'
+                }
+            } catch {
+                $result.Errors += "Post-exception wait check failed: $($_.Exception.Message)"
             }
-        } catch {}
+        }
+    } catch {
+        $result.Errors += "Helper exception: $($_.Exception.Message)"
+    } finally {
+        # R15-FU2-01: CloseAll attempted exactly once on every path
+        $result.CloseAttempted = $true
+        try {
+            $closeResult = $Registry.CloseAll()
+            $result.CloseAllSucceeded = $closeResult.AllClosed
+            $result.CloseFailedCount = $closeResult.Failed
+        } catch {
+            $result.Errors += "CloseAll exception: $($_.Exception.Message)"
+        }
+        # R13-FU2: Compute Success INSIDE finally so early-return paths
+        # (e.g. already-exited) get a correct Success value after CloseAll runs.
+        $result.Success = $result.IdentityMatched -and $result.ExitedVerified -and $result.CloseAllSucceeded
     }
 
     return $result
@@ -2960,7 +3007,9 @@ function Test-ProcessLevelFaults {
         @{ Name='MetaDuplicateActualPID'; Fault='MetaDuplicateActualPID'; Timeout=$childTimeoutMs; Fast=$true; Type='manifestMeta' },
         # R13-REM-03: Deterministic cleanup identity tests
         @{ Name='CleanupIdentityMatch'; Fault='CleanupIdentityMatch'; Timeout=$childTimeoutMs; Fast=$true; Type='cleanupIdentity' },
-        @{ Name='CleanupIdentityMismatch'; Fault='CleanupIdentityMismatch'; Timeout=$childTimeoutMs; Fast=$true; Type='cleanupIdentity' }
+        @{ Name='CleanupIdentityMismatch'; Fault='CleanupIdentityMismatch'; Timeout=$childTimeoutMs; Fast=$true; Type='cleanupIdentity' },
+        # R15-FU2-04: Deterministic cleanup registration failure fixture
+        @{ Name='CleanupRegistrationFailure'; Fault='CleanupRegistrationFailure'; Timeout=$childTimeoutMs; Fast=$true; Type='cleanupRegFailure' }
     )
 
     foreach ($fixture in $faults) {
@@ -2981,12 +3030,12 @@ function Test-ProcessLevelFaults {
         [ProcessHandleRegistry]::TestHook_FailClose = $false
         [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0
         # R9-REM-02: Expected registration counts per fixture type
-        $expParentCount = if ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'cleanupIdentity')) { 1 } else { 0 }
+        $expParentCount = if ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'cleanupIdentity', 'cleanupRegFailure')) { 1 } else { 0 }
         $expDescendantCount = if ($fault -in @('Timeout', 'CleanupFailure')) { 1 } else { 0 }
 
         try {
             # R8: Pure test fixtures (handleReg, collectorFault, markerLifecycle, nativeApiFault) don't need child processes
-            $launchChild = ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'manifestMeta', 'cleanupIdentity'))
+            $launchChild = ($fixtureType -notin @('handleReg', 'collectorFault', 'markerLifecycle', 'nativeApiFault', 'manifestMeta', 'cleanupIdentity', 'cleanupRegFailure'))
             if ($launchChild) {
                 $fastFlag = if ($useFast) { "-SelfTestFastFault" } else { "" }
                 $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -SelfTestOnly -SelfTestFault $fault $fastFlag -PLFToken $testRunToken -PLFMarkerDir `"$markerDir`""
@@ -3446,12 +3495,13 @@ function Test-ProcessLevelFaults {
                 $withinBudget = ($stdoutCapturedBytes -le $maxStreamBytes) -and ($stderrCapturedBytes -le $maxStreamBytes)
                 if ($fault -eq 'GetProcessTimesFailure') {
                     # Start a real child, set hook, try register → must fail, Gate → VerificationError
-                    # R11-REM-01: Track PID+creation-time for orphan-safe cleanup
+                    # R15-FU2-02: Pre-acquire cleanup handle BEFORE enabling hook
                     $gptProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
                     $gptProcId = $gptProc.Id
-                    # R14-FU-01/02: Register cleanup handle BEFORE enabling hook
                     $gptCleanupReg = New-Object ProcessHandleRegistry
                     $gptCleanupRegOk = $gptCleanupReg.RegisterProcess($gptProcId, $testRunToken, "gpt-cleanup").Success
+                    # R15-FU2-02: Semantic evidence in try; test record in finally after cleanup
+                    $gptSemanticPass = $false; $gptSemanticExpected = ""; $gptSemanticActual = ""
                     try {
                         [ProcessHandleRegistry]::TestHook_FailGetProcessTimes = $true
                         $gptReg = $fixtureRegistry.RegisterProcess($gptProcId, $testRunToken, "gpt-test")
@@ -3459,17 +3509,18 @@ function Test-ProcessLevelFaults {
                         $gptHasError = ($gptReg.Error -match 'GetProcessTimes')
                         $gptOrphan = Test-HandleOrphans -Registry $fixtureRegistry -ExpectedParentCount 1
                         $gptNotClean = ($gptOrphan.Status -ne 'VerifiedClean')
-                        $pass = $gptFailed -and $gptHasError -and $gptNotClean
-                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="Success=false GetProcessTimes err orphan!=VerifiedClean"; Actual="Success=$($gptReg.Success) Error=$($gptReg.Error) orphan=$($gptOrphan.Status)"; Pass=$pass }
+                        $gptSemanticPass = $gptFailed -and $gptHasError -and $gptNotClean
+                        $gptSemanticExpected = "Success=false GetProcessTimes err orphan!=VerifiedClean cleanupOk"
+                        $gptSemanticActual = "Success=$($gptReg.Success) Error=$($gptReg.Error) orphan=$($gptOrphan.Status)"
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailGetProcessTimes = $false
-                        # R14-FU-01/02: Cleanup via pre-acquired handle (identity captured before injection)
-                        if ($gptCleanupReg) {
-                            try { $gptTw = $gptCleanupReg.TerminateAndVerify(0, 99, 3000) } catch {}
-                            try { $gptCl = $gptCleanupReg.CloseAll() } catch {}
-                        } else {
-                            Stop-Process -Id $gptProcId -Force -ErrorAction SilentlyContinue
-                        }
+                        # R15-FU2-02: Cleanup via pre-acquired handle through shared helper
+                        $gptCleanupResult = Stop-Wait-VerifyOwnedProcess -Registry $gptCleanupReg -ExpectedCreationTime $gptProc.StartTime.Ticks
+                        # R15-FU2-02: Gate PASS on semantic AND cleanup evidence
+                        $gptCleanupOk = $gptCleanupResult.Success -and $gptCleanupRegOk
+                        $pass = $gptSemanticPass -and $gptCleanupOk
+                        $gptSemanticActual += " cleanupSuccess=$($gptCleanupResult.Success) exited=$($gptCleanupResult.ExitedVerified) close=$($gptCleanupResult.CloseAllSucceeded) regOk=$gptCleanupRegOk"
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected=$gptSemanticExpected; Actual=$gptSemanticActual; Pass=$pass }
                         $gptProc.Dispose()
                     }
                 } elseif ($fault -eq 'WaitFailure') {
@@ -3477,13 +3528,13 @@ function Test-ProcessLevelFaults {
                     # Registrations are COMPLETE — the failure is in WaitForSingleObject,
                     # not in registration. Must prove: regOk, WAIT_FAILED recognized,
                     # cleanup fails, independent cleanup succeeds.
-                    # R11-REM-01: Track PID/creation-time for orphan-safe cleanup
+                    # R15-FU2-02: Pre-acquire cleanup handle BEFORE enabling hook
                     $waitProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
                     $waitProcId = $waitProc.Id
-                    $waitProcStartTime = $waitProc.StartTime
-                    # R14-FU-01/02: Register cleanup handle BEFORE enabling hook
                     $waitCleanupReg = New-Object ProcessHandleRegistry
                     $waitCleanupRegOk = $waitCleanupReg.RegisterProcess($waitProcId, $testRunToken, "wait-cleanup").Success
+                    # R15-FU2-02: Semantic evidence in try; test record in finally after cleanup
+                    $waitSemanticPass = $false; $waitSemanticExpected = ""; $waitSemanticActual = ""
                     try {
                         $waitReg = $fixtureRegistry.RegisterProcess($waitProcId, $testRunToken, "wait-test")
                         $waitRegOk = $waitReg.Success
@@ -3517,53 +3568,55 @@ function Test-ProcessLevelFaults {
                         $entrySnapshotOk = ($waitCleanup.EntryCount -eq 1)
                         $snapshotPid = if ($waitCleanup.EntrySnapshot.Count -gt 0) { $waitCleanup.EntrySnapshot[0].Pid } else { 0 }
                         $snapshotPidMatch = ($snapshotPid -eq $waitProcId)
-                        # R10-REM-04 + R11-REM-04: All assertions including structured WaitOutcome + deterministic error
-                        $pass = $waitRegOk -and $waitCreationNonzero -and $regComplete -and $notZeroActive -and $waitCleanupFailed -and $hasWaitFailedOutcome -and $hasTerminateError -and $exactErrorCode -and $entrySnapshotOk -and $snapshotPidMatch
-                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk cTime reg=1 active>0 cleanupFail WaitFailed Win32=$expectedWaitErrorCode snap=1"; Actual="reg=$waitRegOk cTime=$waitCreationNonzero reg=$regCountBeforeHook active=$waitActive cFail=$waitCleanupFailed wfOutcome=$hasWaitFailedOutcome wfErr=$hasTerminateError win32=$waitWin32Error exact=$exactErrorCode snap=$($waitCleanup.EntryCount) pid=$snapshotPidMatch"; Pass=$pass }
+                        # R15-FU2-02: Semantic pass (including structured WaitOutcome + deterministic error)
+                        $waitSemanticPass = $waitRegOk -and $waitCreationNonzero -and $regComplete -and $notZeroActive -and $waitCleanupFailed -and $hasWaitFailedOutcome -and $hasTerminateError -and $exactErrorCode -and $entrySnapshotOk -and $snapshotPidMatch
+                        $waitSemanticExpected = "regOk cTime reg=1 active>0 cleanupFail WaitFailed Win32=$expectedWaitErrorCode snap=1 cleanupOk"
+                        $waitSemanticActual = "reg=$waitRegOk cTime=$waitCreationNonzero reg=$regCountBeforeHook active=$waitActive cFail=$waitCleanupFailed wfOutcome=$hasWaitFailedOutcome wfErr=$hasTerminateError win32=$waitWin32Error exact=$exactErrorCode snap=$($waitCleanup.EntryCount) pid=$snapshotPidMatch"
                     } finally {
-                        # R14-FU-01/02: Reset hooks, close test registry, cleanup via pre-acquired handle
+                        # R15-FU2-02: Reset hooks, close test registry, cleanup via pre-acquired handle
                         [ProcessHandleRegistry]::TestHook_FailWait = $false
                         [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0
                         $fixtureRegistry.CloseAll()
-                        if ($waitCleanupReg) {
-                            try { $waitTw = $waitCleanupReg.TerminateAndVerify(0, 99, 3000) } catch {}
-                            try { $waitCRes = $waitCleanupReg.CloseAll() } catch {}
-                        } else {
-                            Stop-Process -Id $waitProcId -Force -ErrorAction SilentlyContinue
-                        }
+                        $waitCleanupResult = Stop-Wait-VerifyOwnedProcess -Registry $waitCleanupReg -ExpectedCreationTime $waitProc.StartTime.Ticks
+                        # R15-FU2-02: Gate PASS on semantic AND cleanup evidence
+                        $waitCleanupOk = $waitCleanupResult.Success -and $waitCleanupRegOk
+                        $pass = $waitSemanticPass -and $waitCleanupOk
+                        $waitSemanticActual += " cleanupSuccess=$($waitCleanupResult.Success) exited=$($waitCleanupResult.ExitedVerified) close=$($waitCleanupResult.CloseAllSucceeded) regOk=$waitCleanupRegOk"
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected=$waitSemanticExpected; Actual=$waitSemanticActual; Pass=$pass }
                         $waitProc.Dispose()
                     }
                 } elseif ($fault -eq 'CloseHandleFailure') {
                     # Start a real child, register, then set Close hook and verify close reports failure
-                    # R11-REM-01: Track PID for orphan-safe cleanup
+                    # R15-FU2-02: Pre-acquire cleanup handle BEFORE enabling hook; terminate via held handle
                     $closeProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
                     $closeProcId = $closeProc.Id
-                    # R14-FU-01/02: Register cleanup handle BEFORE enabling hook
                     $closeCleanupReg = New-Object ProcessHandleRegistry
                     $closeCleanupRegOk = $closeCleanupReg.RegisterProcess($closeProcId, $testRunToken, "close-cleanup").Success
+                    # R15-FU2-02: Semantic evidence in try; test record in finally after cleanup
+                    $closeSemanticPass = $false; $closeSemanticExpected = ""; $closeSemanticActual = ""
                     try {
                         $closeReg = $fixtureRegistry.RegisterProcess($closeProcId, $testRunToken, "close-test")
                         $closeRegOk = $closeReg.Success
-                        # Terminate normally first
+                        # R15-FU2-02: Terminate via held handle (not PID)
                         [ProcessHandleRegistry]::TestHook_FailWait = $false
-                        Stop-Process -Id $closeProcId -Force -ErrorAction SilentlyContinue
-                        Start-Sleep -Milliseconds 500
+                        $closeTermResult = $fixtureRegistry.TerminateAndVerify(0, 99, 3000)
                         # Now set close hook — CloseAll should report failures
                         [ProcessHandleRegistry]::TestHook_FailClose = $true
                         $closeResult = $fixtureRegistry.CloseAll()
                         $closeReportedFail = (-not $closeResult.AllClosed)
                         $closeHasFailures = ($closeResult.Failed -gt 0)
-                        $pass = $closeRegOk -and $closeReportedFail -and $closeHasFailures
-                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="regOk closeFailed failed>0"; Actual="reg=$closeRegOk allClosed=$($closeResult.AllClosed) failed=$($closeResult.Failed)/$($closeResult.Attempted)"; Pass=$pass }
+                        $closeSemanticPass = $closeRegOk -and $closeReportedFail -and $closeHasFailures
+                        $closeSemanticExpected = "regOk closeFailed failed>0 cleanupOk"
+                        $closeSemanticActual = "reg=$closeRegOk allClosed=$($closeResult.AllClosed) failed=$($closeResult.Failed)/$($closeResult.Attempted)"
                     } finally {
                         [ProcessHandleRegistry]::TestHook_FailClose = $false
-                        # R14-FU-01/02: Cleanup via pre-acquired handle (process already terminated in test)
-                        if ($closeCleanupReg) {
-                            try { $closeTw = $closeCleanupReg.TerminateAndVerify(0, 99, 3000) } catch {}
-                            try { $closeCRes = $closeCleanupReg.CloseAll() } catch {}
-                        } else {
-                            Stop-Process -Id $closeProcId -Force -ErrorAction SilentlyContinue
-                        }
+                        # R15-FU2-02: Cleanup via pre-acquired handle through shared helper
+                        $closeCleanupResult = Stop-Wait-VerifyOwnedProcess -Registry $closeCleanupReg -ExpectedCreationTime $closeProc.StartTime.Ticks
+                        # R15-FU2-02: Gate PASS on semantic AND cleanup evidence
+                        $closeCleanupOk = $closeCleanupResult.Success -and $closeCleanupRegOk
+                        $pass = $closeSemanticPass -and $closeCleanupOk
+                        $closeSemanticActual += " cleanupSuccess=$($closeCleanupResult.Success) exited=$($closeCleanupResult.ExitedVerified) close=$($closeCleanupResult.CloseAllSucceeded) regOk=$closeCleanupRegOk"
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected=$closeSemanticExpected; Actual=$closeSemanticActual; Pass=$pass }
                         $closeProc.Dispose()
                     }
                 } else {
@@ -3859,79 +3912,137 @@ function Test-ProcessLevelFaults {
                 }
             }
             'cleanupIdentity' {
-                # R13-REM-03: Deterministic cleanup identity tests
+                # R15-FU2-03: Deterministic cleanup identity tests — prove handle lifecycle
                 if ($fault -eq 'CleanupIdentityMatch') {
-                    # R14-FU-01/04: Handle-based cleanup — pre-register handle, verify through held handle
+                    # R15-FU2-03: Handle-based cleanup through shared helper with pre-acquired registry.
+                    # Helper consumes the registry (CloseAll in finally). No PID fallback.
                     $matchProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
                     $matchProcId = $matchProc.Id
                     $matchCreationTime = $matchProc.StartTime.Ticks
-                    $matchCleanupReg = New-Object ProcessHandleRegistry
-                    $matchCleanupRegOk = $matchCleanupReg.RegisterProcess($matchProcId, $testRunToken, "match-cleanup").Success
+                    # R15-FU2-03: Pre-acquire handle for the helper to consume
+                    $matchTargetReg = New-Object ProcessHandleRegistry
+                    $matchTargetRegOk = $matchTargetReg.RegisterProcess($matchProcId, $testRunToken, "match-target").Success
                     try {
-                        # Verify identity match → successful termination
-                        $matchResult = Stop-Wait-VerifyOwnedProcess -ProcessId $matchProcId -CreationTime $matchCreationTime
+                        # R15-FU2-03: Call helper with pre-acquired registry (not PID)
+                        $matchResult = Stop-Wait-VerifyOwnedProcess -Registry $matchTargetReg -ExpectedCreationTime $matchCreationTime
+                        # Prove: identity matched, terminated, exited, handles closed
                         $identityOk = $matchResult.IdentityMatched -and $matchResult.IdentityVerified
-                        $termOk = $matchResult.TerminateRequested -and $matchResult.Exited
-                        $absentOk = $matchResult.FinalAbsent
-                        # R14-FU-04: Verify cleanup handle was pre-acquired
-                        $handlePreAcquired = $matchCleanupRegOk
-                        $pass = $identityOk -and $termOk -and $absentOk -and $handlePreAcquired
-                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="identity match + terminate + absent + handle pre-acquired"; Actual="identity=$identityOk verified=$($matchResult.IdentityVerified) term=$($matchResult.TerminateRequested) exited=$($matchResult.Exited) absent=$absentOk handle=$handlePreAcquired"; Pass=$pass }
+                        $termOk = $matchResult.TerminateAttempted -and $matchResult.TerminateSucceeded -and $matchResult.ExitedVerified
+                        $closeOk = $matchResult.CloseAllSucceeded
+                        $handlePreAcquired = $matchTargetRegOk
+                        $pass = $identityOk -and $termOk -and $closeOk -and $handlePreAcquired
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="identity match + terminate + exited + close + handle pre-acquired"; Actual="identity=$identityOk verified=$($matchResult.IdentityVerified) matched=$($matchResult.IdentityMatched) term=$($matchResult.TerminateAttempted) succeeded=$($matchResult.TerminateSucceeded) exited=$($matchResult.ExitedVerified) close=$closeOk handle=$handlePreAcquired"; Pass=$pass }
                     } finally {
-                        # R14-FU-01: Handle-based cleanup — terminate and close through pre-acquired handle
-                        if ($matchCleanupReg) {
-                            try { $matchTw = $matchCleanupReg.TerminateAndVerify(0, 99, 3000) } catch {}
-                            try { $matchCRes = $matchCleanupReg.CloseAll() } catch {}
-                        } else {
-                            Stop-Process -Id $matchProcId -Force -ErrorAction SilentlyContinue
-                        }
+                        # R15-FU2-03: Helper already closed registry in its finally; just dispose
                         $matchProc.Dispose()
                     }
                 } elseif ($fault -eq 'CleanupIdentityMismatch') {
-                    # R14-FU-01/04: Start TWO processes with pre-registered cleanup handles.
-                    # Prove mismatch causes no termination on the target, then clean both via handles.
+                    # R15-FU2-03: Start TWO processes. Prove mismatch causes no termination.
+                    # Three registries: target (consumed by helper), owned cleanup, other cleanup.
                     $ownedProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 10`"" -PassThru -WindowStyle Hidden
                     $ownedProcId = $ownedProc.Id
                     $otherProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 10`"" -PassThru -WindowStyle Hidden
                     $otherProcId = $otherProc.Id
                     $otherCreationTime = $otherProc.StartTime.Ticks
-                    # R14-FU-01: Pre-register cleanup handles BEFORE test
+                    # R15-FU2-03: Pre-acquire TARGET handle for helper to consume
+                    $ownedTargetReg = New-Object ProcessHandleRegistry
+                    $ownedTargetRegOk = $ownedTargetReg.RegisterProcess($ownedProcId, $testRunToken, "mismatch-target").Success
+                    # R15-FU2-03: Pre-acquire CLEANUP handle for outer finally
                     $ownedCleanupReg = New-Object ProcessHandleRegistry
-                    $ownedCleanupRegOk = $ownedCleanupReg.RegisterProcess($ownedProcId, $testRunToken, "mismatch-owned").Success
+                    $ownedCleanupRegOk = $ownedCleanupReg.RegisterProcess($ownedProcId, $testRunToken, "mismatch-cleanup").Success
+                    # R15-FU2-03: Pre-acquire OTHER cleanup handle
                     $otherCleanupReg = New-Object ProcessHandleRegistry
                     $otherCleanupRegOk = $otherCleanupReg.RegisterProcess($otherProcId, $testRunToken, "mismatch-other").Success
                     try {
-                        # Use owned PID with OTHER process's creation time → mismatch
-                        $mismatchResult = Stop-Wait-VerifyOwnedProcess -ProcessId $ownedProcId -CreationTime $otherCreationTime
+                        # R15-FU2-03: Call helper with target reg and wrong creation time → mismatch
+                        $mismatchResult = Stop-Wait-VerifyOwnedProcess -Registry $ownedTargetReg -ExpectedCreationTime $otherCreationTime
                         # Must NOT have terminated the owned process
-                        $noTerm = (-not $mismatchResult.TerminateRequested) -and (-not $mismatchResult.Exited)
+                        $noTerm = (-not $mismatchResult.TerminateAttempted)
                         $identityMismatch = $mismatchResult.IdentityVerified -and (-not $mismatchResult.IdentityMatched)
-                        # R14-FU-04: Owned process must still be alive (verified via held handle, not PID)
+                        # R15-FU2-03: Owned still alive via cleanup handle (not PID lookup)
                         $ownedStillAlive = (-not $ownedCleanupReg.CheckWaitStatus(0).Exited)
-                        # R14-FU-04: Verify cleanup handles were pre-acquired
-                        $handlesPreAcquired = $ownedCleanupRegOk -and $otherCleanupRegOk
+                        # R15-FU2-03: All three handles pre-acquired
+                        $handlesPreAcquired = $ownedTargetRegOk -and $ownedCleanupRegOk -and $otherCleanupRegOk
                         $pass = $noTerm -and $identityMismatch -and $ownedStillAlive -and $handlesPreAcquired
                         $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="identity mismatch + no term + still alive + handles pre-acquired"; Actual="noTerm=$noTerm idMismatch=$identityMismatch verified=$($mismatchResult.IdentityVerified) matched=$($mismatchResult.IdentityMatched) alive=$ownedStillAlive handles=$handlesPreAcquired"; Pass=$pass }
                     } finally {
-                        # R14-FU-01: Handle-based cleanup for both processes
+                        # R15-FU2-03: Safe outer cleanup via continuously held cleanup handles
+                        # Owned: terminate+wait+close via cleanup reg (target reg already consumed by helper)
+                        $ownedTermOk = $false; $ownedCloseOk = $false
+                        $otherTermOk = $false; $otherCloseOk = $false
                         if ($ownedCleanupReg) {
-                            try { $ownedTw = $ownedCleanupReg.TerminateAndVerify(0, 99, 3000) } catch {}
-                            try { $ownedCRes = $ownedCleanupReg.CloseAll() } catch {}
-                        } else {
-                            Stop-Process -Id $ownedProcId -Force -ErrorAction SilentlyContinue
+                            try {
+                                $ownedTw = $ownedCleanupReg.TerminateAndVerify(0, 99, 3000)
+                                $ownedTermOk = $ownedTw.Terminated -and $ownedTw.Wait.Exited
+                            } catch {}
+                            try {
+                                $ownedCRes = $ownedCleanupReg.CloseAll()
+                                $ownedCloseOk = $ownedCRes.AllClosed
+                            } catch {}
                         }
                         $ownedProc.Dispose()
+                        # Other: terminate+wait+close via other cleanup reg
                         if ($otherCleanupReg) {
-                            try { $otherTw = $otherCleanupReg.TerminateAndVerify(0, 99, 3000) } catch {}
-                            try { $otherCRes = $otherCleanupReg.CloseAll() } catch {}
-                        } else {
-                            Stop-Process -Id $otherProcId -Force -ErrorAction SilentlyContinue
+                            try {
+                                $otherTw = $otherCleanupReg.TerminateAndVerify(0, 99, 3000)
+                                $otherTermOk = $otherTw.Terminated -and $otherTw.Wait.Exited
+                            } catch {}
+                            try {
+                                $otherCRes = $otherCleanupReg.CloseAll()
+                                $otherCloseOk = $otherCRes.AllClosed
+                            } catch {}
                         }
                         $otherProc.Dispose()
+                        # R15-FU2-03: Gate PASS includes outer cleanup results
+                        $pass = $pass -and $ownedTermOk -and $ownedCloseOk -and $otherTermOk -and $otherCloseOk
                     }
                 } else {
                     $pass = $false
                     $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known cleanupIdentity"; Actual="unknown"; Pass=$pass }
+                }
+            }
+            'cleanupRegFailure' {
+                # R15-FU2-04: Deterministic cleanup registration failure fixture
+                if ($fault -eq 'CleanupRegistrationFailure') {
+                    # Start a real process, pre-acquire backup handle, inject registration
+                    # failure in a separate cleanup registry, verify fail-closed behavior.
+                    # No PID termination fallback.
+                    $crgProc = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+                    $crgProcId = $crgProc.Id
+                    # R15-FU2-04: Pre-acquire backup handle BEFORE hook injection
+                    $crgBackupReg = New-Object ProcessHandleRegistry
+                    $crgBackupRegOk = $crgBackupReg.RegisterProcess($crgProcId, $testRunToken, "crg-backup").Success
+                    # Separate cleanup authority registry (will fail)
+                    $crgCleanupReg = New-Object ProcessHandleRegistry
+                    $crgSemanticPass = $false; $crgSemanticExpected = ""; $crgSemanticActual = ""
+                    try {
+                        # R15-FU2-04: Inject registration failure via hook
+                        [ProcessHandleRegistry]::TestHook_FailGetProcessTimes = $true
+                        # Attempt cleanup registration → must fail
+                        $crgRegResult = $crgCleanupReg.RegisterProcess($crgProcId, $testRunToken, "crg-cleanup")
+                        $crgRegFailed = (-not $crgRegResult.Success)
+                        $crgHasError = (-not [string]::IsNullOrEmpty($crgRegResult.Error))
+                        # Verify no entries in failed cleanup registry
+                        $crgNoEntries = ($crgCleanupReg.Count -eq 0)
+                        # Verify backup was pre-acquired and valid
+                        $crgBackupOk = $crgBackupRegOk -and ($crgBackupReg.Count -eq 1)
+                        # R15-FU2-04: All assertions — failure is structural, backup is valid
+                        $crgSemanticPass = $crgRegFailed -and $crgHasError -and $crgNoEntries -and $crgBackupOk
+                        $crgSemanticExpected = "regFailed hasError noEntries backupOk backupCleanupOk"
+                        $crgSemanticActual = "regFailed=$crgRegFailed hasError=$crgHasError noEntries=$crgNoEntries backupOk=$crgBackupOk error=$($crgRegResult.Error)"
+                    } finally {
+                        [ProcessHandleRegistry]::TestHook_FailGetProcessTimes = $false
+                        # R15-FU2-04: Use backup handle for safe cleanup — NO PID fallback
+                        $crgBackupResult = Stop-Wait-VerifyOwnedProcess -Registry $crgBackupReg -ExpectedCreationTime $crgProc.StartTime.Ticks
+                        # R15-FU2-04: Gate PASS on semantic AND backup cleanup
+                        $pass = $crgSemanticPass -and $crgBackupResult.Success
+                        $crgSemanticActual += " backupSuccess=$($crgBackupResult.Success) exited=$($crgBackupResult.ExitedVerified) close=$($crgBackupResult.CloseAllSucceeded)"
+                        $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected=$crgSemanticExpected; Actual=$crgSemanticActual; Pass=$pass }
+                        $crgProc.Dispose()
+                    }
+                } else {
+                    $pass = $false
+                    $tests += [PSCustomObject]@{ Name="Fault=$fault"; Expected="known cleanupRegFailure"; Actual="unknown"; Pass=$pass }
                 }
             }
         }
