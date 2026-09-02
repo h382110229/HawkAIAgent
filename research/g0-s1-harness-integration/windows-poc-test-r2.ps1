@@ -2126,8 +2126,14 @@ function Invoke-SelfTestAggregation {
             }
         }
         # R15-FU5-03: Deterministic assertion — displayed sum must equal R15Total
+        # and each included suite appears exactly once
         if ($formulaSum -ne $R15Total) {
             Write-Host "  FAIL: R15 formula sum ($formulaSum) != R15Total ($R15Total)" -ForegroundColor Red
+        }
+        $recordedR15Count = 0
+        foreach ($sn in $r15Suites) { if ($SuiteResults[$sn]) { $recordedR15Count++ } }
+        if ($formulaParts.Count -ne $recordedR15Count) {
+            Write-Host "  FAIL: R15 formula part count ($($formulaParts.Count)) != recorded R15 suite count ($recordedR15Count)" -ForegroundColor Red
         }
         Write-Host "R15 helper tests: $($formulaParts -join ' + ') = $R15Total"
     }
@@ -4277,6 +4283,8 @@ function Test-FocusedNegatives {
     $negBackup5aOk = $negBackup5a.RegisterProcess($negProc5a.Id, "neg", "neg-5a-backup").Success
     $negBackup5b = New-Object ProcessHandleRegistry
     $negBackup5bOk = $negBackup5b.RegisterProcess($negProc5b.Id, "neg", "neg-5b-backup").Success
+    # R15-FU5-02: Initialize before try so post-finally code can access them
+    $neg5BaselineTrue = $false; $neg5PredResult = $false; $neg5ExMsg = $null
     try {
         # Set up mismatch fixture
         $negMReg5 = New-Object ProcessHandleRegistry
@@ -4320,17 +4328,24 @@ function Test-FocusedNegatives {
             -TargetCloseAllOk $negMTargetClose5 `
             -OuterOwnedOk $negOwnedOk5 -OuterOtherOk $negOtherOk5 `
             -NoException $negNoExc5 -NoCleanupError $negNoCleanupErr5
-        $neg5Pass = $neg5BaselineTrue -and (-not $neg5PredResult) # baseline true, altered false
-        $negTests += [PSCustomObject]@{ Name="Neg4-OwnedOuterCleanupFail"; Pass=$neg5Pass;
-            Actual="BaselineTrue=$neg5BaselineTrue AlteredResult=$neg5PredResult ownedOk=$negOwnedOk5 otherOk=$negOtherOk5 handles=$negHandles5 noTerm=$negMNoTerm5 idMismatch=$negMIdMismatch5 alive=$negMStillAlive5 targetClose=$negMTargetClose5" }
     } catch {
         [ProcessHandleRegistry]::TestHook_FailClose = $false
-        $neg5Pass = $false
-        $negTests += [PSCustomObject]@{ Name="Neg4-OwnedOuterCleanupFail"; Pass=$false; Actual="EXCEPTION: $($_.Exception.Message)" }
+        $neg5ExMsg = $_.Exception.Message
     } finally {
         [ProcessHandleRegistry]::TestHook_FailClose = $false
         $negBackup5aResult = Stop-Wait-VerifyOwnedProcess -Registry $negBackup5a -ExpectedCreationTime $negCreation5a
         $negBackup5bResult = Stop-Wait-VerifyOwnedProcess -Registry $negBackup5b -ExpectedCreationTime $negCreation5b
+    }
+    # R15-FU5-02: PASS computed after finally; gates backup cleanup results
+    if ($neg5ExMsg) {
+        $negTests += [PSCustomObject]@{ Name="Neg4-OwnedOuterCleanupFail"; Pass=$false; Actual="EXCEPTION: $neg5ExMsg" }
+    } else {
+        $neg5Pass = $neg5BaselineTrue -and (-not $neg5PredResult) -and
+            $negBackup5aOk -and $negBackup5bOk -and
+            $negBackup5aResult.Success -and $negBackup5aResult.ExitedVerified -and $negBackup5aResult.CloseAllSucceeded -and ($negBackup5aResult.Errors.Count -eq 0) -and
+            $negBackup5bResult.Success -and $negBackup5bResult.ExitedVerified -and $negBackup5bResult.CloseAllSucceeded -and ($negBackup5bResult.Errors.Count -eq 0)
+        $negTests += [PSCustomObject]@{ Name="Neg4-OwnedOuterCleanupFail"; Pass=$neg5Pass;
+            Actual="BaselineTrue=$neg5BaselineTrue AlteredResult=$neg5PredResult ownedOk=$negOwnedOk5 otherOk=$negOtherOk5 handles=$negHandles5 noTerm=$negMNoTerm5 idMismatch=$negMIdMismatch5 alive=$negMStillAlive5 targetClose=$negMTargetClose5 bk5aReg=$negBackup5aOk bk5bReg=$negBackup5bOk bk5aSucc=$($negBackup5aResult.Success) bk5aExit=$($negBackup5aResult.ExitedVerified) bk5aClose=$($negBackup5aResult.CloseAllSucceeded) bk5aErr=$($negBackup5aResult.Errors.Count) bk5bSucc=$($negBackup5bResult.Success) bk5bExit=$($negBackup5bResult.ExitedVerified) bk5bClose=$($negBackup5bResult.CloseAllSucceeded) bk5bErr=$($negBackup5bResult.Errors.Count)" }
     }
 
     # --- Neg-5: Other outer-cleanup failure makes CleanupIdentityMismatch result false ---
@@ -4344,6 +4359,8 @@ function Test-FocusedNegatives {
     $negBackup6aOk = $negBackup6a.RegisterProcess($negProc6a.Id, "neg", "neg-6a-backup").Success
     $negBackup6b = New-Object ProcessHandleRegistry
     $negBackup6bOk = $negBackup6b.RegisterProcess($negProc6b.Id, "neg", "neg-6b-backup").Success
+    # R15-FU5-02: Initialize before try so post-finally code can access them
+    $neg6BaselineTrue = $false; $neg6PredResult = $false; $neg6ExMsg = $null
     try {
         # Set up mismatch fixture
         $negMReg6 = New-Object ProcessHandleRegistry
@@ -4387,17 +4404,24 @@ function Test-FocusedNegatives {
             -TargetCloseAllOk $negMTargetClose6 `
             -OuterOwnedOk $negOwnedOk6 -OuterOtherOk $negOtherOk6 `
             -NoException $negNoExc6 -NoCleanupError $negNoCleanupErr6
-        $neg6Pass = $neg6BaselineTrue -and (-not $neg6PredResult) # baseline true, altered false
-        $negTests += [PSCustomObject]@{ Name="Neg5-OtherOuterCleanupFail"; Pass=$neg6Pass;
-            Actual="BaselineTrue=$neg6BaselineTrue AlteredResult=$neg6PredResult ownedOk=$negOwnedOk6 otherOk=$negOtherOk6 handles=$negHandles6 noTerm=$negMNoTerm6 idMismatch=$negMIdMismatch6 alive=$negMStillAlive6 targetClose=$negMTargetClose6" }
     } catch {
         [ProcessHandleRegistry]::TestHook_FailClose = $false
-        $neg6Pass = $false
-        $negTests += [PSCustomObject]@{ Name="Neg5-OtherOuterCleanupFail"; Pass=$false; Actual="EXCEPTION: $($_.Exception.Message)" }
+        $neg6ExMsg = $_.Exception.Message
     } finally {
         [ProcessHandleRegistry]::TestHook_FailClose = $false
         $negBackup6aResult = Stop-Wait-VerifyOwnedProcess -Registry $negBackup6a -ExpectedCreationTime $negCreation6a
         $negBackup6bResult = Stop-Wait-VerifyOwnedProcess -Registry $negBackup6b -ExpectedCreationTime $negCreation6b
+    }
+    # R15-FU5-02: PASS computed after finally; gates backup cleanup results
+    if ($neg6ExMsg) {
+        $negTests += [PSCustomObject]@{ Name="Neg5-OtherOuterCleanupFail"; Pass=$false; Actual="EXCEPTION: $neg6ExMsg" }
+    } else {
+        $neg6Pass = $neg6BaselineTrue -and (-not $neg6PredResult) -and
+            $negBackup6aOk -and $negBackup6bOk -and
+            $negBackup6aResult.Success -and $negBackup6aResult.ExitedVerified -and $negBackup6aResult.CloseAllSucceeded -and ($negBackup6aResult.Errors.Count -eq 0) -and
+            $negBackup6bResult.Success -and $negBackup6bResult.ExitedVerified -and $negBackup6bResult.CloseAllSucceeded -and ($negBackup6bResult.Errors.Count -eq 0)
+        $negTests += [PSCustomObject]@{ Name="Neg5-OtherOuterCleanupFail"; Pass=$neg6Pass;
+            Actual="BaselineTrue=$neg6BaselineTrue AlteredResult=$neg6PredResult ownedOk=$negOwnedOk6 otherOk=$negOtherOk6 handles=$negHandles6 noTerm=$negMNoTerm6 idMismatch=$negMIdMismatch6 alive=$negMStillAlive6 targetClose=$negMTargetClose6 bk6aReg=$negBackup6aOk bk6bReg=$negBackup6bOk bk6aSucc=$($negBackup6aResult.Success) bk6aExit=$($negBackup6aResult.ExitedVerified) bk6aClose=$($negBackup6aResult.CloseAllSucceeded) bk6aErr=$($negBackup6aResult.Errors.Count) bk6bSucc=$($negBackup6bResult.Success) bk6bExit=$($negBackup6bResult.ExitedVerified) bk6bClose=$($negBackup6bResult.CloseAllSucceeded) bk6bErr=$($negBackup6bResult.Errors.Count)" }
     }
 
     # --- Neg-6: Diagnostic fields exposed on WaitFailure ---
