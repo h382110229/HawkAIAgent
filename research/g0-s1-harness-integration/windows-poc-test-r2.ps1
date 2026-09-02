@@ -2704,19 +2704,27 @@ function Stop-Wait-VerifyOwnedProcess {
         } catch {
             $result.Errors += "CloseAll exception: $($_.Exception.Message)"
         }
-        # R13-FU3-02: Fail-closed Success — every mandatory invariant must hold
-        $result.Success = $result.RegistrationSucceeded -and
-            ($result.EntryCount -eq $result.ExpectedEntryCount) -and
-            $result.IdentityVerified -and
-            $result.IdentityMatched -and
-            $result.ExitedVerified -and
-            $result.CloseAttempted -and
-            $result.CloseAllSucceeded -and
-            ($result.CloseFailedCount -eq 0) -and
-            ($result.Errors.Count -eq 0)
+        # R13-FU3-02: Fail-closed Success — shared predicate (R14-FU4-03)
+        $result.Success = Test-HelperSuccess -Result $result
     }
 
     return $result
+}
+
+# R14-FU4-03: Shared fail-closed success predicate for Stop-Wait-VerifyOwnedProcess.
+# Used by the helper's finally block AND by focused negative tests to avoid
+# duplicating the PASS formula in a test-only block.
+function Test-HelperSuccess {
+    param([PSCustomObject]$Result)
+    return ($Result.RegistrationSucceeded -and
+        ($Result.EntryCount -eq $Result.ExpectedEntryCount) -and
+        $Result.IdentityVerified -and
+        $Result.IdentityMatched -and
+        $Result.ExitedVerified -and
+        $Result.CloseAttempted -and
+        $Result.CloseAllSucceeded -and
+        ($Result.CloseFailedCount -eq 0) -and
+        ($Result.Errors.Count -eq 0))
 }
 
 function Test-ProcessLevelFaults {
@@ -4120,7 +4128,145 @@ function Test-ProcessLevelFaults {
     foreach ($t in $tests) { $color = if ($t.Pass) { "Green" } else { "Red" }; Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) (expected=$($t.Expected) actual=$($t.Actual))" -ForegroundColor $color }
     if (-not $orphanFree) { Write-Host "  FAIL: Orphaned test processes detected after cleanup" -ForegroundColor Red }
 
+    # R14-FU4-03: Run focused negative tests using the same production predicates
+    # that determine the real fixture result. Durable, committed, runtime-derived.
+    $negPassed = Test-FocusedNegatives
+    if (-not $negPassed) { $allPassed = $false }
+
     return $allPassed
+}
+
+# R14-FU4-03: Focused negative evidence using production predicates/helpers.
+# Proves deterministic failure modes of Stop-Wait-VerifyOwnedProcess and
+# CleanupIdentityMismatch's stored result, using the shared Test-HelperSuccess
+# predicate (not a copied formula).
+function Test-FocusedNegatives {
+    $allNegPassed = $true
+    $negTests = @()
+
+    # --- Neg-1: Extra registry entry makes helper Success false ---
+    $negProc1 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+    $negProc2 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+    try {
+        $negReg1 = New-Object ProcessHandleRegistry
+        $negReg1.RegisterProcess($negProc1.Id, "neg", "neg-1") | Out-Null
+        $negReg1.RegisterProcess($negProc2.Id, "neg", "neg-2") | Out-Null
+        $negR1 = Stop-Wait-VerifyOwnedProcess -Registry $negReg1 -ExpectedCreationTime $negProc1.StartTime.Ticks -ExpectedEntryCount 1
+        $neg1Pass = (-not (Test-HelperSuccess -Result $negR1))
+        $negTests += [PSCustomObject]@{ Name="Neg1-ExtraEntry"; Pass=$neg1Pass; Actual="Success=$($negR1.Success) EntryCount=$($negR1.EntryCount) ExpectedEntryCount=$($negR1.ExpectedEntryCount)" }
+    } finally {
+        $negProc1.Dispose(); $negProc2.Dispose()
+    }
+
+    # --- Neg-2: Nonempty Errors makes helper Success false ---
+    $negProc3 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+    try {
+        $negReg2 = New-Object ProcessHandleRegistry
+        $negReg2.RegisterProcess($negProc3.Id, "neg", "neg-3") | Out-Null
+        $negR2 = Stop-Wait-VerifyOwnedProcess -Registry $negReg2 -ExpectedCreationTime $negProc3.StartTime.Ticks
+        # Clean result should be Success=true; inject error to prove fail-closed
+        $negR2.Errors += "Injected test error"
+        $neg2Pass = (-not (Test-HelperSuccess -Result $negR2))
+        $negTests += [PSCustomObject]@{ Name="Neg2-NonemptyErrors"; Pass=$neg2Pass; Actual="Success(pre-inject)=$($negR2.Success) Errors.Count=$($negR2.Errors.Count)" }
+    } finally {
+        $negProc3.Dispose()
+    }
+
+    # --- Neg-3: CloseAll failure makes helper Success false ---
+    # Uses pre-acquired backup handle for safe cleanup (no PID-only fallback)
+    $negProc4 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+    $negBackup4 = New-Object ProcessHandleRegistry
+    $negBackup4Ok = $negBackup4.RegisterProcess($negProc4.Id, "neg", "neg-4-backup").Success
+    try {
+        $negReg3 = New-Object ProcessHandleRegistry
+        $negReg3.RegisterProcess($negProc4.Id, "neg", "neg-4") | Out-Null
+        [ProcessHandleRegistry]::TestHook_FailClose = $true
+        $negR3 = Stop-Wait-VerifyOwnedProcess -Registry $negReg3 -ExpectedCreationTime $negProc4.StartTime.Ticks
+        [ProcessHandleRegistry]::TestHook_FailClose = $false
+        $neg3Pass = (-not (Test-HelperSuccess -Result $negR3)) -and (-not $negR3.CloseAllSucceeded)
+        $negTests += [PSCustomObject]@{ Name="Neg3-CloseAllFailure"; Pass=$neg3Pass; Actual="Success=$($negR3.Success) CloseAllSucceeded=$($negR3.CloseAllSucceeded)" }
+    } finally {
+        [ProcessHandleRegistry]::TestHook_FailClose = $false
+        # Pre-acquired backup handle cleans up safely
+        $negBackup4Result = Stop-Wait-VerifyOwnedProcess -Registry $negBackup4 -ExpectedCreationTime $negProc4.StartTime.Ticks
+        $negProc4.Dispose()
+    }
+
+    # --- Neg-4: Owned outer-cleanup failure makes CleanupIdentityMismatch result false ---
+    # Mismatch helper: identity mismatch -> no termination -> outer cleanup fails via hook
+    $negProc5 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 10`"" -PassThru -WindowStyle Hidden
+    $negCreation5 = $negProc5.StartTime.Ticks
+    $negReg5 = New-Object ProcessHandleRegistry
+    $negReg5.RegisterProcess($negProc5.Id, "neg", "neg-5-mismatch") | Out-Null
+    $negBackup5 = New-Object ProcessHandleRegistry
+    $negBackup5.RegisterProcess($negProc5.Id, "neg", "neg-5-backup") | Out-Null
+    $wrongTime5 = (Get-Date).AddDays(-1).Ticks
+    try {
+        [ProcessHandleRegistry]::TestHook_FailClose = $true
+        $negR5 = Stop-Wait-VerifyOwnedProcess -Registry $negReg5 -ExpectedCreationTime $wrongTime5
+        [ProcessHandleRegistry]::TestHook_FailClose = $false
+        # Mismatch stored result: helper Success + outer CloseAll -> must be false
+        $neg5StoredResult = (Test-HelperSuccess -Result $negR5) -and $negR5.CloseAllSucceeded
+        $neg5Pass = (-not $neg5StoredResult)
+        $negTests += [PSCustomObject]@{ Name="Neg4-OwnedOuterCleanupFail"; Pass=$neg5Pass; Actual="HelperSuccess=$($negR5.Success) CloseAllSucceeded=$($negR5.CloseAllSucceeded) StoredResult=$neg5StoredResult" }
+    } finally {
+        [ProcessHandleRegistry]::TestHook_FailClose = $false
+        $negBackup5Result = Stop-Wait-VerifyOwnedProcess -Registry $negBackup5 -ExpectedCreationTime $negCreation5
+        $negProc5.Dispose()
+    }
+
+    # --- Neg-5: Other outer-cleanup failure makes CleanupIdentityMismatch result false ---
+    # Match helper: identity match -> terminate -> exit -> outer cleanup fails via hook
+    $negProc6 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 10`"" -PassThru -WindowStyle Hidden
+    $negCreation6 = $negProc6.StartTime.Ticks
+    $negReg6 = New-Object ProcessHandleRegistry
+    $negReg6.RegisterProcess($negProc6.Id, "neg", "neg-6-match") | Out-Null
+    $negBackup6 = New-Object ProcessHandleRegistry
+    $negBackup6.RegisterProcess($negProc6.Id, "neg", "neg-6-backup") | Out-Null
+    try {
+        [ProcessHandleRegistry]::TestHook_FailClose = $true
+        $negR6 = Stop-Wait-VerifyOwnedProcess -Registry $negReg6 -ExpectedCreationTime $negCreation6
+        [ProcessHandleRegistry]::TestHook_FailClose = $false
+        # Match stored result: helper Success + outer CloseAll -> must be false
+        $neg6StoredResult = (Test-HelperSuccess -Result $negR6) -and $negR6.CloseAllSucceeded
+        $neg6Pass = (-not $neg6StoredResult)
+        $negTests += [PSCustomObject]@{ Name="Neg5-OtherOuterCleanupFail"; Pass=$neg6Pass; Actual="HelperSuccess=$($negR6.Success) ExitedVerified=$($negR6.ExitedVerified) CloseAllSucceeded=$($negR6.CloseAllSucceeded) StoredResult=$neg6StoredResult" }
+    } finally {
+        [ProcessHandleRegistry]::TestHook_FailClose = $false
+        $negBackup6Result = Stop-Wait-VerifyOwnedProcess -Registry $negBackup6 -ExpectedCreationTime $negCreation6
+        $negProc6.Dispose()
+    }
+
+    # --- Neg-6: Diagnostic fields exposed on WaitFailure ---
+    $negProc7 = Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5`"" -PassThru -WindowStyle Hidden
+    try {
+        $negReg7 = New-Object ProcessHandleRegistry
+        $negReg7.RegisterProcess($negProc7.Id, "neg", "neg-7-diag") | Out-Null
+        [ProcessHandleRegistry]::TestHook_FailWait = $true
+        [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0x57
+        $negR7 = Stop-Wait-VerifyOwnedProcess -Registry $negReg7 -ExpectedCreationTime $negProc7.StartTime.Ticks
+        [ProcessHandleRegistry]::TestHook_FailWait = $false
+        [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0
+        $hasDiag = ($negR7.PSObject.Properties.Name -contains 'TerminateWin32Error') -and
+            ($negR7.PSObject.Properties.Name -contains 'TerminateError') -and
+            ($negR7.PSObject.Properties.Name -contains 'FinalWaitCode') -and
+            ($negR7.PSObject.Properties.Name -contains 'FinalWaitWin32Error')
+        $negTests += [PSCustomObject]@{ Name="Neg6-DiagFields"; Pass=$hasDiag; Actual="TerminateWin32Error=$($negR7.TerminateWin32Error) FinalWaitCode=$($negR7.FinalWaitCode) FinalWaitWin32Error=$($negR7.FinalWaitWin32Error)" }
+    } finally {
+        [ProcessHandleRegistry]::TestHook_FailWait = $false
+        [ProcessHandleRegistry]::TestHook_WaitErrorCode = 0
+        $negProc7.Dispose()
+    }
+
+    # Summary
+    $script:SelfTestSuiteResults['FocusedNegatives'] = @{ Declared=$negTests.Count; Actual=$negTests.Count; Passed=@($negTests | Where-Object { $_.Pass }).Count; Failed=@($negTests | Where-Object { -not $_.Pass }).Count }
+    Write-Host "\n=== Focused Negative Evidence ($($negTests.Count) checks) ===" -ForegroundColor Cyan
+    foreach ($t in $negTests) {
+        if (-not $t.Pass) { $allNegPassed = $false }
+        $color = if ($t.Pass) { "Green" } else { "Red" }
+        Write-Host "  $(if ($t.Pass) { 'PASS' } else { 'FAIL' }): $($t.Name) ($($t.Actual))" -ForegroundColor $color
+    }
+    return $allNegPassed
 }
 
 
@@ -6468,7 +6614,7 @@ if ($SelfTestOnly) {
     $srLR = $script:SelfTestSuiteResults['LockfileReader']
     if ($srLR) { $nodeTotal = $srLR.Actual; $nodePassed = $srLR.Passed }
     $r15Total = 0; $r15Passed = 0
-    foreach ($suiteName in @('ManifestCompare','SuiteEvidence','ProcessLevelFaults')) {
+    foreach ($suiteName in @('ManifestCompare','SuiteEvidence','ProcessLevelFaults','FocusedNegatives')) {
         $sr = $script:SelfTestSuiteResults[$suiteName]
         if ($sr) { $r15Total += $sr.Actual; $r15Passed += $sr.Passed }
     }
@@ -6478,6 +6624,9 @@ if ($SelfTestOnly) {
     $allSuites = @('Aggregation','NativeJudgment','ParentPath','GateSummary','LockfileReader','ManifestCompare','SuiteEvidence')
     if ($script:SelfTestSuiteResults.ContainsKey('ProcessLevelFaults')) {
         $allSuites += 'ProcessLevelFaults'
+    }
+    if ($script:SelfTestSuiteResults.ContainsKey('FocusedNegatives')) {
+        $allSuites += 'FocusedNegatives'
     }
     $aggResult = Invoke-SelfTestAggregation `
       -SuiteResults $script:SelfTestSuiteResults `
