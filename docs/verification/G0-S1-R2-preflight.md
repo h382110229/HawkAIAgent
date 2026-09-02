@@ -26,9 +26,10 @@ All rows derived mechanically from `git show -s --format` + `git show --name-onl
 | R13-FU3 docs | `bb4c5c37978fe93c74b2bddc46e0f326914110a4` | `40e97d43fab3e113116fbbbad242cf00208c808a` (R13-FU3 code) | `docs: R13-FU3 preflight - fail-closed helper, frozen identity, CleanupIdentityMismatch restructured, 215/215 PASS` | `docs/verification/G0-S1-R2-preflight.md` |
 | R13-FU4 code | `053c9baf58589f262d1d41eb4c1273de122a1c2a` | `bb4c5c37978fe93c74b2bddc46e0f326914110a4` (R13-FU3 docs) | `fix(harness): R13 FU4 - shared fail-closed predicate, durable focused negative evidence in committed self-test path` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
 | R13-FU4 docs | `84e436d75674fb9cccb6f4b0b23e9f07a82c525e` | `053c9baf58589f262d1d41eb4c1273de122a1c2a` (R13-FU4 code) | `docs: R13-FU4 preflight - corrected topology, shared predicate, durable negative evidence, 221/221 PASS` | `docs/verification/G0-S1-R2-preflight.md` |
-| R13-FU5 code | `e6351e9` | `84e436d75674fb9cccb6f4b0b23e9f07a82c525e` (R13-FU4 docs) | `fix(harness): R13 FU5 - shared CleanupIdentityMismatch predicate, verified backup cleanup, dynamic R15 formula` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
+|| R13-FU5 code | `e6351e9` | `84e436d75674fb9cccb6f4b0b23e9f07a82c525e` (R13-FU4 docs) | `fix(harness): R13 FU5 - shared CleanupIdentityMismatch predicate, verified backup cleanup, dynamic R15 formula` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
+| R13-FU5b code | `6ace82d007a400647edf0a474c244530f89ea047` | `e6351e9` (R13-FU5 code) | `fix(harness): R13 FU5b - Neg4/Neg5 backup cleanup gates, R15 formula uniqueness assertion` | `research/g0-s1-harness-integration/windows-poc-test-r2.ps1` |
 
-Parent chain: R11 docs → R12 code → R12 docs → R13 code → R13 docs → R14 code → R14 docs → R13-FU2 code → R13-FU2 docs → R13-FU3 code → R13-FU3 docs → R13-FU4 code → R13-FU4 docs → R13-FU5 code (this cycle's code commit)
+Parent chain: R11 docs → R12 code → R12 docs → R13 code → R13 docs → R14 code → R14 docs → R13-FU2 code → R13-FU2 docs → R13-FU3 code → R13-FU3 docs → R13-FU4 code → R13-FU4 docs → R13-FU5 code → R13-FU5b code (this cycle's code commit)
 
 ---
 
@@ -36,14 +37,14 @@ Parent chain: R11 docs → R12 code → R12 docs → R13 code → R13 docs → R
 
 ### Script: `research/g0-s1-harness-integration/windows-poc-test-r2.ps1`
 
-The R13-FU5 docs-only commit (to be created) will not change the script. Final script hashes are from the R13-FU5 code commit.
+The R13-FU5b docs-only commit (to be created) will not change the script. Final script hashes are from the R13-FU5b code commit.
 
-**Final script hashes (R13-FU5 code commit `e6351e9`):**
+**Final script hashes (R13-FU5b code commit `6ace82d`):**
 
 | Domain | SHA-256 |
 |--------|---------|
-| Raw Git-blob | `44d44265cc7bfa92be1c823d10e73fb068345abc` (git hash-object) |
-| Checked-out (Windows, CRLF) | `0daa3b003d738978e3da3758ba2914741820174c41bf93134f1db735e9126da5` (sha256sum) |
+| Raw Git-blob | `8d93e244c325bd979f1c3333dc96cceac0a39ca0` (git hash-object) |
+| Checked-out (Windows, CRLF) | `7b827bfa70f7712d6b3a4b48fa8779166b5c5103969880b601c0a6b00cff9a7e` (sha256sum) |
 
 The checkout hash differs from the blob hash because Git applies CRLF conversion on checkout (autocrlf=true). The blob retains LF endings. Each hash is environment-specific evidence, not a universal property of the Git blob.
 
@@ -117,8 +118,8 @@ Total: **6** checks (runtime-derived `FocusedNegatives` suite count)
 | Neg1-ExtraEntry | Register 2 entries, ExpectedEntryCount=1; independent backup cleanup for BOTH processes | `Test-HelperSuccess` (shared) | HelperFail=True; bk1/bk2 registration+cleanup all verified |
 | Neg2-NonemptyErrors | Inject error into clean result; backup cleanup for process | `Test-HelperSuccess` (shared) | HelperFail=True; backup registration+cleanup verified |
 | Neg3-CloseAllFailure | `TestHook_FailClose=$true`; backup cleanup for process | `Test-HelperSuccess` (shared) | HelperFail=True; backup registration+cleanup verified |
-| Neg4-OwnedOuterCleanupFail | Mismatch fixture; baseline-true via shared predicate; `TestHook_FailClose` on owned cleanup ONLY | `Test-CleanupIdentityMismatchSuccess` (shared) | BaselineTrue=True, AlteredResult=False |
-| Neg5-OtherOuterCleanupFail | Mismatch fixture; baseline-true via shared predicate; `TestHook_FailClose` on other cleanup ONLY | `Test-CleanupIdentityMismatchSuccess` (shared) | BaselineTrue=True, AlteredResult=False |
+| Neg4-OwnedOuterCleanupFail | Mismatch fixture; baseline-true via shared predicate; `TestHook_FailClose` on owned cleanup ONLY; backup gates in PASS | `Test-CleanupIdentityMismatchSuccess` (shared) | BaselineTrue=True, AlteredResult=False; bk5a/bk5b registration+cleanup all verified |
+| Neg5-OtherOuterCleanupFail | Mismatch fixture; baseline-true via shared predicate; `TestHook_FailClose` on other cleanup ONLY; backup gates in PASS | `Test-CleanupIdentityMismatchSuccess` (shared) | BaselineTrue=True, AlteredResult=False; bk6a/bk6b registration+cleanup all verified |
 | Neg6-DiagFields | `TestHook_FailWait` + `TestHook_WaitErrorCode=0x57`; backup cleanup for process | Property existence + backup cleanup | Diag=True; backup registration+cleanup verified |
 
 **Shared predicates:** All checks use `Test-HelperSuccess` (the same function used by `Stop-Wait-VerifyOwnedProcess`'s finally block) or `Test-CleanupIdentityMismatchSuccess` (used by the real fixture), not copied formulas.
@@ -128,8 +129,8 @@ Total: **6** checks (runtime-derived `FocusedNegatives` suite count)
 PASS: Neg1-ExtraEntry (HelperFail=True bk1Reg=True bk2Reg=True bk1Succ=True bk1Exit=True bk1Close=True bk1Err=0 bk2Succ=True bk2Exit=True bk2Close=True bk2Err=0)
 PASS: Neg2-NonemptyErrors (HelperFail=True bkReg=True bkSucc=True bkExit=True bkClose=True bkErr=0)
 PASS: Neg3-CloseAllFailure (HelperFail=True bkReg=True bkSucc=True bkExit=True bkClose=True bkErr=0)
-PASS: Neg4-OwnedOuterCleanupFail (BaselineTrue=True AlteredResult=False ownedOk=False otherOk=True handles=True noTerm=True idMismatch=True alive=True targetClose=True)
-PASS: Neg5-OtherOuterCleanupFail (BaselineTrue=True AlteredResult=False ownedOk=True otherOk=False handles=True noTerm=True idMismatch=True alive=True targetClose=True)
+PASS: Neg4-OwnedOuterCleanupFail (BaselineTrue=True AlteredResult=False ownedOk=False otherOk=True handles=True noTerm=True idMismatch=True alive=True targetClose=True bk5aReg=True bk5bReg=True bk5aSucc=True bk5aExit=True bk5aClose=True bk5aErr=0 bk5bSucc=True bk5bExit=True bk5bClose=True bk5bErr=0)
+PASS: Neg5-OtherOuterCleanupFail (BaselineTrue=True AlteredResult=False ownedOk=True otherOk=False handles=True noTerm=True idMismatch=True alive=True targetClose=True bk6aReg=True bk6bReg=True bk6aSucc=True bk6aExit=True bk6aClose=True bk6aErr=0 bk6bSucc=True bk6bExit=True bk6bClose=True bk6bErr=0)
 PASS: Neg6-DiagFields (Diag=True bkReg=True bkSucc=True bkExit=True bkClose=True bkErr=0 TerminateWin32Error=0 FinalWaitCode=4294967295 FinalWaitWin32Error=87)
 ```
 
@@ -143,7 +144,7 @@ PASS: Neg6-DiagFields (Diag=True bkReg=True bkSucc=True bkExit=True bkClose=True
 ManifestCompare(14) + SuiteEvidence(11) + ProcessLevelFaults(34) + FocusedNegatives(6) = 65
 ```
 
-The formula is built dynamically from the same runtime suite list used to calculate `$R15Total`. A deterministic assertion verifies the displayed sum equals `$R15Total`.
+The formula is built dynamically from the same runtime suite list used to calculate `$R15Total`. Deterministic assertions verify: (1) displayed sum equals `$R15Total`, (2) each included R15 suite name/count appears exactly once in the formula.
 
 Full total: 54 (pure) + 102 (node) + 65 (R15) = **221**
 
@@ -244,13 +245,9 @@ Independent review observed one new PowerShell PID (47812) after the5-second set
 
 **Problem:** Round 4 Neg1 had no backup cleanup for the second process. Neg3-Neg5 created backup registries but did not gate PASS on backup registration/cleanup success. Neg6 had no backup registry. Independent review observed a transient orphan PowerShell PID after the5-second settling window.
 
-**Fix:** Every negative test:
-- Pre-acquires independent backup cleanup handle for every started process
-- Freezes creation time before injection
-- In `finally`, cleans every process via `Stop-Wait-VerifyOwnedProcess` on the backup registry
-- PASS requires: backup registration success, cleanup helper Success, ExitedVerified, CloseAllSucceeded, zero cleanup errors
-- If semantic setup throws, deterministic FAIL record is appended and safe cleanup continues
-- No reliance on `Process.Dispose()`, natural `Start-Sleep` completion, PID lookup, or process-name-wide kill
+**Initial FU5 fix:** Every negative test pre-acquires independent backup cleanup handles. PASS gates backup registration success, cleanup helper Success, ExitedVerified, CloseAllSucceeded, and zero cleanup errors.
+
+**FU5b refinement:** Neg4 and Neg5 PASS computation was inside the try block, before the finally block ran backup cleanup. Restructured so PASS is computed after finally and gates backup cleanup results. Variables initialized before try to ensure accessibility after finally. Deterministic FAIL record on exception; safe cleanup continues regardless.
 
 ### FU5-03: Dynamic R15 Formula Display
 
@@ -327,6 +324,6 @@ The fixture now uses the shared `Test-CleanupIdentityMismatchSuccess` predicate 
 | FU4-04 | Remediation artifact removal | DONE (R13-FU4) |
 | FU4-05 | Evidence wording matches gate state | DONE (R13-FU4) |
 | FU5-01 | Shared `Test-CleanupIdentityMismatchSuccess` predicate; non-vacuous Neg4/Neg5 | DONE (R13-FU5) |
-| FU5-02 | Verified backup cleanup handles for all6 negative tests | DONE (R13-FU5) |
+| FU5-02 | Verified backup cleanup handles for all6 negative tests | DONE (R13-FU5/FU5b) |
 | FU5-03 | Dynamic R15 formula display including FocusedNegatives | DONE (R13-FU5) |
 | FU5-04 | Corrected preflight claims; recorded transient-PID finding | DONE (R13-FU5) |
